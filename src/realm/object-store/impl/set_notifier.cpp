@@ -60,7 +60,7 @@ bool SetNotifier::do_add_required_change_info(TransactionChangeInfo& info)
     if (!m_set->is_attached())
         return false; // origin row was deleted after the notification was added
 
-    info.lists.push_back({m_table, m_obj.value, m_col.value, &m_change});
+    info.lists.push_back({m_table, m_obj, m_col, &m_change});
 
     m_info = &info;
 
@@ -107,14 +107,14 @@ void SetNotifier::run()
         for (size_t i = 0; i < set.size(); ++i) {
             if (m_change.modifications.contains(i))
                 continue;
-            if (object_did_change(set.get(i).value))
+            if (object_did_change(set.get(i)))
                 m_change.modifications.add(i);
         }
 
         for (auto const& move : m_change.moves) {
             if (m_change.modifications.contains(move.to))
                 continue;
-            if (object_did_change(set.get(move.to).value))
+            if (object_did_change(set.get(move.to)))
                 m_change.modifications.add(move.to);
         }
     }

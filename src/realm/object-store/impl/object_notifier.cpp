@@ -37,7 +37,7 @@ bool ObjectNotifier::do_add_required_change_info(TransactionChangeInfo& info)
         return false;
 
     m_info = &info;
-    info.tables[m_table->get_key().value];
+    info.tables[m_table->get_key()];
 
     // When adding or removing a callback the related tables can change due to the way we calculate related tables
     // when key path filters are set hence we need to recalculate every time the callbacks are changed.
@@ -61,9 +61,9 @@ void ObjectNotifier::run()
         // If any callback has a key path filter we will check all related tables and if any of them was changed we
         // mark the this object as changed.
         auto object_change_checker = get_object_modification_checker(*m_info, m_table);
-        std::vector<int64_t> changed_columns = object_change_checker(m_obj.value);
+        std::vector<ColKey> changed_columns = object_change_checker(m_obj);
 
-        if (auto it = m_info->tables.find(m_table->get_key().value); it != m_info->tables.end()) {
+        if (auto it = m_info->tables.find(m_table->get_key()); it != m_info->tables.end()) {
             const auto& change = it->second;
             if (object_was_deleted(change)) {
                 return;
@@ -73,7 +73,7 @@ void ObjectNotifier::run()
         if (changed_columns.size() > 0) {
             m_change.modifications.add(0);
             for (auto changed_column : changed_columns) {
-                m_change.columns[changed_column].add(0);
+                m_change.columns[changed_column.value].add(0);
             }
         }
         if (all_callbacks_filtered()) {
@@ -81,7 +81,7 @@ void ObjectNotifier::run()
         }
     }
 
-    auto it = m_info->tables.find(m_table->get_key().value);
+    auto it = m_info->tables.find(m_table->get_key());
     if (it == m_info->tables.end())
         // This object's table is not in the map of changed tables held by `m_info`
         // hence no further details have to be checked.
@@ -92,20 +92,20 @@ void ObjectNotifier::run()
         return;
     }
 
-    auto column_modifications = change.get_columns_modified(m_obj.value);
+    auto column_modifications = change.get_columns_modified(m_obj);
     if (!column_modifications)
         return;
 
     // Finally we add all changes to `m_change` which is later used to notify about the changed columns.
     m_change.modifications.add(0);
     for (auto col : *column_modifications) {
-        m_change.columns[col].add(0);
+        m_change.columns[col.value].add(0);
     }
 }
 
 bool ObjectNotifier::object_was_deleted(const ObjectChangeSet& object_change_set)
 {
-    if (object_change_set.deletions_contains(m_obj.value)) {
+    if (object_change_set.deletions_contains(m_obj)) {
         // The object was deleted after adding the notifier.
         m_change.deletions.add(0);
         m_table = {};

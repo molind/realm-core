@@ -250,10 +250,17 @@ inline std::ostream& operator<<(std::ostream& ostr, ObjKey key)
 
 class ObjKeys : public std::vector<ObjKey> {
 public:
-    ObjKeys(const std::vector<int64_t>& init)
+    explicit ObjKeys(const std::vector<int64_t>& init)
     {
         reserve(init.size());
         for (auto i : init) {
+            emplace_back(i);
+        }
+    }
+    ObjKeys(const std::initializer_list<int64_t>& list)
+    {
+        reserve(list.size());
+        for (auto i : list) {
             emplace_back(i);
         }
     }
@@ -343,10 +350,24 @@ inline std::string to_string(ColKey ck)
 namespace std {
 
 template <>
+struct hash<realm::TableKey> {
+    size_t operator()(realm::TableKey key) const
+    {
+        return std::hash<uint32_t>{}(key.value);
+    }
+};
+template <>
 struct hash<realm::ObjKey> {
     size_t operator()(realm::ObjKey key) const
     {
         return std::hash<uint64_t>{}(key.value);
+    }
+};
+template <>
+struct hash<realm::ColKey> {
+    size_t operator()(realm::ColKey key) const
+    {
+        return std::hash<int64_t>{}(key.value);
     }
 };
 

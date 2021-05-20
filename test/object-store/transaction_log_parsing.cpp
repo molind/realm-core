@@ -56,8 +56,8 @@ public:
 
         _impl::CollectionChangeBuilder c;
         _impl::TransactionChangeInfo info{};
-        info.tables[m_table_key.value];
-        info.lists.push_back({m_table_key, m_list.get_key().value, m_list.get_col_key().value, &c});
+        info.tables[m_table_key];
+        info.lists.push_back({m_table_key, m_list.get_key(), m_list.get_col_key(), &c});
         _impl::transaction::advance(*m_group, info);
 
         if (info.lists.empty()) {
@@ -180,7 +180,7 @@ public:
         m_result.reserve(objects.size());
         for (auto& obj : objects) {
             m_result.push_back(
-                ObserverState{obj.get_table()->get_key(), obj.get_key().value, (void*)(uintptr_t)m_result.size()});
+                ObserverState{obj.get_table()->get_key(), obj.get_key(), (void*)(uintptr_t)m_result.size()});
         }
     }
 
@@ -286,7 +286,7 @@ TEST_CASE("Transaction log parsing: changeset calcuation") {
         });
 
         auto& table = *r->read_group().get_table("class_table");
-        auto table_key = table.get_key().value;
+        auto table_key = table.get_key();
         auto cols = table.get_column_keys();
 
         r->begin_transaction();
@@ -297,8 +297,7 @@ TEST_CASE("Transaction log parsing: changeset calcuation") {
         r->commit_transaction();
 
         auto coordinator = _impl::RealmCoordinator::get_coordinator(config.path);
-        using TableKeyType = decltype(TableKey::value);
-        auto track_changes = [&](std::vector<TableKeyType> tables_needed, auto&& f) {
+        auto track_changes = [&](std::vector<TableKey> tables_needed, auto&& f) {
             auto sg = coordinator->begin_read();
 
             r->begin_transaction();
@@ -318,7 +317,7 @@ TEST_CASE("Transaction log parsing: changeset calcuation") {
             });
             REQUIRE(info.tables.size() == 1);
             REQUIRE(info.tables[table_key].modifications_size() == 1);
-            REQUIRE(info.tables[table_key].modifications_contains(1, {}));
+            REQUIRE(info.tables[table_key].modifications_contains(ObjKey(1), {}));
         }
 
         SECTION("modifications to untracked tables are ignored") {
@@ -335,8 +334,8 @@ TEST_CASE("Transaction log parsing: changeset calcuation") {
             });
             REQUIRE(info.tables.size() == 1);
             REQUIRE(info.tables[table_key].insertions_size() == 2);
-            REQUIRE(info.tables[table_key].insertions_contains(10));
-            REQUIRE(info.tables[table_key].insertions_contains(11));
+            REQUIRE(info.tables[table_key].insertions_contains(ObjKey(10)));
+            REQUIRE(info.tables[table_key].insertions_contains(ObjKey(11)));
         }
 
         SECTION("deleting newly added rows makes them not be reported") {
@@ -346,7 +345,7 @@ TEST_CASE("Transaction log parsing: changeset calcuation") {
             });
             REQUIRE(info.tables.size() == 1);
             REQUIRE(info.tables[table_key].insertions_size() == 1);
-            REQUIRE(info.tables[table_key].insertions_contains(10));
+            REQUIRE(info.tables[table_key].insertions_contains(ObjKey(10)));
             REQUIRE(info.tables[table_key].deletions_empty());
         }
 
@@ -356,9 +355,9 @@ TEST_CASE("Transaction log parsing: changeset calcuation") {
             });
             REQUIRE(info.tables.size() == 1);
             REQUIRE(info.tables[table_key].insertions_size() == 1);
-            REQUIRE(info.tables[table_key].insertions_contains(10));
+            REQUIRE(info.tables[table_key].insertions_contains(ObjKey(10)));
             REQUIRE(info.tables[table_key].modifications_size() == 0);
-            REQUIRE(!info.tables[table_key].modifications_contains(10, {}));
+            REQUIRE(!info.tables[table_key].modifications_contains(ObjKey(10), {}));
             REQUIRE(info.tables[table_key].deletions_empty());
         }
 
@@ -369,8 +368,8 @@ TEST_CASE("Transaction log parsing: changeset calcuation") {
             });
             REQUIRE(info.tables.size() == 1);
             REQUIRE(info.tables[table_key].deletions_size() == 2);
-            REQUIRE(info.tables[table_key].deletions_contains(2));
-            REQUIRE(info.tables[table_key].deletions_contains(3));
+            REQUIRE(info.tables[table_key].deletions_contains(ObjKey(2)));
+            REQUIRE(info.tables[table_key].deletions_contains(ObjKey(3)));
             REQUIRE(info.tables[table_key].insertions_empty());
             REQUIRE(info.tables[table_key].modifications_empty());
         }
@@ -1605,7 +1604,7 @@ TEST_CASE("DeepChangeChecker") {
 
         _impl::TransactionChangeInfo info{};
         for (auto key : rt->get_table_keys())
-            info.tables[key.value];
+            info.tables[key];
         _impl::transaction::advance(*rt, info);
         return info;
     };

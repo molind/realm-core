@@ -33,20 +33,20 @@ bool CollectionNotifier::any_related_table_was_modified(TransactionChangeInfo co
     // actually modified. This can be false if there were only insertions, or
     // deletions which were not linked to by any row in the linking table
     auto table_modified = [&](auto& tbl) {
-        auto it = info.tables.find(tbl.table_key.value);
+        auto it = info.tables.find(tbl.table_key);
         return it != info.tables.end() && !it->second.modifications_empty();
     };
     return any_of(begin(m_related_tables), end(m_related_tables), table_modified);
 }
 
-std::function<bool(ObjectChangeSet::ObjectKeyType)>
-CollectionNotifier::get_modification_checker(TransactionChangeInfo const& info, ConstTableRef root_table)
+std::function<bool(ObjKey)> CollectionNotifier::get_modification_checker(TransactionChangeInfo const& info,
+                                                                         ConstTableRef root_table)
 {
     if (info.schema_changed)
         set_table(root_table);
 
     if (!any_related_table_was_modified(info)) {
-        return [](ObjectChangeSet::ObjectKeyType) {
+        return [](ObjKey) {
             return false;
         };
     }
@@ -56,8 +56,8 @@ CollectionNotifier::get_modification_checker(TransactionChangeInfo const& info, 
     // `ObjectChangeSet` within the `TransactionChangeInfo` for this table directly.
     if (m_related_tables.size() == 1 && !all_callbacks_filtered()) {
         auto root_table_key = m_related_tables[0].table_key;
-        auto& object_change_set = info.tables.find(root_table_key.value)->second;
-        return [&](ObjectChangeSet::ObjectKeyType object_key) {
+        auto& object_change_set = info.tables.find(root_table_key)->second;
+        return [&](ObjKey object_key) {
             return object_change_set.modifications_contains(object_key, {});
         };
     }
@@ -68,7 +68,7 @@ CollectionNotifier::get_modification_checker(TransactionChangeInfo const& info, 
     else if (any_callbacks_filtered()) {
         // In case we have some callbacks, we need to combine the unfiltered `DeepChangeChecker` with
         // the filtered `KeyPathChangeChecker` to make sure we send all expected notifications.
-        return [&info, root_table, this](ObjectChangeSet::ObjectKeyType object_key) {
+        return [&info, root_table, this](ObjKey object_key) {
             auto key_path_change_checker =
                 KeyPathChangeChecker(info, *root_table, m_related_tables, m_key_path_arrays);
             auto deep_change_checker = DeepChangeChecker(info, *root_table, m_related_tables, m_key_path_arrays);
@@ -79,7 +79,7 @@ CollectionNotifier::get_modification_checker(TransactionChangeInfo const& info, 
     return DeepChangeChecker(info, *root_table, m_related_tables, m_key_path_arrays);
 }
 
-std::function<std::vector<int64_t>(ObjectChangeSet::ObjectKeyType)>
+std::function<std::vector<ColKey>(ObjKey)>
 CollectionNotifier::get_object_modification_checker(TransactionChangeInfo const& info, ConstTableRef root_table)
 {
     return ObjectChangeChecker(info, *root_table, m_related_tables, m_key_path_arrays);
@@ -235,7 +235,7 @@ void CollectionNotifier::add_required_change_info(TransactionChangeInfo& info)
     // Create an entry in the `TransactionChangeInfo` for every table in `m_related_tables`.
     info.tables.reserve(m_related_tables.size());
     for (auto& tbl : m_related_tables)
-        info.tables[tbl.table_key.value];
+        info.tables[tbl.table_key];
 }
 
 void CollectionNotifier::prepare_handover()
