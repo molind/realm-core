@@ -301,18 +301,16 @@ void Connection::cancel_reconnect_delay()
 }
 
 
-void Connection::websocket_handshake_completion_handler(const HTTPHeaders& headers)
+void Connection::websocket_handshake_completion_handler(const std::string& protocol)
 {
-    auto i = headers.find("Sec-WebSocket-Protocol");
-    if (i != headers.end()) {
-        std::string_view value = i->second;
+    if (!protocol.empty()) {
         std::string_view prefix = sync::get_websocket_protocol_prefix();
         // FIXME: Use std::string_view::begins_with() in C++20.
-        bool begins_with =
-            (value.size() >= prefix.size() && std::equal(value.data(), value.data() + prefix.size(), prefix.data()));
+        bool begins_with = (protocol.size() >= prefix.size() &&
+                            std::equal(protocol.data(), protocol.data() + prefix.size(), prefix.data()));
         if (begins_with) {
             util::MemoryInputStream in;
-            in.set_buffer(value.data() + prefix.size(), value.data() + value.size());
+            in.set_buffer(protocol.data() + prefix.size(), protocol.data() + protocol.size());
             in.imbue(std::locale::classic());
             in.unsetf(std::ios_base::skipws);
             int value_2 = 0;
@@ -328,7 +326,7 @@ void Connection::websocket_handshake_completion_handler(const HTTPHeaders& heade
                 }
             }
         }
-        logger.error("Bad protocol info from server: '%1'", value); // Throws
+        logger.error("Bad protocol info from server: '%1'", protocol); // Throws
     }
     else {
         logger.error("Missing protocol info from server"); // Throws
@@ -345,8 +343,7 @@ void Connection::websocket_read_or_write_error_handler(std::error_code ec)
 }
 
 
-void Connection::websocket_handshake_error_handler(std::error_code ec, const HTTPHeaders*,
-                                                   const std::string_view* body)
+void Connection::websocket_handshake_error_handler(std::error_code ec, const std::string_view* body)
 {
     bool is_fatal;
     if (ec == util::websocket::Error::bad_response_3xx_redirection ||
