@@ -63,7 +63,6 @@ public:
     using OutputBuffer         = util::ResettableExpandableBufferOutputStream;
     using ClientProtocol = _impl::ClientProtocol;
     using ClientResetOperation = _impl::ClientResetOperation;
-    using EventLoopMetricsHandler = util::network::Service::EventLoopMetricsHandler;
 
     /// Per-server endpoint information used to determine reconnect delays.
     class ReconnectInfo {
@@ -121,11 +120,9 @@ public:
     static constexpr int get_oldest_supported_protocol_version() noexcept;
 
     // @{
-    /// These call stop(), run(), and report_event_loop_metrics() on the service
-    /// object (get_service()) respectively.
+    /// These call stop() and run() on the service object (get_service()) respectively.
     void stop() noexcept;
     void run();
-    void report_event_loop_metrics(std::function<EventLoopMetricsHandler>);
     // @}
 
     const std::string& get_user_agent_string() const noexcept;
@@ -1091,11 +1088,6 @@ private:
 
 
 // Implementation
-
-inline void ClientImpl::report_event_loop_metrics(std::function<EventLoopMetricsHandler> handler)
-{
-    m_service.report_event_loop_metrics(std::move(handler)); // Throws
-}
 
 inline const std::string& ClientImpl::get_user_agent_string() const noexcept
 {
