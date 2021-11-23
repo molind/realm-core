@@ -64,17 +64,27 @@ static std::exception_ptr* get_last_exception()
 }
 
 #endif // RLM_NO_THREAD_LOCAL
+static const char* copy_message(const char* msg)
+{
+    std::string_view message_contents(msg);
+    auto message = std::make_unique<char[]>(message_contents.size() + 1);
+    std::strcpy(message.get(), msg);
+    return const_cast<const char*>(message.release());
+}
 
-static bool convert_error(std::exception_ptr* ptr, realm_error_t* err)
+static realm_error_t* create_error(std::exception_ptr* ptr)
 {
     if (ptr && *ptr) {
+        realm_error_t* err = new realm_error_t;
         err->kind.code = 0;
+        err->message = nullptr;
 
         auto populate_error = [&](const std::exception& ex, realm_errno_e error_number) {
-            if (err) {
-                err->error = error_number;
-                err->message = ex.what();
-            }
+            err->error = error_number;
+            // copy the message. rethrow_exception copies the exception object on some platforms (Windows) hence
+            // the ex.what() ptr will get invalidated when create_error completes
+            err->message = copy_message(ex.what());
+
             *ptr = std::current_exception();
         };
 
@@ -172,21 +182,32 @@ static bool convert_error(std::exception_ptr* ptr, realm_error_t* err)
         // FIXME: Handle more exception types.
         catch (...) {
             err->error = RLM_ERR_UNKNOWN;
-            err->message = "Unknown error";
+            err->message = copy_message("Unknown error");
             *ptr = std::current_exception();
         }
-        return true;
+        return err;
     }
-    return false;
+    return nullptr;
 }
 
-RLM_API bool realm_get_last_error(realm_error_t* err)
+RLM_API realm_error_t* realm_get_last_error()
 {
     std::exception_ptr* ptr = get_last_exception();
     if (ptr) {
-        return convert_error(ptr, err);
+        return create_error(ptr);
     }
-    return false;
+    return nullptr;
+}
+
+RLM_API void realm_release_last_error(realm_error_t* err)
+{
+    if (err) {
+        if (err->message) {
+            void* ptr = static_cast<void*>(const_cast<char*>(err->message));
+            delete[] ptr;
+        }
+        delete err;
+    }
 }
 
 RLM_API bool realm_clear_last_error()
@@ -208,9 +229,9 @@ RLM_API realm_async_error_t* realm_get_last_error_as_async_error(void)
     return nullptr;
 }
 
-RLM_API void realm_get_async_error(const realm_async_error_t* async_err, realm_error_t* out_err)
+RLM_API realm_error_t* realm_get_async_error(const realm_async_error_t* async_err)
 {
-    convert_error(&const_cast<realm_async_error_t*>(async_err)->ep, out_err);
+    return create_error(&const_cast<realm_async_error_t*>(async_err)->ep);
 }
 
 } // namespace realm::c_api
