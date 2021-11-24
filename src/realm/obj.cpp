@@ -404,6 +404,8 @@ Mixed Obj::get_any(ColKey col_key) const
             return Mixed{_get<util::Optional<UUID>>(col_ndx)};
         case col_type_Link:
             return Mixed{_get<ObjKey>(col_ndx)};
+        case col_type_TypedLink:
+            return Mixed{_get<ObjLink>(col_ndx)};
         default:
             REALM_UNREACHABLE();
             break;
@@ -759,7 +761,8 @@ void Obj::traverse_path(Visitor v, PathSizer ps, size_t path_length) const
         });
     }
     else {
-        ps(path_length);
+        if (ps)
+            ps(path_length);
     }
 }
 
@@ -2289,6 +2292,9 @@ Obj& Obj::set_null(ColKey col_key, bool is_default)
     // Links need special handling
     if (col_type == col_type_Link) {
         set(col_key, null_key);
+    }
+    else if (col_type == col_type_TypedLink) {
+        set(col_key, ObjLink());
     }
     else {
         auto attrs = col_key.get_attrs();

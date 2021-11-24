@@ -4066,4 +4066,91 @@ TEST(Shared_WriteCopy)
     CHECK_EQUAL(db->start_read()->get_table("foo")->size(), 1);
 }
 
+TEST(Shared_WriteTo)
+{
+    SHARED_GROUP_TEST_PATH(path1);
+    SHARED_GROUP_TEST_PATH(path2);
+
+    auto create_schema = [](TransactionRef tr) {
+        auto embedded = tr->add_embedded_table("class_Embedded");
+        embedded->add_column(type_Float, "float");
+        // Embedded in embedded
+        embedded->add_column_dictionary(*embedded, "additional");
+
+        auto baas = tr->add_table_with_primary_key("class_Baa", type_Int, "_id");
+        baas->add_column_list(type_Int, "list");
+        baas->add_column_set(type_Int, "set");
+        baas->add_column_dictionary(type_Int, "dictionary");
+        baas->add_column(*embedded, "child");
+
+        auto foos = tr->add_table_with_primary_key("class_Foo", type_String, "_id");
+        foos->add_column(type_String, "str");
+        foos->add_column_list(*embedded, "children");
+        foos->add_column(type_TypedLink, "any", true);
+        foos->add_column(*baas, "baa");
+
+        baas->add_column(*foos, "link");
+    };
+
+    DBRef db1 = DB::create(make_in_realm_history(), path1);
+    auto tr = db1->start_write();
+
+    create_schema(tr);
+
+    {
+        /* Create local objects */
+        auto foos = tr->get_table("class_Foo");
+        auto baas = tr->get_table("class_Baa");
+        auto foo = foos->create_object_with_primary_key("123").set("str", "Hello");
+        auto children = foo.get_linklist("children");
+        children.create_and_insert_linked_object(0);
+        auto baa = baas->create_object_with_primary_key(999).set("link", foo.get_key());
+        auto obj = baa.create_and_set_linked_object(baas->get_column_key("child"));
+        obj.set("float", 42.f);
+        auto additional = obj.get_dictionary("additional");
+        additional.create_and_insert_linked_object("One").set("float", 1.f);
+        additional.create_and_insert_linked_object("Two").set("float", 2.f);
+        additional.create_and_insert_linked_object("Three").set("float", 3.f);
+        foo.set("baa", baa.get_key());
+
+        auto list = baa.get_list<Int>("list");
+        list.add(1);
+        list.add(2);
+        list.add(3);
+        auto set = baa.get_set<Int>("set");
+        set.insert(4);
+        set.insert(5);
+        set.insert(6);
+        auto dict = baa.get_dictionary("dictionary");
+        dict.insert("key7", 7);
+        dict.insert("key8", 8);
+        dict.insert("key9", 9);
+
+        baa = baas->create_object_with_primary_key(666).set("link", foo.get_key());
+        obj = baa.create_and_set_linked_object(baas->get_column_key("child"));
+        obj.set("float", 35.f);
+        auto foo2 = foos->create_object_with_primary_key("456").set("any", baa.get_link());
+    }
+    tr->commit_and_continue_as_read();
+    tr->to_json(std::cout);
+
+    // Create remote db
+    DBRef db2 = DB::create(make_in_realm_history(), path2);
+    {
+        auto wt = db2->start_write();
+        create_schema(wt);
+        auto baas = wt->get_table("class_Baa");
+        auto baa = baas->create_object_with_primary_key(666);
+        auto obj = baa.create_and_set_linked_object(baas->get_column_key("child"));
+        obj.set("float", 99.f);
+        wt->commit();
+    }
+
+    // Copy local object over
+    auto dest = db2->start_write();
+    tr->copy_to(dest);
+    dest->commit_and_continue_as_read();
+    dest->to_json(std::cout);
+}
+
 #endif // TEST_SHARED

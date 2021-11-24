@@ -631,6 +631,8 @@ public:
     }
     TransactionRef duplicate();
 
+    void copy_to(TransactionRef dest) const;
+
     _impl::History* get_history() const;
 
     // direct handover of accessor instances
@@ -674,6 +676,8 @@ private:
     void do_end_read() noexcept;
     void commit_and_continue_writing();
     void initialize_replication();
+
+    void replicate(Transaction* dest, Replication& repl) const;
 
     DBRef db;
     mutable std::unique_ptr<_impl::History> m_history_read;
