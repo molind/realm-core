@@ -346,6 +346,7 @@ app::Response AdminAPIEndpoint::do_request(app::Request request) const
     request.headers["Content-Type"] = "application/json;charset=utf-8";
     request.headers["Accept"] = "application/json";
     request.headers["Authorization"] = util::format("Bearer %1", m_access_token);
+    std::cerr << request.url << " " << request.body << std::endl;
     auto resp = do_http_request(request);
     return resp;
 }
@@ -848,7 +849,7 @@ AppSession create_app(const AppCreateConfig& config)
         mongo_service_def["config"]["sync_query"] = nlohmann::json{
             {"state", "enabled"},
             {"database_name", config.mongo_dbname},
-            {"queryable_field_names", queryable_fields},
+            {"queryable_fields_names", queryable_fields},
             {"permissions",
              {{"rules", nlohmann::json::object()},
               {"defaultRoles",
