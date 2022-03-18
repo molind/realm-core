@@ -1392,7 +1392,7 @@ public:
     SyncConnection(ServerImpl& serv, std::int_fast64_t id, std::unique_ptr<util::network::Socket>&& socket,
                    std::unique_ptr<util::network::ssl::Stream>&& ssl_stream,
                    std::unique_ptr<util::network::ReadAheadBuffer>&& read_ahead_buffer, int client_protocol_version,
-                   std::string client_user_agent, std::string remote_endpoint)
+                   std::string client_user_agent, AccessToken access_token, std::string remote_endpoint)
         : logger{make_logger_prefix(id), serv.logger} // Throws
         , m_server{serv}
         , m_id{id}
@@ -1402,6 +1402,7 @@ public:
         , m_websocket{*this}
         , m_client_protocol_version{client_protocol_version}
         , m_client_user_agent{std::move(client_user_agent)}
+        , m_client_access_token{std::move(access_token)}
         , m_remote_endpoint{std::move(remote_endpoint)}
     {
         // Make the output buffer stream throw std::bad_alloc if it fails to
@@ -1635,6 +1636,7 @@ private:
 
     // The user agent description passed by the client.
     const std::string m_client_user_agent;
+    const AccessToken m_client_access_token;
 
     const std::string m_remote_endpoint;
 
@@ -2187,6 +2189,33 @@ private:
             close_due_to_error(ec);
             return;
         }
+
+        auto paramName = std::string_view("baas_at=");
+        auto start = request.path.find(paramName);
+        if (start == std::string::npos) {
+            logger.error("Missing auth GET param");
+            close_due_to_error(websocket::Error::bad_response_401_unauthorized);
+            return;
+        }
+        start += paramName.length();
+    
+        auto end = request.path.find('&', start);
+        if (end == std::string::npos) {
+            end = request.path.length();
+        }
+
+        auto token = request.path.substr(start, end - start);
+
+        AccessToken::ParseError error;
+        util::Optional<AccessToken> access_token =
+            get_server().get_access_control().verify_access_token(token.c_str(), &error);
+
+        if (error != AccessToken::ParseError::none && !access_token) {
+            logger.error("Invalid token");
+            close_due_to_error(websocket::Error::bad_response_401_unauthorized);
+            return;
+        }
+
         REALM_ASSERT(response);
         add_common_http_response_headers(*response);
 
@@ -2197,7 +2226,10 @@ private:
                 user_agent = i->second; // Throws (copy)
         }
 
-        auto handler = [negotiated_protocol_version, user_agent = std::move(user_agent), this](std::error_code ec) {
+        auto handler = [negotiated_protocol_version, 
+                        user_agent = std::move(user_agent), 
+                        access_token = std::move(*access_token), 
+                        this](std::error_code ec) {
             // If the operation is aborted, the socket object may have been destroyed.
             if (ec != util::error::operation_aborted) {
                 if (ec) {
@@ -2207,7 +2239,7 @@ private:
 
                 std::unique_ptr<SyncConnection> sync_conn = std::make_unique<SyncConnection>(
                     m_server, m_id, std::move(m_socket), std::move(m_ssl_stream), std::move(m_read_ahead_buffer),
-                    negotiated_protocol_version, std::move(user_agent),
+                    negotiated_protocol_version, std::move(user_agent), std::move(access_token),
                     std::move(m_remote_endpoint)); // Throws
                 SyncConnection& sync_conn_ref = *sync_conn;
                 m_server.add_sync_connection(m_id, std::move(sync_conn));
@@ -5462,6 +5494,14 @@ void SyncConnection::receive_bind_message(session_ident_type session_ident, std:
 
     Session& sess = *p.first->second;
     sess.initiate(); // Throws
+
+    if (signed_user_token.length() > 0 || !m_client_access_token.path || *m_client_access_token.path != path) {
+        logger.error("Permission denied");                       // Throws
+        metrics().increment("protocol.violated");                // Throws
+        protocol_error(ProtocolError::permission_denied, &sess); // Throws
+        return;
+    }
+
     ProtocolError error;
     bool success =
         sess.receive_bind_message(std::move(path), std::move(signed_user_token), need_client_file_ident, is_subserver,

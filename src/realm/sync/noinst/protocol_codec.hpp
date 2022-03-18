@@ -640,8 +640,11 @@ public:
                                         "Signed user token size in BIND message is too large");
                 }
 
-                auto path = msg.read_sized_data<std::string>(path_size);
+                auto quoted_path = msg.read_sized_data<std::string>(path_size);
                 auto signed_user_token = msg.read_sized_data<std::string>(signed_user_token_size);
+
+                // fix path made from BSON to the real path.
+                std::string path = quoted_path.substr(1, quoted_path.length()-2);
 
                 connection.receive_bind_message(session_ident, std::move(path), std::move(signed_user_token),
                                                 need_client_file_ident, is_subserver); // Throws
