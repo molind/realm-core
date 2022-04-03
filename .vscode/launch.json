@@ -2,6 +2,14 @@
         "version": "0.2.0",
         "configurations": [
             {
+                "type": "lldb",
+                "request": "launch",
+                "name": "Launch sync_migrator",
+                "program": "${workspaceFolder}/sync_migrator",
+                "args": [],
+                "cwd": "${workspaceFolder}"
+            },
+            {
                 "name": "realm-tests debug",
                 "type": "cppdbg",
                 "request": "launch",
