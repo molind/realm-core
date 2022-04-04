@@ -1,3 +1,20 @@
+///////////////////////////////////////////////////////////////////////////
+//
+// Copyright 2022 Realm Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+////////////////////////////////////////////////////////////////////////////
 
 #ifndef REALM_NOINST_CLIENT_HISTORY_IMPL_HPP
 #define REALM_NOINST_CLIENT_HISTORY_IMPL_HPP
@@ -42,10 +59,11 @@ class ClientReplication;
 //
 //       Cooked history was removed, except to verify that there is no cooked history.
 //
+//  12   History entries are compressed.
 
 constexpr int get_client_history_schema_version() noexcept
 {
-    return 11;
+    return 12;
 }
 
 class IntegrationException : public std::runtime_error {
@@ -78,8 +96,6 @@ public:
         std::unique_ptr<char[]> buffer;
     };
 
-    // FIXME: Apparently, this feature is expected by object store, but why?
-    // What is it ultimately used for? (@tgoyne)
     class SyncTransactReporter {
     public:
         virtual void report_sync_transact(VersionID old_version, VersionID new_version) = 0;
@@ -234,7 +250,7 @@ public:
 
     // Overriding member functions in realm::TransformHistory
     version_type find_history_entry(version_type, version_type, HistoryEntry&) const noexcept override final;
-    ChunkedBinaryData get_reciprocal_transform(version_type) const override final;
+    ChunkedBinaryData get_reciprocal_transform(version_type, bool&) const override final;
     void set_reciprocal_transform(version_type, BinaryData) override final;
 
 public: // Stuff in this section is only used by CLI tools.
@@ -394,6 +410,7 @@ private:
     void fix_up_client_file_ident_in_stored_changesets(Transaction&, file_ident_type);
     void record_current_schema_version();
     static void record_current_schema_version(Array& schema_versions, version_type snapshot_version);
+    void compress_stored_changesets();
 
     size_t sync_history_size() const noexcept
     {

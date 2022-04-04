@@ -2,13 +2,18 @@
 
 #include <realm.h>
 #include <realm/object-store/object.hpp>
+#include <realm/object-store/c_api/types.hpp>
+#include <realm/object-store/sync/generic_network_transport.hpp>
 
-#include <realm/util/file.hpp>
+#include "sync/flx_sync_harness.hpp"
 #include "util/test_file.hpp"
+#include "realm/object-store/impl/object_accessor_impl.hpp"
 
 #include <cstring>
 #include <numeric>
 #include <thread>
+
+using namespace realm;
 
 extern "C" int realm_c_api_tests(const char* file);
 
@@ -392,7 +397,8 @@ TEST_CASE("C API (non-database)") {
             check_mode(RLM_SCHEMA_MODE_AUTOMATIC);
             check_mode(RLM_SCHEMA_MODE_IMMUTABLE);
             check_mode(RLM_SCHEMA_MODE_READ_ONLY);
-            check_mode(RLM_SCHEMA_MODE_RESET_FILE);
+            check_mode(RLM_SCHEMA_MODE_SOFT_RESET_FILE);
+            check_mode(RLM_SCHEMA_MODE_HARD_RESET_FILE);
             check_mode(RLM_SCHEMA_MODE_ADDITIVE_EXPLICIT);
             check_mode(RLM_SCHEMA_MODE_ADDITIVE_DISCOVERED);
             check_mode(RLM_SCHEMA_MODE_MANUAL);
@@ -617,14 +623,14 @@ static CPtr<realm_schema_t> make_schema()
         {
             "Bar",
             "int", // primary key
-            2,     // properties
+            3,     // properties
             1,     // computed properties,
             RLM_INVALID_CLASS_KEY,
             RLM_CLASS_NORMAL,
         },
     };
 
-    const realm_property_info_t bar_properties[3] = {
+    const realm_property_info_t bar_properties[4] = {
         {
             "int",
             "",
@@ -644,6 +650,16 @@ static CPtr<realm_schema_t> make_schema()
             "",
             RLM_INVALID_PROPERTY_KEY,
             RLM_PROPERTY_NORMAL | RLM_PROPERTY_NULLABLE,
+        },
+        {
+            "doubles",
+            "",
+            RLM_PROPERTY_TYPE_DOUBLE,
+            RLM_COLLECTION_TYPE_NONE,
+            "",
+            "",
+            RLM_INVALID_PROPERTY_KEY,
+            RLM_PROPERTY_NORMAL,
         },
         {
             "linking_objects",
@@ -837,12 +853,12 @@ TEST_CASE("C API") {
 
     SECTION("realm changed notification") {
         bool realm_changed_callback_called = false;
-        realm_add_realm_changed_callback(
+        auto token = cptr(realm_add_realm_changed_callback(
             realm,
             [](void* userdata) {
                 *reinterpret_cast<bool*>(userdata) = true;
             },
-            &realm_changed_callback_called, [](void*) {});
+            &realm_changed_callback_called, [](void*) {}));
 
         realm_begin_write(realm);
         realm_commit(realm);
@@ -895,7 +911,7 @@ TEST_CASE("C API") {
             realm_schema_t* expected_schema;
             bool result;
         } context = {new_schema, false};
-        realm_add_schema_changed_callback(
+        auto token = realm_add_schema_changed_callback(
             realm,
             [](void* userdata, auto* new_schema) {
                 auto& ctx = *reinterpret_cast<Context*>(userdata);
@@ -923,6 +939,7 @@ TEST_CASE("C API") {
         }
         free(properties);
         realm_release(new_schema);
+        realm_release(token);
     }
 
     SECTION("schema validates") {
@@ -987,6 +1004,10 @@ TEST_CASE("C API") {
         REQUIRE(found);
         bar_properties["strings"] = info.key;
 
+        REQUIRE(checked(realm_find_property(realm, class_bar.key, "doubles", &found, &info)));
+        REQUIRE(found);
+        bar_properties["doubles"] = info.key;
+
         REQUIRE(checked(realm_find_property(realm, class_bar.key, "linking_objects", &found, &info)));
         REQUIRE(found);
         bar_properties["linking_objects"] = info.key;
@@ -997,6 +1018,7 @@ TEST_CASE("C API") {
     realm_property_key_t foo_links_key = foo_properties["link_list"];
     realm_property_key_t bar_int_key = bar_properties["int"];
     realm_property_key_t bar_strings_key = bar_properties["strings"];
+    realm_property_key_t bar_doubles_key = bar_properties["doubles"];
 
     SECTION("realm_freeze()") {
         auto realm2 = cptr_checked(realm_freeze(realm));
@@ -1068,7 +1090,7 @@ TEST_CASE("C API") {
         num_found = 0;
         CHECK(checked(realm_get_property_keys(realm, class_bar.key, properties, 3, &num_found)));
         CHECK(num_found == 3);
-        CHECK(properties[2] == bar_properties["linking_objects"]);
+        CHECK(properties[2] == bar_properties["doubles"]);
 
         num_found = 0;
         CHECK(checked(realm_get_property_keys(realm, class_bar.key, properties, 1, &num_found)));
@@ -1085,7 +1107,7 @@ TEST_CASE("C API") {
         CHECK(num_found == class_foo.num_properties + class_foo.num_computed_properties);
 
         CHECK(checked(realm_get_property_keys(realm, class_bar.key, ps.data(), ps.size(), &num_found)));
-        CHECK(num_found == 3);
+        CHECK(num_found == 4);
     }
 
     SECTION("realm_get_property()") {
@@ -2178,6 +2200,7 @@ TEST_CASE("C API") {
                     CPtr<realm_collection_changes_t> changes;
                     CPtr<realm_async_error_t> error;
                     bool destroyed = false;
+                    bool called = false;
                 };
 
                 State state;
@@ -2185,6 +2208,7 @@ TEST_CASE("C API") {
                 auto on_change = [](void* userdata, const realm_collection_changes_t* changes) {
                     auto* state = static_cast<State*>(userdata);
                     state->changes = clone_cptr(changes);
+                    state->called = true;
                 };
 
                 auto on_error = [](void* userdata, const realm_async_error_t* err) {
@@ -2199,8 +2223,8 @@ TEST_CASE("C API") {
                 auto null = rlm_null();
 
                 auto require_change = [&]() {
-                    auto token = cptr_checked(realm_list_add_notification_callback(strings.get(), &state, nullptr,
-                                                                                   on_change, on_error, nullptr));
+                    auto token = cptr_checked(realm_list_add_notification_callback(
+                        strings.get(), &state, nullptr, nullptr, on_change, on_error, nullptr));
                     checked(realm_refresh(realm));
                     return token;
                 };
@@ -2211,7 +2235,7 @@ TEST_CASE("C API") {
                         [](void* p) {
                             static_cast<State*>(p)->destroyed = true;
                         },
-                        nullptr, nullptr, nullptr));
+                        nullptr, nullptr, nullptr, nullptr));
                     CHECK(!state.destroyed);
                     token.reset();
                     CHECK(state.destroyed);
@@ -2241,6 +2265,40 @@ TEST_CASE("C API") {
                                                         0, nullptr, 0, nullptr, 0);
                     CHECK(insertion_range.from == 0);
                     CHECK(insertion_range.to == 3);
+                }
+
+                SECTION("modifying target of list with a filter") {
+                    auto bars = cptr_checked(realm_get_list(obj1.get(), foo_links_key));
+                    write([&]() {
+                        auto bar_link = realm_object_as_link(obj2.get());
+                        realm_value_t bar_link_val;
+                        bar_link_val.type = RLM_TYPE_LINK;
+                        bar_link_val.link = bar_link;
+                        CHECK(checked(realm_list_insert(bars.get(), 0, bar_link_val)));
+                    });
+
+                    realm_key_path_elem_t bar_strings[] = {{class_bar.key, bar_doubles_key}};
+                    realm_key_path_t key_path_bar_strings[] = {{1, bar_strings}};
+                    realm_key_path_array_t key_path_array = {1, key_path_bar_strings};
+                    auto token = cptr_checked(realm_list_add_notification_callback(
+                        bars.get(), &state, nullptr, &key_path_array, on_change, on_error, nullptr));
+                    checked(realm_refresh(realm));
+
+                    state.called = false;
+                    write([&]() {
+                        checked(realm_set_value(obj2.get(), bar_doubles_key, rlm_double_val(5.0), false));
+                    });
+                    REQUIRE(state.called);
+                    CHECK(!state.error);
+                    CHECK(state.changes);
+
+                    state.called = false;
+                    write([&]() {
+                        checked(realm_list_insert(strings.get(), 0, str1));
+                        checked(realm_list_insert(strings.get(), 1, str2));
+                        checked(realm_list_insert(strings.get(), 2, null));
+                    });
+                    REQUIRE(!state.called);
                 }
 
                 SECTION("insertion, deletion, modification, modification after") {
@@ -2673,8 +2731,8 @@ TEST_CASE("C API") {
                 auto null = rlm_null();
 
                 auto require_change = [&]() {
-                    auto token = cptr_checked(realm_set_add_notification_callback(strings.get(), &state, nullptr,
-                                                                                  on_change, on_error, nullptr));
+                    auto token = cptr_checked(realm_set_add_notification_callback(
+                        strings.get(), &state, nullptr, nullptr, on_change, on_error, nullptr));
                     checked(realm_refresh(realm));
                     return token;
                 };
@@ -2685,7 +2743,7 @@ TEST_CASE("C API") {
                         [](void* p) {
                             static_cast<State*>(p)->destroyed = true;
                         },
-                        nullptr, nullptr, nullptr));
+                        nullptr, nullptr, nullptr, nullptr));
                     CHECK(!state.destroyed);
                     token.reset();
                     CHECK(state.destroyed);
@@ -3196,7 +3254,7 @@ TEST_CASE("C API") {
 
                 auto require_change = [&]() {
                     auto token = cptr_checked(realm_dictionary_add_notification_callback(
-                        strings.get(), &state, nullptr, on_change, on_error, nullptr));
+                        strings.get(), &state, nullptr, nullptr, on_change, on_error, nullptr));
                     checked(realm_refresh(realm));
                     return token;
                 };
@@ -3207,7 +3265,7 @@ TEST_CASE("C API") {
                         [](void* p) {
                             static_cast<State*>(p)->destroyed = true;
                         },
-                        nullptr, nullptr, nullptr));
+                        nullptr, nullptr, nullptr, nullptr));
                     CHECK(!state.destroyed);
                     token.reset();
                     CHECK(state.destroyed);
@@ -3250,6 +3308,7 @@ TEST_CASE("C API") {
             struct State {
                 CPtr<realm_object_changes_t> changes;
                 CPtr<realm_async_error_t> error;
+                bool called;
             };
 
             State state;
@@ -3257,6 +3316,7 @@ TEST_CASE("C API") {
             auto on_change = [](void* userdata, const realm_object_changes_t* changes) {
                 auto state = static_cast<State*>(userdata);
                 state->changes = clone_cptr(changes);
+                state->called = true;
             };
 
             auto on_error = [](void* userdata, const realm_async_error_t* err) {
@@ -3265,8 +3325,8 @@ TEST_CASE("C API") {
             };
 
             auto require_change = [&]() {
-                auto token = cptr(realm_object_add_notification_callback(obj1.get(), &state, nullptr, on_change,
-                                                                         on_error, nullptr));
+                auto token = cptr(realm_object_add_notification_callback(obj1.get(), &state, nullptr, nullptr,
+                                                                         on_change, on_error, nullptr));
                 checked(realm_refresh(realm));
                 return token;
             };
@@ -3305,6 +3365,32 @@ TEST_CASE("C API") {
 
                 n = realm_object_changes_get_modified_properties(state.changes.get(), modified_keys, 0);
                 CHECK(n == 0);
+            }
+            SECTION("modifying the object while observing a specific value") {
+                realm_key_path_elem_t origin_value[] = {{class_foo.key, foo_int_key}};
+                realm_key_path_t key_path_origin_value[] = {{1, origin_value}};
+                realm_key_path_array_t key_path_array = {1, key_path_origin_value};
+                auto token = cptr(realm_object_add_notification_callback(obj1.get(), &state, nullptr, &key_path_array,
+                                                                         on_change, on_error, nullptr));
+                checked(realm_refresh(realm));
+                state.called = false;
+                write([&]() {
+                    checked(realm_set_value(obj1.get(), foo_int_key, rlm_int_val(999), false));
+                });
+                REQUIRE(state.called);
+                CHECK(!state.error);
+                CHECK(state.changes);
+                realm_property_key_t modified_keys[2];
+                size_t n = realm_object_changes_get_modified_properties(state.changes.get(), modified_keys, 2);
+                CHECK(n == 1);
+                CHECK(modified_keys[0] == foo_int_key);
+
+                state.called = false;
+                write([&]() {
+                    // checked(realm_set_value(obj1.get(), foo_int_key, rlm_int_val(999), false));
+                    checked(realm_set_value(obj1.get(), foo_str_key, rlm_str_val("aaa"), false));
+                });
+                REQUIRE(!state.called);
             }
         }
     }
@@ -3622,3 +3708,285 @@ TEST_CASE("C API") {
     REQUIRE(realm_is_closed(realm));
     realm_release(realm);
 }
+
+#ifdef REALM_ENABLE_AUTH_TESTS
+TEST_CASE("app: flx-sync basic tests", "[c_api][flx][syc]") {
+    using namespace realm::app;
+
+    auto make_schema = []() -> auto
+    {
+        Schema schema{ObjectSchema("Obj", {{"_id", PropertyType::ObjectId, Property::IsPrimary{true}},
+                                           {"name", PropertyType::String | PropertyType::Nullable},
+                                           {"value", PropertyType::Int | PropertyType::Nullable}})};
+
+        return FLXSyncTestHarness::ServerSchema{std::move(schema), {"name", "value"}};
+    };
+
+    FLXSyncTestHarness harness("c_api_flx_sync_test", make_schema());
+    auto foo_obj_id = ObjectId::gen();
+    auto bar_obj_id = ObjectId::gen();
+
+    harness.load_initial_data([&](SharedRealm realm) {
+        CppContext c(realm);
+        realm->begin_transaction();
+        Object::create(c, realm, "Obj",
+                       util::Any(AnyDict{
+                           {"_id", foo_obj_id}, {"name", std::string{"foo"}}, {"value", static_cast<int64_t>(5)}}));
+        Object::create(c, realm, "Obj",
+                       util::Any(AnyDict{
+                           {"_id", bar_obj_id}, {"name", std::string{"bar"}}, {"value", static_cast<int64_t>(10)}}));
+
+        realm->commit_transaction();
+        wait_for_upload(*realm);
+    });
+
+    harness.do_with_new_realm([&](SharedRealm realm) {
+        realm_t c_wrap_realm(realm);
+
+        wait_for_download(*realm);
+        {
+            auto empty_subs = realm_sync_get_latest_subscription_set(&c_wrap_realm);
+            CHECK(realm_sync_subscription_set_size(empty_subs) == 0);
+            CHECK(realm_sync_subscription_set_version(empty_subs) == 0);
+            realm_sync_on_subscription_set_state_change_wait(
+                empty_subs, realm_flx_sync_subscription_set_state_e::RLM_SYNC_SUBSCRIPTION_COMPLETE);
+            realm_release(empty_subs);
+        }
+        realm_class_info_t table_info;
+        bool found;
+        CHECK(realm_find_class(&c_wrap_realm, "Obj", &found, &table_info));
+        auto c_wrap_query_foo = realm_query_parse(&c_wrap_realm, table_info.key, "name = 'foo'", 0, nullptr);
+        auto c_wrap_query_bar = realm_query_parse(&c_wrap_realm, table_info.key, "name = 'bar'", 0, nullptr);
+        {
+            auto sub = realm_sync_get_latest_subscription_set(&c_wrap_realm);
+            CHECK(sub != nullptr);
+            auto new_subs = realm_sync_make_subscription_set_mutable(sub);
+            std::size_t index = -1;
+            bool inserted = false;
+            auto res =
+                realm_sync_subscription_set_insert_or_assign(new_subs, c_wrap_query_foo, nullptr, &index, &inserted);
+            CHECK(inserted == true);
+            CHECK(index == 0);
+            CHECK(res);
+            auto subs = realm_sync_subscription_set_commit(new_subs);
+            auto state = realm_sync_on_subscription_set_state_change_wait(
+                subs, realm_flx_sync_subscription_set_state_e::RLM_SYNC_SUBSCRIPTION_COMPLETE);
+            CHECK(state == realm_flx_sync_subscription_set_state_e::RLM_SYNC_SUBSCRIPTION_COMPLETE);
+            realm_release(sub);
+            realm_release(new_subs);
+            realm_release(subs);
+        }
+
+        wait_for_download(*realm);
+        {
+            realm_refresh(&c_wrap_realm);
+            auto results = realm_object_find_all(&c_wrap_realm, table_info.key);
+            size_t count = 0;
+            realm_results_count(results, &count);
+            CHECK(count == 1);
+            auto object = realm_results_get_object(results, 0);
+            REQUIRE(realm_object_is_valid(object));
+            REQUIRE(object->get_column_value<ObjectId>("_id") == foo_obj_id);
+            realm_release(object);
+            realm_release(results);
+        }
+
+        {
+            auto sub = realm_sync_get_latest_subscription_set(&c_wrap_realm);
+            auto mut_sub = realm_sync_make_subscription_set_mutable(sub);
+            std::size_t index = -1;
+            bool inserted = false;
+            realm_sync_subscription_set_insert_or_assign(mut_sub, c_wrap_query_bar, nullptr, &index, &inserted);
+            CHECK(inserted);
+            auto sub_c = realm_sync_subscription_set_commit(mut_sub);
+            auto state = realm_sync_on_subscription_set_state_change_wait(
+                sub_c, realm_flx_sync_subscription_set_state_e::RLM_SYNC_SUBSCRIPTION_COMPLETE);
+            CHECK(state == realm_flx_sync_subscription_set_state_e::RLM_SYNC_SUBSCRIPTION_COMPLETE);
+            realm_release(sub);
+            realm_release(mut_sub);
+            realm_release(sub_c);
+        }
+
+        {
+            realm_refresh(&c_wrap_realm);
+            auto results = realm_object_find_all(&c_wrap_realm, table_info.key);
+            size_t count = 0;
+            realm_results_count(results, &count);
+            CHECK(count == 2);
+            realm_release(results);
+        }
+
+        {
+            auto sub = realm_sync_get_latest_subscription_set(&c_wrap_realm);
+            auto mut_sub = realm_sync_make_subscription_set_mutable(sub);
+            auto s = realm_sync_find_subscription_by_query(sub, c_wrap_query_foo);
+            CHECK(s != nullptr);
+            auto erased = realm_sync_subscription_set_erase_by_query(mut_sub, c_wrap_query_foo);
+            CHECK(erased);
+            auto c_wrap_new_query_bar = realm_query_parse(&c_wrap_realm, table_info.key, "name = 'bar'", 0, nullptr);
+            std::size_t index = -1;
+            bool inserted = false;
+            bool updated = realm_sync_subscription_set_insert_or_assign(mut_sub, c_wrap_new_query_bar, nullptr,
+                                                                        &index, &inserted);
+            CHECK(!inserted);
+            CHECK(updated);
+            auto sub_c = realm_sync_subscription_set_commit(mut_sub);
+            auto state = realm_sync_on_subscription_set_state_change_wait(
+                sub_c, realm_flx_sync_subscription_set_state_e::RLM_SYNC_SUBSCRIPTION_COMPLETE);
+            CHECK(state == realm_flx_sync_subscription_set_state_e::RLM_SYNC_SUBSCRIPTION_COMPLETE);
+            realm_release(s);
+            realm_release(sub);
+            realm_release(mut_sub);
+            realm_release(sub_c);
+            realm_release(c_wrap_new_query_bar);
+        }
+
+        {
+            realm_refresh(&c_wrap_realm);
+            auto results = realm_object_find_all(&c_wrap_realm, table_info.key);
+            size_t count = 0;
+            realm_results_count(results, &count);
+            CHECK(count == 1);
+            auto object = realm_results_get_object(results, 0);
+            REQUIRE(realm_object_is_valid(object));
+            REQUIRE(object->get_column_value<ObjectId>("_id") == bar_obj_id);
+            realm_release(object);
+            realm_release(results);
+        }
+
+        {
+            auto sub = realm_sync_get_latest_subscription_set(&c_wrap_realm);
+            auto mut_sub = realm_sync_make_subscription_set_mutable(sub);
+            auto cleared = realm_sync_subscription_set_clear(mut_sub);
+            CHECK(cleared);
+            auto sub_c = realm_sync_subscription_set_commit(mut_sub);
+            auto state = realm_sync_on_subscription_set_state_change_wait(
+                sub_c, realm_flx_sync_subscription_set_state_e::RLM_SYNC_SUBSCRIPTION_COMPLETE);
+            CHECK(state == realm_flx_sync_subscription_set_state_e::RLM_SYNC_SUBSCRIPTION_COMPLETE);
+            realm_release(sub);
+            realm_release(mut_sub);
+            realm_release(sub_c);
+        }
+
+        {
+            realm_refresh(&c_wrap_realm);
+            auto results = realm_object_find_all(&c_wrap_realm, table_info.key);
+            size_t count = std::numeric_limits<std::size_t>::max();
+            realm_results_count(results, &count);
+            CHECK(count == 0);
+            realm_release(results);
+        }
+
+        {
+            auto c_wrap_new_query_bar = realm_query_parse(&c_wrap_realm, table_info.key, "name = 'bar'", 0, nullptr);
+            auto sub = realm_sync_get_latest_subscription_set(&c_wrap_realm);
+            auto mut_sub = realm_sync_make_subscription_set_mutable(sub);
+            std::size_t index = -1;
+            bool inserted = false;
+            bool success =
+                realm_sync_subscription_set_insert_or_assign(mut_sub, c_wrap_new_query_bar, "bar", &index, &inserted);
+            CHECK(inserted);
+            CHECK(success);
+            auto sub_c = realm_sync_subscription_set_commit(mut_sub);
+            auto state = realm_sync_on_subscription_set_state_change_wait(
+                sub_c, realm_flx_sync_subscription_set_state_e::RLM_SYNC_SUBSCRIPTION_COMPLETE);
+            CHECK(state == realm_flx_sync_subscription_set_state_e::RLM_SYNC_SUBSCRIPTION_COMPLETE);
+            realm_release(sub);
+            realm_release(mut_sub);
+            realm_release(sub_c);
+            realm_release(c_wrap_new_query_bar);
+        }
+
+        {
+            realm->refresh();
+            auto results = realm_object_find_all(&c_wrap_realm, table_info.key);
+            size_t count = std::numeric_limits<std::size_t>::max();
+            realm_results_count(results, &count);
+            CHECK(count == 1);
+            realm_release(results);
+        }
+
+        {
+            auto sub = realm_sync_get_latest_subscription_set(&c_wrap_realm);
+            auto mut_sub = realm_sync_make_subscription_set_mutable(sub);
+            realm_sync_subscription_set_erase_by_name(mut_sub, "bar");
+            auto sub_c = realm_sync_subscription_set_commit(mut_sub);
+            auto state = realm_sync_on_subscription_set_state_change_wait(
+                sub_c, realm_flx_sync_subscription_set_state_e::RLM_SYNC_SUBSCRIPTION_COMPLETE);
+            CHECK(state == realm_flx_sync_subscription_set_state_e::RLM_SYNC_SUBSCRIPTION_COMPLETE);
+            realm_release(sub);
+            realm_release(mut_sub);
+            realm_release(sub_c);
+        }
+
+        {
+            realm_refresh(&c_wrap_realm);
+            auto results = realm_object_find_all(&c_wrap_realm, table_info.key);
+            size_t count = std::numeric_limits<std::size_t>::max();
+            realm_results_count(results, &count);
+            CHECK(count == 0);
+            realm_release(results);
+        }
+
+        {
+            auto test_query = realm_query_parse(&c_wrap_realm, table_info.key, "name = 'bar'", 0, nullptr);
+            auto sub = realm_sync_get_latest_subscription_set(&c_wrap_realm);
+            auto mut_sub = realm_sync_make_subscription_set_mutable(sub);
+            std::size_t index = -1;
+            bool inserted = false;
+            bool success =
+                realm_sync_subscription_set_insert_or_assign(mut_sub, c_wrap_query_bar, nullptr, &index, &inserted);
+            CHECK(inserted);
+            CHECK(success);
+            auto sub_c = realm_sync_subscription_set_commit(mut_sub);
+            // lambdas with state cannot be easily converted to function pointers, add a simple singleton that syncs
+            // the state among threads
+            struct SyncObject {
+                std::mutex m_mutex;
+                std::condition_variable m_cv;
+                realm_flx_sync_subscription_set_state m_state{RLM_SYNC_SUBSCRIPTION_UNCOMMITTED};
+
+                static SyncObject& create()
+                {
+                    static SyncObject sync_object;
+                    return sync_object;
+                }
+
+                void set_state_and_notify(realm_flx_sync_subscription_set_state state)
+                {
+                    {
+                        std::lock_guard<std::mutex> guard{m_mutex};
+                        m_state = state;
+                    }
+                    m_cv.notify_one();
+                }
+
+                realm_flx_sync_subscription_set_state wait_state()
+                {
+                    using namespace std::chrono_literals;
+                    std::unique_lock<std::mutex> lock{m_mutex};
+                    m_cv.wait_for(lock, 300ms, [this]() {
+                        return m_state == RLM_SYNC_SUBSCRIPTION_COMPLETE;
+                    });
+                    return m_state;
+                }
+            };
+
+            auto callback = [](auto, realm_flx_sync_subscription_set_state_e sub_state) {
+                SyncObject::create().set_state_and_notify(sub_state);
+            };
+            realm_sync_on_subscription_set_state_change_async(
+                sub_c, realm_flx_sync_subscription_set_state_e::RLM_SYNC_SUBSCRIPTION_COMPLETE, callback);
+            CHECK(SyncObject::create().wait_state() ==
+                  realm_flx_sync_subscription_set_state_e::RLM_SYNC_SUBSCRIPTION_COMPLETE);
+
+            realm_release(sub);
+            realm_release(mut_sub);
+            realm_release(sub_c);
+            realm_release(test_query);
+        }
+        realm_release(c_wrap_query_foo);
+        realm_release(c_wrap_query_bar);
+    });
+}
+#endif // REALM_ENABLE_AUTH_TESTS

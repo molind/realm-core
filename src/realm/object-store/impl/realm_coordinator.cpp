@@ -99,50 +99,7 @@ void RealmCoordinator::create_sync_session()
     open_db();
     if (m_sync_session)
         return;
-    m_config.sync_config->get_fresh_realm_for_path =
-        [&](const std::string& path, util::UniqueFunction<void(DBRef, util::Optional<std::string>)> callback) {
-            try {
-                // Get a fully downloaded Realm using the current configuration but changing the
-                // on disk path to the one provided. The current sync session is not affected.
-                REALM_ASSERT(!path.empty());
-                REALM_ASSERT(path != m_config.path);
-                REALM_ASSERT(m_config.sync_config);
-                auto copy_config = m_config;
-                copy_config.schema = util::none;
-                copy_config.realm_data = BinaryData{};
-                copy_config.audit_factory = {};
-                copy_config.path = path;
-                // Do not use 'discard local' mode on the fresh Realm. Use manual mode so that
-                // any error during the download is propagated back to the original session.
-                // This prevents a cycle if the fresh copy itself experiences a client reset.
-                // To make this change and not have it affect the actual sync session, an explicit
-                // copy must be made of the sync config because it is a shared pointer.
-                copy_config.sync_config = std::make_shared<SyncConfig>(*m_config.sync_config);
-                copy_config.sync_config->client_resync_mode = ClientResyncMode::Manual;
-                std::shared_ptr<RealmCoordinator> rc = get_coordinator(copy_config);
-                REALM_ASSERT(rc);
-                auto task = rc->get_synchronized_realm(copy_config);
-                task->start([callback = std::move(callback), path](ThreadSafeReference, std::exception_ptr err) {
-                    try {
-                        if (err) {
-                            std::rethrow_exception(err);
-                        }
-                        else {
-                            std::shared_ptr<RealmCoordinator> rc = RealmCoordinator::get_coordinator(path);
-                            rc->m_sync_session->log_out();
-                            rc->m_sync_session->close();
-                            callback(rc->m_db, util::none);
-                        }
-                    }
-                    catch (const std::exception& e) {
-                        callback(nullptr, util::make_optional<std::string>(e.what()));
-                    }
-                });
-            }
-            catch (const std::exception& e) {
-                callback(nullptr, util::make_optional<std::string>(e.what()));
-            }
-        };
+
     m_sync_session = m_config.sync_config->user->sync_manager()->get_session(m_db, *m_config.sync_config);
 
     std::weak_ptr<RealmCoordinator> weak_self = shared_from_this();
@@ -525,6 +482,8 @@ void RealmCoordinator::open_db()
 #endif
 
     bool server_synchronization_mode = m_config.sync_config || m_config.force_sync_history;
+    bool schema_mode_reset_file =
+        m_config.schema_mode == SchemaMode::SoftResetFile || m_config.schema_mode == SchemaMode::HardResetFile;
     try {
         if (m_config.immutable() && m_config.realm_data) {
             m_db = DB::create(m_config.realm_data, false);
@@ -551,8 +510,7 @@ void RealmCoordinator::open_db()
             options.temp_dir = util::normalize_dir(m_config.fifo_files_fallback_path);
         }
         options.encryption_key = m_config.encryption_key.data();
-        options.allow_file_format_upgrade =
-            !m_config.disable_format_upgrade && m_config.schema_mode != SchemaMode::ResetFile;
+        options.allow_file_format_upgrade = !m_config.disable_format_upgrade && !schema_mode_reset_file;
         if (history) {
             options.backup_at_file_format_change = m_config.backup_at_file_format_change;
             m_db = DB::create(std::move(history), m_config.path, options);
@@ -562,14 +520,14 @@ void RealmCoordinator::open_db()
         }
     }
     catch (realm::FileFormatUpgradeRequired const&) {
-        if (m_config.schema_mode != SchemaMode::ResetFile) {
+        if (!schema_mode_reset_file) {
             translate_file_exception(m_config.path, m_config.immutable());
         }
         util::File::remove(m_config.path);
         return open_db();
     }
     catch (UnsupportedFileFormatVersion const&) {
-        if (m_config.schema_mode != SchemaMode::ResetFile) {
+        if (!schema_mode_reset_file) {
             translate_file_exception(m_config.path, m_config.immutable());
         }
         util::File::remove(m_config.path);
