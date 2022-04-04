@@ -13,20 +13,14 @@ extern "C" {
 namespace realm {
 
 EXPORT void MigrateSyncedRealm(const std::string &inPath, const std::string &outPath) {
-    std::map<std::string, std::string> renames;
-    
     auto syncHist = realm::sync::make_client_replication(inPath);
 
     realm::DBOptions options;
     options.allow_file_format_upgrade = true;
 
-    auto syncDB = realm::DB::create(*syncHist, options);
-    std::cerr << "File upgraded to latest version: " << inPath << std::endl;
-    
+    auto syncDB = realm::DB::create(*syncHist, options);    
     auto localDB = realm::DB::create(outPath);
     auto writeTr = localDB->start_write();
-
-    auto link_depth = 0;
     auto readTr = syncDB->start_read();
     
     // служебные таблицы в сетевом реалме. их не надо копировать
@@ -41,7 +35,6 @@ EXPORT void MigrateSyncedRealm(const std::string &inPath, const std::string &out
             continue;
 
         auto table = readTr->get_table(tableKey);
-
         auto pkCol = table->get_primary_key_column();
         auto writeTable = writeTr->add_table_with_primary_key(tableName, table->get_column_type(pkCol), table->get_column_name(pkCol));
         
@@ -51,8 +44,10 @@ EXPORT void MigrateSyncedRealm(const std::string &inPath, const std::string &out
                 continue; 
 
             auto attr = table->get_column_attr(column);
-            auto writeCol = writeTable->add_column(table->get_column_type(column), table->get_column_name(column), attr.test(col_attr_Nullable));
-            if (attr.test(col_attr_Indexed))
+            const auto &colName = table->get_column_name(column);
+            auto writeCol = writeTable->add_column(table->get_column_type(column), colName, attr.test(col_attr_Nullable));
+            // у исходной таблицы не всегда folderUuid индексирован
+            if (attr.test(col_attr_Indexed) || colName == "folderUuid")
                 writeTable->add_search_index(writeCol);
         }
 

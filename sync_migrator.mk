@@ -100,26 +100,27 @@ APP = sync_migrator
 APP_SRC = sync_migrator_app.cpp
 APP_OBJ = $(APP_SRC:.cpp=.o)
 
-CXXFLAGS = -std=c++17 -I./src -I./genfiles
-
 GENERATED_HEADERS = \
 	genfiles/realm/util/config.h
 
-LDFLAGS = -L.
-
-ifeq "$(LIBS_PLATFORM)" "catalyst"
-	LDFLAGS := $(LDFLAGS) -framework CoreFoundation 
-elseq "$(LIBS_PLATFORM)" "android"
-	LDFLAGS := $(LDFLAGS) -landroid -llog
-else # test app on mac
-	LDFLAGS := $(LDFLAGS) -framework CoreFoundation
+ifeq ($(LIBS_PLATFORM),)
+LIBS_PLATFORM := macos
 endif
+
+LDFLAGS_ios := $(LDFLAGS) -framework CoreFoundation 
+LDFLAGS_catalyst := $(LDFLAGS) -framework CoreFoundation
+LDFLAGS_macos := $(LDFLAGS) -framework CoreFoundation
+LDFLAGS_android := $(LDFLAGS) -landroid -llog
+
+LDFLAGS = ${LDFLAGS_${LIBS_PLATFORM}}
+
+CXXFLAGS := $(CXXFLAGS) -std=c++17 -I./src -I./genfiles
 
 .SUFFIXES: .cpp
 
 all: $(APP)
 
-FLAGS = -g -O0 -DREALM_VERSION_MAJOR=10 -DREALM_VERSION_MINOR=0 -DREALM_VERSION_PATCH=0 -DREALM_VERSION_STRING='"10.0.0-alpha"'
+FLAGS = -DREALM_VERSION_MAJOR=10 -DREALM_VERSION_MINOR=0 -DREALM_VERSION_PATCH=0 -DREALM_VERSION_STRING='"10.0.0-alpha"'
 
 .cpp.o:
 	$(CXX) $(FLAGS) $(CPPFLAGS) ${CXXFLAGS} -c $< -o $@
@@ -130,16 +131,25 @@ FLAGS = -g -O0 -DREALM_VERSION_MAJOR=10 -DREALM_VERSION_MINOR=0 -DREALM_VERSION_
 $(OBJ): $(GENERATED_HEADERS)
 
 $(LIB): $(OBJ)
-	$(CXX) -fvisibility=hidden -shared -o $(LIB) $(FLAGS) ${LDFLAGS} $(OBJ)
+	$(CXX) $(CXXFLAGS) -fvisibility=hidden -shared -o $(LIB) $(FLAGS) ${LDFLAGS} $(OBJ)
 
 $(APP): $(APP_OBJ) $(LIB)
-	$(CXX) $(CPPFLAGS) -o $(APP) $(APP_OBJ) $(LDFLAGS) -lsync_migrator
+	$(CXX) $(CXXFLAGS) -o $(APP) $(APP_OBJ) $(LDFLAGS) -L. -lsync_migrator
 
 genfiles/realm/util/config.h:
 	mkdir -p genfiles/realm/util
 	touch genfiles/realm/util/config.h
 
-.PHONY: clean all
+.PHONY: clean install all
+
+ifndef PREFIX
+PREFIX = /usr/local
+endif
+
+install: $(LIB)
+	mkdir -p ${PREFIX}/lib ${PREFIX}/include/realm
+	cp $(LIB) ${PREFIX}/lib
+	cp sync_migrator.hpp ${PREFIX}/include/realm
 
 clean:
 	rm -f $(OBJ) $(APP_OBJ) $(LIB) $(APP) $(GENERATED_HEADERS)
