@@ -29,7 +29,7 @@ EXPORT void MigrateSyncedRealm(const std::string &inPath, const std::string &out
     filteredTables.emplace("class_ModelSearchHistoryItem");
 
     auto tableKeys = readTr->get_table_keys();
-    for (const auto &tableKey : tableKeys) {
+    for (const auto tableKey : tableKeys) {
         auto tableName = readTr->get_table_name(tableKey);
         if (filteredTables.find(tableName) != filteredTables.end())
             continue;
@@ -39,7 +39,7 @@ EXPORT void MigrateSyncedRealm(const std::string &inPath, const std::string &out
         auto writeTable = writeTr->add_table_with_primary_key(tableName, table->get_column_type(pkCol), table->get_column_name(pkCol));
         
         auto columns = table->get_column_keys();
-        for (const auto &column : columns) {
+        for (const auto column : columns) {
             if (column == pkCol)
                 continue; 
 

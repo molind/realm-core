@@ -85,3 +85,5 @@ Thumbs.db
 # Swift package manager
 /.swiftpm
 /.build
+sync_migrator.xcodeproj/project.xcworkspace/xcuserdata
+sync_migrator.xcodeproj/project.xcworkspace/xcshareddata
