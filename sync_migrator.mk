@@ -66,6 +66,9 @@ SRC = \
 	src/realm/util/terminate.cpp \
 	src/realm/util/thread.cpp \
 	src/realm/util/to_string.cpp \
+	src/realm/object-store/object_schema.cpp \
+	src/realm/object-store/object_store.cpp \
+	src/realm/object-store/schema.cpp \
 	src/realm/sync/changeset.cpp \
 	src/realm/sync/changeset_encoder.cpp \
 	src/realm/sync/changeset_parser.cpp \

@@ -3,6 +3,7 @@
 
 #include <realm.hpp>
 #include <realm/history.hpp>
+#include <realm/object-store/object_store.hpp>
 #include <realm/sync/noinst/client_history_impl.hpp>
 
 #include <map>
@@ -23,6 +24,9 @@ EXPORT void MigrateSyncedRealm(const std::string &inPath, const std::string &out
     auto writeTr = localDB->start_write();
     auto readTr = syncDB->start_read();
     
+    int version = ObjectStore::get_schema_version(*readTr);
+    ObjectStore::set_schema_version(*writeTr, version);
+
     // служебные таблицы в сетевом реалме. их не надо копировать
     auto filteredTables = std::set<std::string>{"metadata", "class___Permission", "class___Role", "class___Class", "class___Realm", "class___User"};
     // бывало мы заливали историю поиска в сетевую базу. выковыривать ее оттуда не надо.
