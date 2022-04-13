@@ -2549,7 +2549,8 @@ typedef void (*realm_app_user_completion_func_t)(void* userdata, realm_user_t* u
 
 RLM_API realm_app_credentials_t* realm_app_credentials_new_anonymous(void) RLM_API_NOEXCEPT;
 RLM_API realm_app_credentials_t* realm_app_credentials_new_facebook(const char* access_token) RLM_API_NOEXCEPT;
-RLM_API realm_app_credentials_t* realm_app_credentials_new_google(const char* id_token) RLM_API_NOEXCEPT;
+RLM_API realm_app_credentials_t* realm_app_credentials_new_google_id_token(const char* id_token) RLM_API_NOEXCEPT;
+RLM_API realm_app_credentials_t* realm_app_credentials_new_google_auth_code(const char* auth_code) RLM_API_NOEXCEPT;
 RLM_API realm_app_credentials_t* realm_app_credentials_new_apple(const char* id_token) RLM_API_NOEXCEPT;
 RLM_API realm_app_credentials_t* realm_app_credentials_new_jwt(const char* jwt_token) RLM_API_NOEXCEPT;
 RLM_API realm_app_credentials_t* realm_app_credentials_new_email_password(const char* email,
@@ -2584,6 +2585,13 @@ RLM_API void realm_app_config_set_default_request_timeout(realm_app_config_t*, u
 RLM_API void realm_app_config_set_platform(realm_app_config_t*, const char*) RLM_API_NOEXCEPT;
 RLM_API void realm_app_config_set_platform_version(realm_app_config_t*, const char*) RLM_API_NOEXCEPT;
 RLM_API void realm_app_config_set_sdk_version(realm_app_config_t*, const char*) RLM_API_NOEXCEPT;
+/**
+ * Get an existing @a realm_app_credentials_t and return it's json representation
+ * Note: the caller must delete the pointer to the string via realm_release
+ *
+ * @return: a non-null ptr to the string representing the json configuration.
+ */
+RLM_API const char* realm_app_credentials_serialize_as_json(realm_app_credentials_t*) RLM_API_NOEXCEPT;
 
 /**
  * Get an existing @a realm_app_t* instance with the same app id, or create it with the

@@ -246,9 +246,14 @@ RLM_API realm_app_credentials_t* realm_app_credentials_new_facebook(const char* 
     return new realm_app_credentials_t(AppCredentials::facebook(access_token));
 }
 
-RLM_API realm_app_credentials_t* realm_app_credentials_new_google(const char* id_token) noexcept
+RLM_API realm_app_credentials_t* realm_app_credentials_new_google_id_token(const char* id_token) noexcept
 {
-    return new realm_app_credentials_t(AppCredentials::google(AuthCode(id_token)));
+    return new realm_app_credentials_t(AppCredentials::google(IdToken(id_token)));
+}
+
+RLM_API realm_app_credentials_t* realm_app_credentials_new_google_auth_code(const char* auth_code) noexcept
+{
+    return new realm_app_credentials_t(AppCredentials::google(AuthCode(auth_code)));
 }
 
 RLM_API realm_app_credentials_t* realm_app_credentials_new_apple(const char* id_token) noexcept
@@ -332,6 +337,13 @@ RLM_API void realm_app_config_set_platform_version(realm_app_config_t* config, c
 RLM_API void realm_app_config_set_sdk_version(realm_app_config_t* config, const char* sdk_version) noexcept
 {
     config->sdk_version = std::string(sdk_version);
+}
+
+RLM_API const char* realm_app_credentials_serialize_as_json(realm_app_credentials_t* app_credentials) noexcept
+{
+    return wrap_err([&] {
+        return duplicate_string(app_credentials->serialize_as_json());
+    });
 }
 
 RLM_API realm_app_t* realm_app_get(const realm_app_config_t* app_config,
