@@ -2190,21 +2190,35 @@ private:
             return;
         }
 
-        auto paramName = std::string_view("baas_at=");
-        auto start = request.path.find(paramName);
-        if (start == std::string::npos) {
-            logger.error("Missing auth GET param");
+        auto token = std::string("");
+
+        // Check Auth header. Used by Android
+        const auto &auth_header = request.headers.at("Authorization");
+        auto bearer = std::string_view("Bearer ");
+        auto start = request.path.find(bearer);
+        if (start != std::string::npos) {
+            start += bearer.length();
+            token = auth_header.substr(start, auth_header.length() - start);
+        } else { // Check baas_at param. Used by iOS
+            auto paramName = std::string_view("baas_at=");
+            auto start = request.path.find(paramName);
+            if (start != std::string::npos) {
+                start += paramName.length();
+        
+                auto end = request.path.find('&', start);
+                if (end == std::string::npos) {
+                    end = request.path.length();
+                }
+
+                token = request.path.substr(start, end - start);
+            }
+        }
+
+        if (token.length() == 0) {
+            logger.error("Missing Authorization header and baas_at param");
             close_due_to_error(websocket::Error::bad_response_401_unauthorized);
             return;
         }
-        start += paramName.length();
-    
-        auto end = request.path.find('&', start);
-        if (end == std::string::npos) {
-            end = request.path.length();
-        }
-
-        auto token = request.path.substr(start, end - start);
 
         AccessToken::ParseError error;
         util::Optional<AccessToken> access_token =
