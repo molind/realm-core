@@ -2193,13 +2193,17 @@ private:
         auto token = std::string("");
 
         // Check Auth header. Used by Android
-        const auto &auth_header = request.headers.at("Authorization");
-        auto bearer = std::string_view("Bearer ");
-        auto start = request.path.find(bearer);
-        if (start != std::string::npos) {
-            start += bearer.length();
-            token = auth_header.substr(start, auth_header.length() - start);
-        } else { // Check baas_at param. Used by iOS
+        const auto &it = request.headers.find("Authorization");
+        if (it != request.headers.end()) {
+            auto auth_header = it->second;
+            auto bearer = std::string_view("Bearer ");
+            auto start = auth_header.find(bearer);
+            if (start != std::string::npos) {
+                start += bearer.length();
+                token = auth_header.substr(start, auth_header.length() - start);
+            }
+        } 
+        if (token.length() == 0) { // Check baas_at param. Used by iOS
             auto paramName = std::string_view("baas_at=");
             auto start = request.path.find(paramName);
             if (start != std::string::npos) {
