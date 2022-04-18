@@ -113,7 +113,7 @@ endif
 LDFLAGS_ios := $(LDFLAGS) -framework CoreFoundation 
 LDFLAGS_catalyst := $(LDFLAGS) -framework CoreFoundation
 LDFLAGS_macos := $(LDFLAGS) -framework CoreFoundation
-LDFLAGS_android := $(LDFLAGS) -landroid -llog
+LDFLAGS_android := $(LDFLAGS) -landroid -llog -lcrypto
 
 LDFLAGS = ${LDFLAGS_${LIBS_PLATFORM}}
 
