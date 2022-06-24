@@ -1,7 +1,6 @@
 SRC = \
-	src/realm/alloc.cpp \
 	src/realm/alloc_slab.cpp \
-	src/realm/array.cpp \
+	src/realm/alloc.cpp \
 	src/realm/array_backlink.cpp \
 	src/realm/array_binary.cpp \
 	src/realm/array_blob.cpp \
@@ -12,10 +11,11 @@ SRC = \
 	src/realm/array_key.cpp \
 	src/realm/array_mixed.cpp \
 	src/realm/array_object_id.cpp \
-	src/realm/array_string.cpp \
 	src/realm/array_string_short.cpp \
+	src/realm/array_string.cpp \
 	src/realm/array_timestamp.cpp \
 	src/realm/array_unsigned.cpp \
+	src/realm/array.cpp \
 	src/realm/bplustree.cpp \
 	src/realm/chunked_binary.cpp \
 	src/realm/cluster.cpp \
@@ -25,38 +25,54 @@ SRC = \
 	src/realm/disable_sync_to_disk.cpp \
 	src/realm/exceptions.cpp \
 	src/realm/global_key.cpp \
-	src/realm/group.cpp \
 	src/realm/group_writer.cpp \
+	src/realm/group.cpp \
+	src/realm/history.cpp \
+	src/realm/impl/output_stream.cpp \
+	src/realm/impl/simulated_failure.cpp \
+	src/realm/impl/transact_log.cpp \
 	src/realm/index_string.cpp \
 	src/realm/list.cpp \
 	src/realm/mixed.cpp \
 	src/realm/node.cpp \
-	src/realm/obj.cpp \
 	src/realm/obj_list.cpp \
+	src/realm/obj.cpp \
 	src/realm/object_id.cpp \
-	src/realm/query.cpp \
+	src/realm/object-store/object_schema.cpp \
+	src/realm/object-store/object_store.cpp \
+	src/realm/object-store/schema.cpp \
 	src/realm/query_engine.cpp \
+	src/realm/query.cpp \
 	src/realm/replication.cpp \
 	src/realm/sort_descriptor.cpp \
 	src/realm/spec.cpp \
 	src/realm/string_data.cpp \
-	src/realm/table.cpp \
+	src/realm/sync/changeset_encoder.cpp \
+	src/realm/sync/changeset_parser.cpp \
+	src/realm/sync/changeset.cpp \
+	src/realm/sync/history.cpp \
+	src/realm/sync/instruction_applier.cpp \
+	src/realm/sync/instruction_replication.cpp \
+	src/realm/sync/instructions.cpp \
+	src/realm/sync/noinst/changeset_index.cpp \
+	src/realm/sync/noinst/client_history_impl.cpp \
+	src/realm/sync/noinst/object_id_history_state.cpp \
+	src/realm/sync/object_id.cpp \
+	src/realm/sync/object.cpp \
+	src/realm/sync/transform.cpp \
 	src/realm/table_ref.cpp \
 	src/realm/table_view.cpp \
+	src/realm/table.cpp \
 	src/realm/unicode.cpp \
-	src/realm/utilities.cpp \
-	src/realm/impl/output_stream.cpp \
-	src/realm/impl/simulated_failure.cpp \
-	src/realm/impl/transact_log.cpp \
-	src/realm/util/allocator.cpp \
 	src/realm/util/allocation_metrics.cpp \
+	src/realm/util/allocator.cpp \
 	src/realm/util/backtrace.cpp \
 	src/realm/util/base64.cpp \
 	src/realm/util/basic_system_errors.cpp \
 	src/realm/util/encrypted_file_mapping.cpp \
 	src/realm/util/fifo_helper.cpp \
-	src/realm/util/file.cpp \
 	src/realm/util/file_mapper.cpp \
+	src/realm/util/file.cpp \
 	src/realm/util/interprocess_condvar.cpp \
 	src/realm/util/interprocess_mutex.cpp \
 	src/realm/util/logger.cpp \
@@ -66,22 +82,7 @@ SRC = \
 	src/realm/util/terminate.cpp \
 	src/realm/util/thread.cpp \
 	src/realm/util/to_string.cpp \
-	src/realm/object-store/object_schema.cpp \
-	src/realm/object-store/object_store.cpp \
-	src/realm/object-store/schema.cpp \
-	src/realm/sync/changeset.cpp \
-	src/realm/sync/changeset_encoder.cpp \
-	src/realm/sync/changeset_parser.cpp \
-	src/realm/sync/history.cpp \
-	src/realm/sync/instructions.cpp \
-	src/realm/sync/instruction_applier.cpp \
-	src/realm/sync/instruction_replication.cpp \
-	src/realm/sync/object.cpp \
-	src/realm/sync/object_id.cpp \
-	src/realm/sync/transform.cpp \
-	src/realm/sync/noinst/changeset_index.cpp \
-	src/realm/sync/noinst/client_history_impl.cpp \
-	src/realm/sync/noinst/object_id_history_state.cpp \
+	src/realm/utilities.cpp \
 	sync_migrator.cpp
 
 EXTERNAL_SRC = \

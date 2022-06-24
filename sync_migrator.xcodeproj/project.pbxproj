@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		6CE19D1628663084007054CB /* history.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 6CFBBA7527FF1E2F00730E1E /* history.cpp */; };
 		6CFBB3A927FF1A6700730E1E /* sync_migrator.hpp in Headers */ = {isa = PBXBuildFile; fileRef = 6CFBB3A427FF1A6700730E1E /* sync_migrator.hpp */; settings = {ATTRIBUTES = (Public, ); }; };
 		6CFBB3AD27FF1A6700730E1E /* sync_migrator.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 6CFBB3A827FF1A6700730E1E /* sync_migrator.cpp */; };
 		6CFBBBE027FF1E3A00730E1E /* alloc_slab.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 6CFBBA6927FF1E2F00730E1E /* alloc_slab.cpp */; };
@@ -2594,6 +2595,7 @@
 				6CFBBC1527FF242400730E1E /* interprocess_condvar.cpp in Sources */,
 				6CFBBC2D27FF246B00730E1E /* changeset_index.cpp in Sources */,
 				6CFBBC1627FF242400730E1E /* file_mapper.cpp in Sources */,
+				6CE19D1628663084007054CB /* history.cpp in Sources */,
 				6CFBBC1E27FF242400730E1E /* thread.cpp in Sources */,
 				6CFBBC1427FF242400730E1E /* fifo_helper.cpp in Sources */,
 				6CFBBC1227FF242400730E1E /* basic_system_errors.cpp in Sources */,

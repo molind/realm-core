@@ -1372,26 +1372,6 @@ void Table::migrate_objects(util::FunctionRef<void()> commit_and_continue)
     if (m_clusters.size() == number_of_objects)
         return;
 
-    /******************** Optionally create !OID accessor ********************/
-
-    BPlusTree<Int>* oid_column = nullptr;
-    std::unique_ptr<BPlusTreeBase> oid_column_store;
-    if (m_spec.get_column_name(0) == "!OID") {
-        // The !OID column is needed in the next stage as well, so it must be
-        // deleted in this stage, so move it from column_accessors to oid_column_store.
-        auto col0 = m_spec.get_key(0);
-        oid_column_store = std::move(column_accessors[col0]);
-
-        column_accessors.erase(col0);
-        oid_column = dynamic_cast<BPlusTree<Int>*>(oid_column_store.get());
-        REALM_ASSERT(oid_column);
-
-        // Delete '0' from cols_to_destroy
-        auto first = cols_to_destroy.begin();
-        REALM_ASSERT(*first == 0);
-        cols_to_destroy.erase(first);
-    }
-
     /*************************** Create objects ******************************/
 
     int64_t max_key_value = -1;
@@ -1410,7 +1390,7 @@ void Table::migrate_objects(util::FunctionRef<void()> commit_and_continue)
         }
 
         // Key will either be equal to the old row number or be based on value from !OID column
-        ObjKey obj_key(oid_column ? oid_column->get(row_ndx) : row_ndx);
+        ObjKey obj_key(row_ndx);
         // Create object with the initial values
         if (obj_key.value > max_key_value) {
             max_key_value = obj_key.value;
@@ -1564,6 +1544,10 @@ void Table::migrate_links(util::FunctionRef<void()> commit_and_continue)
 
 void Table::finalize_migration()
 {
+    if (auto oid_col = get_column_key("!OID")) {
+        remove_column(oid_col);
+    }
+
     ref_type ref = m_top.get_as_ref(top_position_for_columns);
     if (ref) {
         Array::destroy_deep(ref, m_alloc);
