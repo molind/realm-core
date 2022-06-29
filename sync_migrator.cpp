@@ -5,6 +5,7 @@
 #include <realm/history.hpp>
 #include <realm/object-store/object_store.hpp>
 #include <realm/sync/noinst/client_history_impl.hpp>
+#include <realm/sync/noinst/server_history.hpp>
 
 #include <map>
 #include <set>
@@ -76,19 +77,6 @@ void MigrateRealm(DBRef inRealm, DBRef outRealm)
 }
 
 EXPORT void MigrateClientRealm(const std::string& inPath, const std::string& outPath)
-{
-    auto syncHist = realm::sync::make_client_replication(inPath);
-
-    realm::DBOptions options;
-    options.allow_file_format_upgrade = true;
-
-    auto syncDB = realm::DB::create(*syncHist, options);
-    auto localDB = realm::DB::create(outPath);
-
-    MigrateRealm(syncDB, localDB);
-}
-
-EXPORT void MigrateServerRealm(const std::string& inPath, const std::string& outPath)
 {
     auto syncHist = realm::sync::make_client_replication(inPath);
 
