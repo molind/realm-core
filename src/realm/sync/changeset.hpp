@@ -4,15 +4,13 @@
 
 #include <realm/sync/instructions.hpp>
 #include <realm/util/optional.hpp>
-#include <realm/util/allocation_metrics.hpp>
-#include <realm/util/metered/vector.hpp>
 
 #include <type_traits>
 
 namespace realm {
 namespace sync {
 
-using InternStrings = util::metered::vector<StringBufferRange>;
+using InternStrings = std::vector<StringBufferRange>;
 
 struct BadChangesetError : ExceptionWithBacktrace<std::runtime_error> {
     using ExceptionWithBacktrace<std::runtime_error>::ExceptionWithBacktrace;
@@ -177,6 +175,18 @@ struct Changeset {
     /// untransformed changeset was produced.
     file_ident_type origin_file_ident = 0;
 
+    /// Must be set before passing this Changeset to Transformer::transform_remote_changesets
+    /// to the index of this changeset within the received changesets.
+    ///
+    /// In FLX sync the server may send multiple idempotent changesets with the same server version
+    /// when bootstrapping data. Internal data structures within the OT Transformer require the
+    /// input changesets to be sortable in the order that they were received. If the version number
+    /// is not increasing, this will be used to determine the correct sort order.
+    ///
+    /// FIXME: This is a hack that we need to figure out a better way of fixing. This can maybe
+    /// be part of refactoring the ChangesetIndex
+    size_t transform_sequence = 0;
+
     /// Compare for exact equality, including that interned strings have the
     /// same integer values, and there is the same number of interned strings,
     /// same topology of tombstones, etc.
@@ -184,7 +194,7 @@ struct Changeset {
     bool operator!=(const Changeset& that) const noexcept;
 
 private:
-    util::metered::vector<Instruction> m_instructions;
+    std::vector<Instruction> m_instructions;
     std::shared_ptr<std::string> m_string_buffer;
     std::shared_ptr<InternStrings> m_strings;
     bool m_is_dirty = false;
@@ -203,7 +213,7 @@ std::ostream& operator<<(std::ostream&, const Changeset& changeset);
 /// empty, and the position is zero, the iterator is pointing to a tombstone.
 template <bool is_const>
 struct Changeset::IteratorImpl {
-    using list_type = util::metered::vector<Instruction>;
+    using list_type = std::vector<Instruction>;
     using inner_iterator_type = std::conditional_t<is_const, list_type::const_iterator, list_type::iterator>;
 
     // reference_type is a pointer because we have no way to create a reference
@@ -529,7 +539,12 @@ inline StringData Changeset::string_data() const noexcept
 
 inline StringBufferRange Changeset::append_string(StringData string)
 {
-    m_string_buffer->reserve(1024); // we expect more strings
+    // We expect more strings. Only do this at the beginning because until C++20, reserve
+    // will shrink_to_fit if the request is less than the current capacity.
+    constexpr size_t small_string_buffer_size = 1024;
+    if (m_string_buffer->capacity() < small_string_buffer_size) {
+        m_string_buffer->reserve(small_string_buffer_size);
+    }
     size_t offset = m_string_buffer->size();
     m_string_buffer->append(string.data(), string.size());
     return StringBufferRange{uint32_t(offset), uint32_t(string.size())};

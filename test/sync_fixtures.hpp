@@ -411,8 +411,6 @@ public:
         // through unit_test::TestContext will be used.
         util::Logger* logger = nullptr;
 
-        sync::Metrics* server_metrics = nullptr;
-
         // These values will disable the heartbeats by default.
         milliseconds_type client_ping_period = 100000000;  // do not send pings
         milliseconds_type client_pong_timeout = 100000000; // do not expect pongs
@@ -450,8 +448,6 @@ public:
 
         // Must be empty (encryption disabled) or contain 64 bytes.
         std::string server_encryption_key;
-
-        Server::ClientFileBlacklists client_file_blacklists;
 
         int server_max_protocol_version = 0;
 
@@ -512,7 +508,6 @@ public:
             config_2.max_open_files = config.server_max_open_files;
             config_2.logger = &*m_server_loggers[i];
             config_2.token_expiration_clock = &m_fake_token_expiration_clock;
-            config_2.metrics = config.server_metrics;
             config_2.ssl = m_enable_server_ssl;
             config_2.ssl_certificate_path = config.server_ssl_certificate_path;
             config_2.ssl_certificate_key_path = config.server_ssl_certificate_key_path;
@@ -527,7 +522,6 @@ public:
             config_2.tcp_no_delay = true;
             config_2.authorization_header_name = config.authorization_header_name;
             config_2.encryption_key = make_crypt_key(config.server_encryption_key);
-            config_2.client_file_blacklists = config.client_file_blacklists;
             config_2.max_protocol_version = config.server_max_protocol_version;
             config_2.disable_download_for = std::move(config.server_disable_download_for);
             config_2.session_bootstrap_callback = std::move(config.server_session_bootstrap_callback);
@@ -586,13 +580,13 @@ public:
     void set_client_side_error_handler(int client_index, std::function<ErrorHandler> handler)
     {
         using ErrorInfo = Session::ErrorInfo;
-        auto handler_2 = [handler = std::move(handler)](ConnectionState state, const ErrorInfo* error_info) {
+        auto handler_2 = [handler = std::move(handler)](ConnectionState state, util::Optional<ErrorInfo> error_info) {
             if (state != ConnectionState::disconnected)
                 return;
             REALM_ASSERT(error_info);
             std::error_code ec = error_info->error_code;
-            bool is_fatal = error_info->is_fatal;
-            const std::string& detailed_message = error_info->detailed_message;
+            bool is_fatal = error_info->is_fatal();
+            const std::string& detailed_message = error_info->message;
             handler(ec, is_fatal, detailed_message);
         };
         m_connection_state_change_listeners[client_index] = std::move(handler_2);
@@ -652,14 +646,14 @@ public:
         }
         else {
             using ErrorInfo = Session::ErrorInfo;
-            auto fallback_listener = [this](ConnectionState state, const ErrorInfo* error) {
+            auto fallback_listener = [this](ConnectionState state, util::Optional<ErrorInfo> error) {
                 if (state != ConnectionState::disconnected)
                     return;
                 REALM_ASSERT(error);
                 unit_test::TestContext& test_context = m_test_context;
                 util::Logger& logger = test_context.logger;
-                logger.error("Client disconnect: %1: %2 (is_fatal=%3)", error->error_code, error->detailed_message,
-                             error->is_fatal);
+                logger.error("Client disconnect: %1: %2 (is_fatal=%3)", error->error_code, error->message,
+                             error->is_fatal());
                 bool client_error_occurred = true;
                 CHECK_NOT(client_error_occurred);
                 stop();
@@ -748,37 +742,6 @@ public:
     void inform_server_about_external_change(int server_index, const std::string& virt_path)
     {
         get_server(server_index).recognize_external_change(virt_path); // Throws
-    }
-
-    using HTTPStatus = util::HTTPStatus;
-
-    HTTPStatus send_http_compact_request(int server_index, std::string signed_user_token = g_signed_test_user_token)
-    {
-        util::HTTPRequest request;
-        request.method = util::HTTPMethod::Post;
-        request.path = "/api/compact";
-        if (!signed_user_token.empty())
-            request.headers["Authorization"] = _impl::make_authorization_header(signed_user_token);
-        return send_http_request(server_index, request);
-    }
-
-    HTTPStatus send_http_delete_request(int server_index, const std::string& virt_path,
-                                        std::string signed_user_token = g_signed_test_user_token)
-    {
-        util::HTTPRequest request;
-        request.method = util::HTTPMethod::Delete;
-        request.path = "/api/realm" + virt_path;
-        request.headers["Authorization"] = _impl::make_authorization_header(signed_user_token);
-        return send_http_request(server_index, request);
-    }
-
-    HTTPStatus send_http_request(int server_index, const util::HTTPRequest& request)
-    {
-        util::network::Endpoint endpoint = get_server(server_index).listen_endpoint();
-        HTTPRequestClient client{m_logger, endpoint, request};
-        client.fetch_response();
-        const util::HTTPResponse& response = client.get_response();
-        return response.status;
     }
 
 private:
@@ -949,23 +912,6 @@ public:
     {
         MultiClientServerFixture::inform_server_about_external_change(0, virt_path); // Throws
     }
-
-    HTTPStatus send_http_compact_request(std::string signed_user_token = g_signed_test_user_token)
-    {
-        return MultiClientServerFixture::send_http_compact_request(0, signed_user_token); // Throws
-    }
-
-    HTTPStatus send_http_delete_request(const std::string& virt_path,
-                                        std::string signed_user_token = g_signed_test_user_token)
-    {
-        return MultiClientServerFixture::send_http_delete_request(0, virt_path,
-                                                                  signed_user_token); // Throws
-    }
-
-    HTTPStatus send_http_request(const util::HTTPRequest& request)
-    {
-        return MultiClientServerFixture::send_http_request(0, request); // Throws
-    }
 };
 
 
@@ -998,8 +944,6 @@ public:
     void async_wait_for_sync_completion(WaitOperCompletionHandler);
     void async_wait_for_upload_completion(WaitOperCompletionHandler);
     void async_wait_for_download_completion(WaitOperCompletionHandler);
-
-    version_type get_last_integrated_server_version() const;
 
 private:
     struct SelfRef {
@@ -1100,104 +1044,20 @@ inline void RealmFixture::async_wait_for_download_completion(WaitOperCompletionH
     m_session.async_wait_for_download_completion(std::move(handler));
 }
 
-inline version_type RealmFixture::get_last_integrated_server_version() const
-{
-    version_type current_client_version = 0;    // Dummy
-    SaltedFileIdent client_file_ident = {0, 0}; // Dummy
-    SyncProgress progress;
-    auto& repl = static_cast<ClientReplication&>(*m_db->get_replication());
-    repl.get_history().get_status(current_client_version, client_file_ident, progress);
-    return progress.download.server_version;
-}
-
 inline void RealmFixture::setup_error_handler(util::UniqueFunction<ErrorHandler> handler)
 {
     using ErrorInfo = Session::ErrorInfo;
-    auto listener = [handler = std::move(handler)](ConnectionState state, const ErrorInfo* error_info) {
+    auto listener = [handler = std::move(handler)](ConnectionState state,
+                                                   const util::Optional<ErrorInfo>& error_info) {
         if (state != ConnectionState::disconnected)
             return;
         REALM_ASSERT(error_info);
         std::error_code ec = error_info->error_code;
-        bool is_fatal = error_info->is_fatal;
-        const std::string& detailed_message = error_info->detailed_message;
+        bool is_fatal = error_info->is_fatal();
+        const std::string& detailed_message = error_info->message;
         handler(ec, is_fatal, detailed_message);
     };
     m_session.set_connection_state_change_listener(std::move(listener));
 }
-
-
-namespace accounting {
-
-// Set up schema
-inline bool init(Transaction& tr, int account_identifier, std::int_fast64_t initial_balance)
-{
-    TableRef account = tr.add_table("class_Account");
-    ColKey col_ndx_identifier = account->add_column(type_Int, "identifier");
-    ColKey col_ndx_balance = account->add_column(type_Int, "balance");
-    account->create_object().set(col_ndx_identifier, account_identifier).set(col_ndx_balance, initial_balance);
-    return true;
-}
-
-// Add money to an account (or withdraw if amount is negative).
-inline bool credit(Transaction& tr, int account_identifier, std::int_fast64_t amount)
-{
-    TableRef account = tr.get_table("class_Account");
-    ColKey col_ndx_identifier = account->get_column_key("identifier");
-    ColKey col_ndx_balance = account->get_column_key("balance");
-    ObjKey obj_key = account->find_first_int(col_ndx_identifier, account_identifier);
-    Obj obj = account->get_object(obj_key);
-    auto balance = obj.get<Int>(col_ndx_balance);
-    balance += amount;
-    bool is_debit = (amount < 0);
-    if (is_debit && balance < 0)
-        return false;
-    obj.set(col_ndx_balance, balance);
-    return true;
-}
-
-} // namespace accounting
-
-
-inline TableRef find_or_create_result_sets_table(Transaction& g)
-{
-    TableRef result_sets = g.get_table(g_partial_sync_result_sets_table_name);
-    if (!result_sets) {
-        result_sets = g.add_table(g_partial_sync_result_sets_table_name);
-        result_sets->add_column(type_String, "query");
-        result_sets->add_column(type_String, "matches_property");
-        result_sets->add_column(type_Int, "status");
-        result_sets->add_column(type_String, "error_message");
-        result_sets->add_column(type_Int, "query_parse_counter");
-    }
-    return result_sets;
-}
-
-inline ObjKey add_partial_sync_subscription(Transaction& g, TableRef table, StringData query)
-{
-    TableRef result_sets = find_or_create_result_sets_table(g);
-    // Find a match column for the table, or add one.
-    ColKey matches_col;
-    for (ColKey col_key : result_sets->get_column_keys()) {
-        if (result_sets->get_column_type(col_key) == type_LinkList &&
-            result_sets->get_link_target(col_key) == table) {
-            matches_col = col_key;
-        }
-    }
-    if (!matches_col) {
-        std::stringstream ss;
-        ss << "matches_" << table->get_name();
-        std::string matches_col_name = ss.str();
-        matches_col = result_sets->add_column_list(*table, matches_col_name);
-    }
-
-    Obj result_set = result_sets->create_object();
-    ColKey col_ndx_query = result_sets->get_column_key("query");
-    ColKey col_ndx_matches_property = result_sets->get_column_key("matches_property");
-
-    result_set.set(col_ndx_query, query);
-    result_set.set(col_ndx_matches_property, result_sets->get_column_name(matches_col));
-    return result_set.get_key();
-}
-
 } // namespace fixtures
 } // namespace realm

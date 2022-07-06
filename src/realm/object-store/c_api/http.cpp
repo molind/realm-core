@@ -58,6 +58,7 @@ private:
         auto completion_data = std::make_unique<Completion>(std::move(completion_block));
 
         std::vector<realm_http_header_t> c_headers;
+        c_headers.reserve(request.headers.size());
         for (auto& header : request.headers) {
             c_headers.push_back({header.first.c_str(), header.second.c_str()});
         }
@@ -78,8 +79,8 @@ private:
 } // namespace
 } // namespace realm::c_api
 
-RLM_API realm_http_transport_t* realm_http_transport_new(realm_http_request_func_t request_executor, void* userdata,
-                                                         realm_free_userdata_func_t free)
+RLM_API realm_http_transport_t* realm_http_transport_new(realm_http_request_func_t request_executor,
+                                                         realm_userdata_t userdata, realm_free_userdata_func_t free)
 {
     auto transport = std::make_shared<realm::c_api::CNetworkTransport>(realm::c_api::UserdataPtr{userdata, free},
                                                                        request_executor);

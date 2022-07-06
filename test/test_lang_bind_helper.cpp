@@ -30,7 +30,6 @@
 #include <realm/util/encrypted_file_mapping.hpp>
 #include <realm/util/to_string.hpp>
 #include <realm/replication.hpp>
-#include <realm/history.hpp>
 
 // Need fork() and waitpid() for Shared_RobustAgainstDeathDuringWrite
 #ifndef _WIN32
@@ -1459,7 +1458,7 @@ TEST(LangBindHelper_AdvanceReadTransact_CascadeRemove_ColumnLink)
     {
         WriteTransaction wt(sg);
         auto origin = wt.add_table("origin");
-        auto target = wt.add_embedded_table("target");
+        auto target = wt.add_table("target", Table::Type::Embedded);
         col = origin->add_column(*target, "o_1");
         target->add_column(type_Int, "t_1");
         wt.commit();
@@ -1544,7 +1543,7 @@ TEST(LangBindHelper_AdvanceReadTransact_CascadeRemove_ColumnLinkList)
     {
         WriteTransaction wt(sg);
         auto origin = wt.add_table("origin");
-        auto target = wt.add_embedded_table("target");
+        auto target = wt.add_table("target", Table::Type::Embedded);
         col = origin->add_column_list(*target, "o_1");
         target->add_column(type_Int, "t_1");
         wt.commit();
@@ -3091,12 +3090,12 @@ TEST(LangBindHelper_ImplicitTransactions_MultipleTrackers)
 
 #if !REALM_ANDROID && !REALM_IOS
 
-std::stringstream ss;
-void signal_handler(int signal)
+static std::stringstream s_ss;
+static void signal_handler(int signal)
 {
     std::cout << "signal handler: " << signal << std::endl;
-    util::Backtrace::capture().print(ss);
-    std::cout << "trace: " << ss.str() << std::endl;
+    util::Backtrace::capture().print(s_ss);
+    std::cout << "trace: " << s_ss.str() << std::endl;
     exit(signal);
 }
 

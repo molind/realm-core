@@ -1,6 +1,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <tuple>
@@ -11,27 +12,33 @@
 #include <condition_variable>
 #include <thread>
 
-#include <realm/util/features.h>
-#include <realm/util/parent_dir.hpp>
-#include <realm/util/uri.hpp>
-#include <realm/util/network.hpp>
-#include <realm/util/http.hpp>
-#include <realm/util/random.hpp>
-#include <realm/util/websocket.hpp>
-#include <realm/chunked_binary.hpp>
-#include <realm/sync/noinst/server/server_history.hpp>
-#include <realm/sync/noinst/protocol_codec.hpp>
-#include <realm/sync/noinst/server/server_dir.hpp>
-#include <realm/impl/simulated_failure.hpp>
 #include <realm.hpp>
-#include <realm/history.hpp>
-#include <realm/version.hpp>
-#include <realm/sync/transform.hpp>
-#include <realm/sync/history.hpp>
-#include <realm/sync/protocol.hpp>
-#include <realm/sync/client.hpp>
-#include <realm/sync/noinst/server/server.hpp>
+#include <realm/chunked_binary.hpp>
+#include <realm/data_type.hpp>
+#include <realm/impl/simulated_failure.hpp>
 #include <realm/list.hpp>
+#include <realm/sync/changeset.hpp>
+#include <realm/sync/changeset_encoder.hpp>
+#include <realm/sync/client.hpp>
+#include <realm/sync/history.hpp>
+#include <realm/sync/instructions.hpp>
+#include <realm/sync/noinst/protocol_codec.hpp>
+#include <realm/sync/noinst/server/server.hpp>
+#include <realm/sync/noinst/server/server_dir.hpp>
+#include <realm/sync/noinst/server/server_history.hpp>
+#include <realm/sync/object_id.hpp>
+#include <realm/sync/protocol.hpp>
+#include <realm/sync/transform.hpp>
+#include <realm/util/buffer.hpp>
+#include <realm/util/features.h>
+#include <realm/util/http.hpp>
+#include <realm/util/logger.hpp>
+#include <realm/util/network.hpp>
+#include <realm/util/parent_dir.hpp>
+#include <realm/util/random.hpp>
+#include <realm/util/uri.hpp>
+#include <realm/util/websocket.hpp>
+#include <realm/version.hpp>
 
 #include "sync_fixtures.hpp"
 
@@ -39,7 +46,6 @@
 #include "util/demangle.hpp"
 #include "util/semaphore.hpp"
 #include "util/thread_wrapper.hpp"
-#include "util/mock_metrics.hpp"
 #include "util/compare_groups.hpp"
 
 using namespace realm;
@@ -116,7 +122,6 @@ ClientHistory& get_history(DBRef db)
     return get_replication(db).get_history();
 }
 
-
 TEST(Sync_BadVirtualPath)
 {
     // NOTE:  This test is no longer valid after migration to MongoDB Realm
@@ -133,12 +138,12 @@ TEST(Sync_BadVirtualPath)
     int nerrors = 0;
 
     using ErrorInfo = Session::ErrorInfo;
-    auto listener = [&](ConnectionState state, const ErrorInfo* error_info) {
+    auto listener = [&](ConnectionState state, util::Optional<ErrorInfo> error_info) {
         if (state != ConnectionState::disconnected)
             return;
         REALM_ASSERT(error_info);
         std::error_code ec = error_info->error_code;
-        bool is_fatal = error_info->is_fatal;
+        bool is_fatal = error_info->is_fatal();
         CHECK_EQUAL(sync::ProtocolError::illegal_realm_path, ec);
         CHECK(is_fatal);
         ++nerrors;
@@ -545,7 +550,7 @@ TEST(Sync_TokenWithoutExpirationAllowed)
         ClientServerFixture fixture(dir, test_context);
 
         using ErrorInfo = Session::ErrorInfo;
-        auto listener = [&](ConnectionState state, const ErrorInfo* error_info) {
+        auto listener = [&](ConnectionState state, util::Optional<ErrorInfo> error_info) {
             if (state != ConnectionState::disconnected)
                 return;
             REALM_ASSERT(error_info);
@@ -758,12 +763,12 @@ TEST(Sync_DetectSchemaMismatch_ColumnType)
         fixture.start();
 
         using ErrorInfo = Session::ErrorInfo;
-        auto listener = [&](ConnectionState state, const ErrorInfo* error_info) {
+        auto listener = [&](ConnectionState state, util::Optional<ErrorInfo> error_info) {
             if (state != ConnectionState::disconnected)
                 return;
             REALM_ASSERT(error_info);
             std::error_code ec = error_info->error_code;
-            bool is_fatal = error_info->is_fatal;
+            bool is_fatal = error_info->is_fatal();
             CHECK(ec == sync::Client::Error::bad_changeset || ec == sync::ProtocolError::invalid_schema_change);
             CHECK(is_fatal);
             // FIXME: Check that the message in the log is user-friendly.
@@ -810,12 +815,12 @@ TEST(Sync_DetectSchemaMismatch_Nullability)
         fixture.start();
 
         using ErrorInfo = Session::ErrorInfo;
-        auto listener = [&](ConnectionState state, const ErrorInfo* error_info) {
+        auto listener = [&](ConnectionState state, util::Optional<ErrorInfo> error_info) {
             if (state != ConnectionState::disconnected)
                 return;
             REALM_ASSERT(error_info);
             std::error_code ec = error_info->error_code;
-            bool is_fatal = error_info->is_fatal;
+            bool is_fatal = error_info->is_fatal();
             CHECK(ec == sync::Client::Error::bad_changeset || ec == sync::ProtocolError::invalid_schema_change);
             CHECK(is_fatal);
             // FIXME: Check that the message in the log is user-friendly.
@@ -864,12 +869,12 @@ TEST(Sync_DetectSchemaMismatch_Links)
         fixture.start();
 
         using ErrorInfo = Session::ErrorInfo;
-        auto listener = [&](ConnectionState state, const ErrorInfo* error_info) {
+        auto listener = [&](ConnectionState state, util::Optional<ErrorInfo> error_info) {
             if (state != ConnectionState::disconnected)
                 return;
             REALM_ASSERT(error_info);
             std::error_code ec = error_info->error_code;
-            bool is_fatal = error_info->is_fatal;
+            bool is_fatal = error_info->is_fatal();
             CHECK(ec == sync::Client::Error::bad_changeset || ec == sync::ProtocolError::invalid_schema_change);
             CHECK(is_fatal);
             // FIXME: Check that the message in the log is user-friendly.
@@ -916,12 +921,12 @@ TEST(Sync_DetectSchemaMismatch_PrimaryKeys_Name)
         fixture.start();
 
         using ErrorInfo = Session::ErrorInfo;
-        auto listener = [&](ConnectionState state, const ErrorInfo* error_info) {
+        auto listener = [&](ConnectionState state, util::Optional<ErrorInfo> error_info) {
             if (state != ConnectionState::disconnected)
                 return;
             REALM_ASSERT(error_info);
             std::error_code ec = error_info->error_code;
-            bool is_fatal = error_info->is_fatal;
+            bool is_fatal = error_info->is_fatal();
             CHECK(ec == sync::Client::Error::bad_changeset || ec == sync::ProtocolError::invalid_schema_change);
             CHECK(is_fatal);
             // FIXME: Check that the message in the log is user-friendly.
@@ -964,12 +969,12 @@ TEST(Sync_DetectSchemaMismatch_PrimaryKeys_Type)
         fixture.start();
 
         using ErrorInfo = Session::ErrorInfo;
-        auto listener = [&](ConnectionState state, const ErrorInfo* error_info) {
+        auto listener = [&](ConnectionState state, util::Optional<ErrorInfo> error_info) {
             if (state != ConnectionState::disconnected)
                 return;
             REALM_ASSERT(error_info);
             std::error_code ec = error_info->error_code;
-            bool is_fatal = error_info->is_fatal;
+            bool is_fatal = error_info->is_fatal();
             CHECK(ec == sync::Client::Error::bad_changeset || ec == sync::ProtocolError::invalid_schema_change);
             CHECK(is_fatal);
             // FIXME: Check that the message in the log is user-friendly.
@@ -1014,12 +1019,12 @@ TEST(Sync_DetectSchemaMismatch_PrimaryKeys_Nullability)
         bool error_did_occur = false;
 
         using ErrorInfo = Session::ErrorInfo;
-        auto listener = [&](ConnectionState state, const ErrorInfo* error_info) {
+        auto listener = [&](ConnectionState state, util::Optional<ErrorInfo> error_info) {
             if (state != ConnectionState::disconnected)
                 return;
             REALM_ASSERT(error_info);
             std::error_code ec = error_info->error_code;
-            bool is_fatal = error_info->is_fatal;
+            bool is_fatal = error_info->is_fatal();
             CHECK(ec == sync::Client::Error::bad_changeset || ec == sync::ProtocolError::invalid_schema_change);
             CHECK(is_fatal);
             // FIXME: Check that the message in the log is user-friendly.
@@ -1931,474 +1936,6 @@ TEST(Sync_HTTP_ContentLength)
 
     server.stop();
     server_thread.join();
-}
-
-
-// The Sync_HttpApiOk sends a HTTP request to a running sync server with url
-// prefix /api/ and checks the various api endpoints.
-TEST(Sync_HttpApi)
-{
-    TEST_DIR(server_dir);
-    util::Logger& logger = test_context.logger;
-    util::PrefixLogger server_logger("Server: ", logger);
-    std::string server_address = "localhost";
-
-    Server::Config server_config;
-    server_config.logger = &server_logger;
-    server_config.listen_address = server_address;
-    server_config.listen_port = "";
-    server_config.tcp_no_delay = true;
-
-    util::Optional<PKey> public_key = PKey::load_public(g_test_server_key_path);
-    Server server(server_dir, std::move(public_key), server_config);
-    server.start();
-
-    ThreadWrapper server_thread;
-    server_thread.start([&] {
-        server.run();
-    });
-
-    const util::network::Endpoint& endpoint = server.listen_endpoint();
-
-    // url = /api/ok
-    {
-        util::HTTPRequest request;
-        request.method = util::HTTPMethod::Get;
-        request.path = "/api/ok";
-        HTTPRequestClient client(logger, endpoint, request);
-        client.fetch_response();
-        const util::HTTPResponse& response = client.get_response();
-        CHECK_EQUAL(response.status, util::HTTPStatus::Ok);
-        CHECK(!response.body);
-    }
-
-    // url = /api/x
-    {
-        util::HTTPRequest request;
-        request.method = util::HTTPMethod::Get;
-        request.path = "/api/x";
-        HTTPRequestClient client(logger, endpoint, request);
-        client.fetch_response();
-        const util::HTTPResponse& response = client.get_response();
-        CHECK_EQUAL(response.status, util::HTTPStatus::Forbidden);
-        CHECK_EQUAL(response.body, "no access token");
-    }
-
-    // url = /api/x with admin access token
-    {
-        util::HTTPRequest request;
-        request.method = util::HTTPMethod::Get;
-        request.path = "/api/x";
-        request.headers["Authorization"] = _impl::make_authorization_header(g_signed_test_user_token);
-        HTTPRequestClient client(logger, endpoint, request);
-        client.fetch_response();
-        const util::HTTPResponse& response = client.get_response();
-        CHECK_EQUAL(response.status, util::HTTPStatus::NotFound);
-    }
-
-    // url = /api/info with admin access token
-    {
-        util::HTTPRequest request;
-        request.method = util::HTTPMethod::Get;
-        request.path = "/api/info";
-        request.headers["Authorization"] = _impl::make_authorization_header(g_signed_test_user_token);
-        HTTPRequestClient client(logger, endpoint, request);
-        client.fetch_response();
-        const util::HTTPResponse& response = client.get_response();
-        CHECK_EQUAL(response.status, util::HTTPStatus::Ok);
-        CHECK(response.body);
-        const char* prefix = "Realm sync server\n\n";
-        size_t prefix_len = strlen(prefix);
-        CHECK(response.body->length() >= prefix_len && response.body->substr(0, prefix_len) == prefix);
-    }
-
-    // url = /api/info with non-admin access token
-    {
-        util::HTTPRequest request;
-        request.method = util::HTTPMethod::Get;
-        request.path = "/api/info";
-        request.headers["Authorization"] = _impl::make_authorization_header(g_user_0_token);
-        HTTPRequestClient client(logger, endpoint, request);
-        client.fetch_response();
-        const util::HTTPResponse& response = client.get_response();
-        CHECK_EQUAL(response.status, util::HTTPStatus::Forbidden);
-        CHECK_EQUAL(response.body, "must be admin");
-    }
-
-    server.stop();
-    server_thread.join();
-}
-
-
-// This test checks that a custom authorization header name
-// can be set in the sync server config.
-TEST(Sync_HttpApiWithCustomAuthorizationHeaderName)
-{
-    TEST_DIR(server_dir);
-    util::Logger& logger = test_context.logger;
-    util::PrefixLogger server_logger("Server: ", logger);
-    std::string server_address = "localhost";
-
-    Server::Config server_config;
-    server_config.logger = &server_logger;
-    server_config.listen_address = server_address;
-    server_config.listen_port = "";
-    server_config.tcp_no_delay = true;
-    server_config.authorization_header_name = "X-Alternative-Name";
-
-    util::Optional<PKey> public_key = PKey::load_public(g_test_server_key_path);
-    Server server(server_dir, std::move(public_key), server_config);
-    server.start();
-
-    ThreadWrapper server_thread;
-    server_thread.start([&] {
-        server.run();
-    });
-
-    const util::network::Endpoint& endpoint = server.listen_endpoint();
-
-    // Correct authorization header.
-    {
-        util::HTTPRequest request;
-        request.method = util::HTTPMethod::Get;
-        request.path = "/api/info";
-        request.headers["X-Alternative-Name"] = _impl::make_authorization_header(g_signed_test_user_token);
-        HTTPRequestClient client(logger, endpoint, request);
-        client.fetch_response();
-        const util::HTTPResponse& response = client.get_response();
-        CHECK_EQUAL(response.status, util::HTTPStatus::Ok);
-        CHECK(response.body);
-        const char* prefix = "Realm sync server\n\n";
-        size_t prefix_len = strlen(prefix);
-        CHECK(response.body->length() >= prefix_len && response.body->substr(0, prefix_len) == prefix);
-    }
-
-    // Incorrect authorization header.
-    {
-        util::HTTPRequest request;
-        request.method = util::HTTPMethod::Get;
-        request.path = "/api/info";
-        request.headers["Authorization"] = _impl::make_authorization_header(g_signed_test_user_token);
-        HTTPRequestClient client(logger, endpoint, request);
-        client.fetch_response();
-        const util::HTTPResponse& response = client.get_response();
-        CHECK_EQUAL(response.status, util::HTTPStatus::Forbidden);
-        CHECK_EQUAL(response.body, "no access token");
-    }
-
-    server.stop();
-    server_thread.join();
-}
-
-
-#if 0
-// FIXME: This test does not pass always - CHECK_LESS(size_after_1, size_before_1) fails sometimes.
-//        Is this test still relevant?
-// This test creates a sync server and a sync client. The sync client uploads
-// data to two Realms.
-//
-// The sizes of the Realms are found.  A HTTP request for "/api/compact" is
-// sent to the server. It is checked that the Realms are smaller.
-//
-// Another client is made that downloads the data through full sync and it is
-// verified that it ends up with the same data as the uploading client.
-//
-// This cycle is repeated: Create more data, compact, check sizes, verify
-// correctness.
-TEST(Sync_HttpApiCompact)
-{
-    TEST_DIR(server_dir);
-    TEST_CLIENT_DB(db_1);
-    TEST_CLIENT_DB(db_2);
-
-    ClientServerFixture fixture(server_dir, test_context);
-    fixture.start();
-
-    Session session_1 = fixture.make_bound_session(db_1, "/db_1");
-    std::unique_ptr<Replication> history_1 = make_client_replication();
-    auto db_1 = DB::create(*history_1, path_1);
-
-    Session session_2 = fixture.make_bound_session(db_2, "/db_2");
-    std::unique_ptr<Replication> history_2 = make_client_replication();
-    auto db_2 = DB::create(*history_2, path_2);
-
-    auto create_schema = [](Session& sess, DBRef db) {
-        WriteTransaction wt(db);
-        TableRef table = wt.get_group().add_table_with_primary_key("class_items", type_String, "a");
-        table->add_column(type_Int, "i");
-        version_type new_version = wt.commit();
-        sess.nonsync_transact_notify(new_version);
-    };
-    create_schema(session_1, db_1);
-    create_schema(session_2, db_2);
-
-    auto insert_objects = [](WriteTransaction& wt, size_t counter, int number_of_objects) {
-        TableRef table = wt.get_table("class_items");
-
-        for (int i = 0; i < number_of_objects; ++i) {
-            std::string pk_str = std::to_string(counter) + "_" + std::to_string(i);
-            StringData pk{pk_str};
-            Obj obj = table->create_object_with_primary_key(pk);
-            obj.set(table->get_column_key("i"), i);
-        }
-    };
-
-    size_t counter = 0;
-
-    for (size_t i = 0; i < 1; ++i) {
-        WriteTransaction wt{db_1};
-        insert_objects(wt, counter, 400);
-        version_type new_version = wt.commit();
-        session_1.nonsync_transact_notify(new_version);
-        ++counter;
-    }
-
-    for (size_t i = 0; i < 5; ++i) {
-        WriteTransaction wt{db_2};
-        insert_objects(wt, counter, 300);
-        version_type new_version = wt.commit();
-        session_2.nonsync_transact_notify(new_version);
-        ++counter;
-    }
-
-    session_1.wait_for_upload_complete_or_client_stopped();
-    session_2.wait_for_upload_complete_or_client_stopped();
-
-    std::string server_realm_file_1 = fixture.map_virtual_to_real_path("/db_1");
-    std::string server_realm_file_2 = fixture.map_virtual_to_real_path("/db_2");
-    CHECK(util::File::exists(server_realm_file_1));
-    CHECK(util::File::exists(server_realm_file_2));
-
-    size_t size_before_1 = util::File{server_realm_file_1}.get_size();
-    size_t size_before_2 = util::File{server_realm_file_2}.get_size();
-
-    // Send a HTTP request to the server to compact all Realms.
-    CHECK_EQUAL(util::HTTPStatus::Ok, fixture.send_http_compact_request());
-
-    size_t size_after_1 = util::File{server_realm_file_1}.get_size();
-    size_t size_after_2 = util::File{server_realm_file_2}.get_size();
-
-    CHECK_LESS(size_after_1, size_before_1);
-    CHECK_LESS(size_after_2, size_before_2);
-
-    auto check_groups = [&](DBRef db_external, const std::string& server_path) {
-        TEST_CLIENT_DB(db);
-        Session session = fixture.make_bound_session(db, server_path);
-        session.wait_for_download_complete_or_client_stopped();
-
-        auto db = DB::create(make_client_replication(), path);
-        ReadTransaction rt_1(db);
-        ReadTransaction rt_2(db_external);
-        CHECK(compare_groups(rt_1, rt_2));
-        session.detach();
-        fixture.wait_for_session_terminations_or_client_stopped();
-    };
-
-    check_groups(db_1, "/db_1");
-    check_groups(db_2, "/db_2");
-
-    // First cycle is complete. Repeat. The amount of data is slightly
-    // changes.
-
-    for (size_t i = 0; i < 2; ++i) {
-        WriteTransaction wt{db_1};
-        insert_objects(wt, counter, 700);
-        version_type new_version = wt.commit();
-        session_1.nonsync_transact_notify(new_version);
-        ++counter;
-    }
-
-    for (size_t i = 0; i < 5; ++i) {
-        WriteTransaction wt{db_2};
-        insert_objects(wt, counter, 300);
-        version_type new_version = wt.commit();
-        session_2.nonsync_transact_notify(new_version);
-        ++counter;
-    }
-
-    session_1.wait_for_upload_complete_or_client_stopped();
-    session_2.wait_for_upload_complete_or_client_stopped();
-
-    size_before_1 = util::File{server_realm_file_1}.get_size();
-    size_before_2 = util::File{server_realm_file_2}.get_size();
-
-    // Send a HTTP request to the server to compact all Realms.
-    CHECK_EQUAL(util::HTTPStatus::Ok, fixture.send_http_compact_request());
-
-    size_after_1 = util::File{server_realm_file_1}.get_size();
-    size_after_2 = util::File{server_realm_file_2}.get_size();
-
-    CHECK_LESS(size_after_1, size_before_1);
-    CHECK_LESS(size_after_2, size_before_2);
-
-    check_groups(db_1, "/db_1");
-    check_groups(db_2, "/db_2");
-}
-
-#endif // _WIN32
-
-
-// Sync_RealmDeletion creates a client realm, uploads a changeset,
-// exercises the Realm deletion HTTP request, and verifies that
-// the Realm (including .lock and .management) is gone and that
-// the session has been disabled.
-// The test also verifies that the Realm isn't deleted if the
-// request lacks proper Authorization.
-void test_realm_deletion(unit_test::TestContext& test_context, bool disable_state_realms)
-{
-    REALM_ASSERT(disable_state_realms);
-
-    TEST_DIR(server_dir);
-    TEST_CLIENT_DB(db);
-
-    {
-        WriteTransaction wt{db};
-        wt.add_table("class_table-1");
-        wt.commit();
-    }
-
-    ClientServerFixture::Config config;
-    ClientServerFixture fixture(server_dir, test_context, std::move(config));
-
-    std::string server_path = "/test";
-    std::string server_realm_file = fixture.map_virtual_to_real_path(server_path);
-    std::string server_realm_file_lock = server_realm_file + ".lock";
-    std::string server_realm_file_management = server_realm_file + ".management";
-
-    bool session_is_disabled = false;
-
-    auto error_handler = [&](std::error_code ec, bool, const std::string&) {
-        CHECK_EQUAL(ProtocolError::server_file_deleted, ec);
-        session_is_disabled = true;
-        fixture.stop();
-    };
-
-    fixture.set_client_side_error_handler(error_handler);
-    Session session = fixture.make_bound_session(db, server_path);
-    fixture.start();
-    session.wait_for_upload_complete_or_client_stopped();
-
-    CHECK(util::File::exists(server_realm_file));
-    CHECK(util::File::exists(server_realm_file_lock));
-    CHECK(util::File::exists(server_realm_file_management));
-
-    // Send a HTTP request to delete the Realm without Authorization
-    CHECK_EQUAL(util::HTTPStatus::Forbidden, fixture.send_http_delete_request(server_path, ""));
-
-    // The server realm is still there
-    CHECK(util::File::exists(server_realm_file));
-    CHECK(util::File::exists(server_realm_file_lock));
-    CHECK(util::File::exists(server_realm_file_management));
-
-    // Send a HTTP request to delete the Realm without Authorization
-    CHECK_EQUAL(util::HTTPStatus::Forbidden, fixture.send_http_delete_request(server_path, ""));
-
-    // The server realm is still there
-    CHECK(util::File::exists(server_realm_file));
-    CHECK(util::File::exists(server_realm_file_lock));
-    CHECK(util::File::exists(server_realm_file_management));
-
-    // Send a HTTP request to delete the Realm with Authorization
-    // for another Realm.
-    CHECK_EQUAL(util::HTTPStatus::Forbidden,
-                fixture.send_http_delete_request(server_path, g_signed_test_user_token_for_path));
-
-    // The server realm is still there
-    CHECK(util::File::exists(server_realm_file));
-    CHECK(util::File::exists(server_realm_file_lock));
-    CHECK(util::File::exists(server_realm_file_management));
-
-    // Send a HTTP request to delete the Realm with admin Authorization
-    CHECK_EQUAL(util::HTTPStatus::Ok, fixture.send_http_delete_request(server_path));
-
-    // The realm is deleted
-    CHECK(!util::File::exists(server_realm_file));
-    CHECK(!util::File::exists(server_realm_file_lock));
-    CHECK(!util::File::exists(server_realm_file_management));
-
-    write_transaction_notifying_session(db, session, [](WriteTransaction& wt) {
-        wt.add_table("class_table-2");
-    });
-
-    session.wait_for_upload_complete_or_client_stopped();
-
-    CHECK(session_is_disabled);
-    CHECK(!util::File::exists(server_realm_file));
-    CHECK(!util::File::exists(server_realm_file_lock));
-    CHECK(!util::File::exists(server_realm_file_management));
-}
-
-
-TEST(Sync_RealmDeletionWhenStateRealmsDisabled)
-{
-    test_realm_deletion(test_context, true);
-}
-
-
-// Sync_RealmDeletionEmptyDir creates a client realm, uploads a changeset,
-// exercises the Realm deletion HTTP request, and verifies that
-// the Realm (including .lock and .management) and all directories
-// made empty by removing the realm are removed as well.
-TEST(Sync_RealmDeletionEmptyDir)
-{
-    TEST_DIR(server_dir);
-    TEST_CLIENT_DB(db_1);
-    TEST_CLIENT_DB(db_2);
-
-    ClientServerFixture fixture(server_dir, test_context);
-    fixture.start();
-
-    std::string server_path = "/u/project/task/test";
-    std::string server_realm_file = fixture.map_virtual_to_real_path(server_path);
-    std::string server_realm_file_lock = server_realm_file + ".lock";
-    std::string server_realm_file_management = server_realm_file + ".management";
-    std::string server_task_dir = util::parent_dir(server_realm_file);
-    std::string server_project_dir = util::parent_dir(server_task_dir);
-    std::string server_u_dir = util::parent_dir(server_project_dir);
-
-    // Create the Realm at path = /u/project/task/test. This Realm will be deleted later.
-    {
-        {
-            WriteTransaction wt{db_1};
-            wt.add_table("class_table-1");
-            wt.commit();
-        }
-
-        Session session = fixture.make_bound_session(db_1, server_path);
-        session.wait_for_download_complete_or_client_stopped();
-    }
-
-    // Create another Realm at path = /u/test. This Realm will not be deleted.
-    {
-        {
-            WriteTransaction wt{db_2};
-            wt.add_table("class_table-1");
-            wt.commit();
-        }
-
-        Session session = fixture.make_bound_session(db_2, "/u/test");
-        session.wait_for_download_complete_or_client_stopped();
-    }
-
-    CHECK(util::File::exists(server_u_dir));
-    CHECK(util::File::exists(server_project_dir));
-    CHECK(util::File::exists(server_task_dir));
-    CHECK(util::File::exists(server_realm_file));
-    CHECK(util::File::exists(server_realm_file_lock));
-    CHECK(util::File::exists(server_realm_file_management));
-
-    // Send a HTTP request to delete the Realm with admin Authorization
-    CHECK_EQUAL(util::HTTPStatus::Ok, fixture.send_http_delete_request(server_path));
-
-    // server_u_dir should still exist.
-    CHECK(util::File::exists(server_u_dir));
-
-    // Check that the realm and the empty parent directories are deleted
-    CHECK(!util::File::exists(server_project_dir));
-    CHECK(!util::File::exists(server_task_dir));
-    CHECK(!util::File::exists(server_realm_file));
-    CHECK(!util::File::exists(server_realm_file_lock));
-    CHECK(!util::File::exists(server_realm_file_management));
 }
 
 
@@ -3461,7 +2998,7 @@ TEST(Sync_SSL_Certificate_Verify_Callback_2)
         std::string pem(pem_data, pem_size);
 
         std::string expected = "-----BEGIN CERTIFICATE-----\n"
-                               "MIIF0zCCA7ugAwIBAgIBBjANBgkqhkiG9w0BAQsFADB1MRIwEAYKCZImiZPyLGQB\n";
+                               "MIIF0zCCA7ugAwIBAgIBCDANBgkqhkiG9w0BAQsFADB1MRIwEAYKCZImiZPyLGQB\n";
 
         CHECK_EQUAL(expected, pem.substr(0, expected.size()));
 
@@ -3519,7 +3056,7 @@ TEST(Sync_SSL_Certificate_Verify_Callback_3)
         else {
             CHECK_EQUAL(pem_size, 1700);
             CHECK_EQUAL(preverify_ok, 1);
-            CHECK_EQUAL(pem_data[1667], 'h');
+            CHECK_EQUAL(pem_data[1667], '2');
             CHECK_EQUAL(pem_data[1698], '-');
             CHECK_EQUAL(pem_data[1699], '\n');
         }
@@ -4383,8 +3920,8 @@ TEST(Sync_CancelReconnectDelay)
         fixture.start();
 
         BowlOfStonesSemaphore bowl;
-        auto handler = [&](std::error_code ec, bool, const std::string&) {
-            if (CHECK_EQUAL(ec, ProtocolError::connection_closed))
+        auto handler = [&](const SessionErrorInfo& info) {
+            if (CHECK_EQUAL(info.error_code, ProtocolError::connection_closed))
                 bowl.add_stone();
         };
         Session session = fixture.make_session(db);
@@ -4405,8 +3942,8 @@ TEST(Sync_CancelReconnectDelay)
         fixture.start();
 
         BowlOfStonesSemaphore bowl;
-        auto handler = [&](std::error_code ec, bool, const std::string&) {
-            if (CHECK_EQUAL(ec, ProtocolError::connection_closed))
+        auto handler = [&](const SessionErrorInfo& info) {
+            if (CHECK_EQUAL(info.error_code, ProtocolError::connection_closed))
                 bowl.add_stone();
         };
         Session session = fixture.make_session(db);
@@ -4428,8 +3965,8 @@ TEST(Sync_CancelReconnectDelay)
 
         {
             BowlOfStonesSemaphore bowl;
-            auto handler = [&](std::error_code ec, bool, const std::string&) {
-                if (CHECK_EQUAL(ec, ProtocolError::connection_closed))
+            auto handler = [&](const SessionErrorInfo& info) {
+                if (CHECK_EQUAL(info.error_code, ProtocolError::connection_closed))
                     bowl.add_stone();
             };
             Session session = fixture.make_session(db);
@@ -4464,8 +4001,8 @@ TEST(Sync_CancelReconnectDelay)
         session_x.wait_for_download_complete_or_client_stopped();
 
         BowlOfStonesSemaphore bowl;
-        auto handler = [&](std::error_code ec, bool, const std::string&) {
-            if (CHECK_EQUAL(ec, ProtocolError::illegal_realm_path))
+        auto handler = [&](const SessionErrorInfo& info) {
+            if (CHECK_EQUAL(info.error_code, ProtocolError::illegal_realm_path))
                 bowl.add_stone();
         };
         Session session = fixture.make_session(db);
@@ -4487,8 +4024,8 @@ TEST(Sync_CancelReconnectDelay)
         session_x.wait_for_download_complete_or_client_stopped();
 
         BowlOfStonesSemaphore bowl;
-        auto handler = [&](std::error_code ec, bool, const std::string&) {
-            if (CHECK_EQUAL(ec, ProtocolError::illegal_realm_path))
+        auto handler = [&](const SessionErrorInfo& info) {
+            if (CHECK_EQUAL(info.error_code, ProtocolError::illegal_realm_path))
                 bowl.add_stone();
         };
         Session session = fixture.make_session(db);
@@ -5411,13 +4948,13 @@ TEST(Sync_ConnectionStateChange)
         fixture.start();
 
         BowlOfStonesSemaphore bowl_1, bowl_2;
-        auto listener_1 = [&](ConnectionState state, const ErrorInfo* error_info) {
+        auto listener_1 = [&](ConnectionState state, util::Optional<ErrorInfo> error_info) {
             CHECK_EQUAL(state == ConnectionState::disconnected, bool(error_info));
             states_1.push_back(state);
             if (state == ConnectionState::disconnected)
                 bowl_1.add_stone();
         };
-        auto listener_2 = [&](ConnectionState state, const ErrorInfo* error_info) {
+        auto listener_2 = [&](ConnectionState state, util::Optional<ErrorInfo> error_info) {
             CHECK_EQUAL(state == ConnectionState::disconnected, bool(error_info));
             states_2.push_back(state);
             if (state == ConnectionState::disconnected)
@@ -5453,7 +4990,7 @@ TEST(Sync_ClientErrorHandler)
     fixture.start();
 
     BowlOfStonesSemaphore bowl;
-    auto handler = [&](std::error_code, bool, const std::string&) {
+    auto handler = [&](const SessionErrorInfo&) {
         bowl.add_stone();
     };
 
@@ -5631,12 +5168,12 @@ TEST_IF(Sync_SSL_Certificates, false)
 
         Session session{client, db, nullptr, std::move(session_config)};
 
-        auto listener = [&](ConnectionState state, const Session::ErrorInfo* error_info) {
+        auto listener = [&](ConnectionState state, const util::Optional<Session::ErrorInfo>& error_info) {
             if (state == ConnectionState::disconnected) {
                 CHECK(error_info);
                 client_logger.debug(
                     "State change: disconnected, error_code = %1, is_fatal = %2, detailed_message = %3",
-                    error_info->error_code, error_info->is_fatal, error_info->detailed_message);
+                    error_info->error_code, error_info->is_fatal(), error_info->message);
                 // We expect to get through the SSL handshake but will hit an error due to the wrong token.
                 CHECK_NOT_EQUAL(error_info->error_code, Client::Error::ssl_server_cert_rejected);
                 client.stop();
@@ -5710,12 +5247,12 @@ TEST(Sync_BadChangeset)
             wt.commit();
         }
 
-        auto listener = [&](ConnectionState state, const Session::ErrorInfo* error_info) {
+        auto listener = [&](ConnectionState state, const util::Optional<Session::ErrorInfo>& error_info) {
             if (state != ConnectionState::disconnected)
                 return;
             REALM_ASSERT(error_info);
             std::error_code ec = error_info->error_code;
-            bool is_fatal = error_info->is_fatal;
+            bool is_fatal = error_info->is_fatal();
             CHECK_EQUAL(sync::ProtocolError::bad_changeset, ec);
             CHECK(is_fatal);
             did_fail = true;
@@ -5759,7 +5296,7 @@ TEST(Sync_GoodChangeset_AccentCharacterInFieldName)
             wt.commit();
         }
 
-        auto listener = [&](ConnectionState state, const Session::ErrorInfo*) {
+        auto listener = [&](ConnectionState state, const util::Optional<Session::ErrorInfo>) {
             if (state != ConnectionState::disconnected)
                 return;
             did_fail = true;
@@ -5777,15 +5314,6 @@ TEST(Sync_GoodChangeset_AccentCharacterInFieldName)
 
 
 namespace issue2104 {
-
-class IntegrationReporter : public _impl::ServerHistory::IntegrationReporter {
-public:
-    void on_integration_session_begin() override {}
-
-    void on_changeset_integrated(std::size_t) override {}
-
-    void on_changesets_merged(long) override {}
-};
 
 class ServerHistoryContext : public _impl::ServerHistory::Context {
 public:
@@ -5809,16 +5337,10 @@ public:
         return m_transform_buffer;
     }
 
-    IntegrationReporter& get_integration_reporter() override
-    {
-        return m_integration_reporter;
-    }
-
 private:
     std::mt19937_64 m_random;
     std::unique_ptr<sync::Transformer> m_transformer;
     util::Buffer<char> m_transform_buffer;
-    IntegrationReporter m_integration_reporter;
 };
 
 } // namespace issue2104
@@ -6026,38 +5548,6 @@ TEST_IF(Sync_Issue2104, false)
 }
 
 
-TEST(Sync_ConcurrentHttpDeleteAndHttpCompact)
-{
-    TEST_DIR(server_dir);
-    ClientServerFixture::Config config;
-    ClientServerFixture fixture(server_dir, test_context, std::move(config));
-    fixture.start();
-
-    for (int i = 0; i < 64; ++i) {
-        std::string virt_path = "/test";
-        {
-            TEST_CLIENT_DB(db);
-            Session session = fixture.make_bound_session(db, virt_path);
-            session.wait_for_download_complete_or_client_stopped();
-            session.detach();
-            fixture.wait_for_session_terminations_or_client_stopped();
-        }
-        auto run_delete = [&] {
-            CHECK_EQUAL(util::HTTPStatus::Ok, fixture.send_http_delete_request(virt_path));
-        };
-        auto run_compact = [&] {
-            CHECK_EQUAL(util::HTTPStatus::Ok, fixture.send_http_compact_request());
-        };
-        ThreadWrapper delete_thread;
-        ThreadWrapper compact_thread;
-        delete_thread.start(run_delete);
-        compact_thread.start(run_compact);
-        delete_thread.join();
-        compact_thread.join();
-    }
-}
-
-
 TEST(Sync_RunServerWithoutPublicKey)
 {
     TEST_CLIENT_DB(db);
@@ -6112,43 +5602,6 @@ TEST(Sync_ServerSideEncryption)
     CHECK(group.has_table("class_Test"));
 }
 
-
-TEST(Sync_ServerSideEncryptionPlusCompact)
-{
-    TEST_CLIENT_DB(db_1);
-    TEST_CLIENT_DB(db_2);
-
-    {
-        WriteTransaction wt(db_1);
-        wt.add_table("class_Test");
-        wt.commit();
-    }
-
-    TEST_DIR(server_dir);
-    ClientServerFixture::Config config;
-    bool always_encrypt = true;
-    config.server_encryption_key = crypt_key_2(always_encrypt);
-    ClientServerFixture fixture(server_dir, test_context, std::move(config));
-    fixture.start();
-
-    {
-        Session session = fixture.make_bound_session(db_1, "/test");
-        session.wait_for_upload_complete_or_client_stopped();
-    }
-
-    // Send a HTTP request to the server to compact all Realms.
-    CHECK_EQUAL(util::HTTPStatus::Ok, fixture.send_http_compact_request());
-
-    {
-        Session session = fixture.make_bound_session(db_2, "/test");
-        session.wait_for_download_complete_or_client_stopped();
-    }
-
-    {
-        auto rt = db_2->start_read();
-        CHECK(rt->has_table("class_Test"));
-    }
-}
 
 // This test calls row_for_object_id() for various object ids and tests that
 // the right value is returned including that no assertions are hit.
@@ -6288,58 +5741,6 @@ TEST(Sync_LogCompaction_EraseObject_LinkList)
 }
 
 
-TEST(Sync_ClientFileBlacklisting)
-{
-    TEST_CLIENT_DB(db);
-    TEST_DIR(server_dir);
-
-    // Get a client file identifier allocated for the client-side file
-    {
-        ClientServerFixture fixture(server_dir, test_context);
-        fixture.start();
-        Session session = fixture.make_bound_session(db, "/test");
-        session.wait_for_download_complete_or_client_stopped();
-    }
-    file_ident_type client_file_ident;
-    {
-        version_type client_version;
-        SaltedFileIdent client_file_ident_2;
-        SyncProgress progress;
-        get_history(db).get_status(client_version, client_file_ident_2, progress);
-        client_file_ident = client_file_ident_2.ident;
-    }
-
-    // Check that blacklisting works
-    MockMetrics metrics;
-    bool did_fail = false;
-    {
-        ClientServerFixture::Config config;
-        config.server_metrics = &metrics;
-        config.client_file_blacklists["/test"].push_back(client_file_ident);
-        ClientServerFixture fixture(server_dir, test_context, std::move(config));
-        fixture.start();
-        using ConnectionState = ConnectionState;
-        using ErrorInfo = Session::ErrorInfo;
-        auto listener = [&](ConnectionState state, const ErrorInfo* error_info) {
-            if (state != ConnectionState::disconnected)
-                return;
-            REALM_ASSERT(error_info);
-            std::error_code ec = error_info->error_code;
-            bool is_fatal = error_info->is_fatal;
-            CHECK_EQUAL(sync::ProtocolError::client_file_blacklisted, ec);
-            CHECK(is_fatal);
-            did_fail = true;
-            fixture.stop();
-        };
-        Session session = fixture.make_session(db);
-        session.set_connection_state_change_listener(listener);
-        fixture.bind_session(session, "/test");
-        session.wait_for_download_complete_or_client_stopped();
-    }
-    CHECK(did_fail);
-    CHECK_EQUAL(1.0, metrics.sum_equal("blacklisted"));
-}
-
 // This test could trigger the assertion that the row_for_object_id cache is
 // valid before the cache was properly invalidated in the case of a short
 // circuited sync replicator.
@@ -6418,12 +5819,12 @@ TEST(Sync_ResumeAfterClientSideFailureToIntegrate)
     bool failed_twice = false;
     using ConnectionState = ConnectionState;
     using ErrorInfo = Session::ErrorInfo;
-    auto listener = [&](ConnectionState state, const ErrorInfo* error_info) {
+    auto listener = [&](ConnectionState state, util::Optional<ErrorInfo> error_info) {
         if (state != ConnectionState::disconnected)
             return;
         REALM_ASSERT(error_info);
         std::error_code ec = error_info->error_code;
-        bool is_fatal = error_info->is_fatal;
+        bool is_fatal = error_info->is_fatal();
         CHECK_EQUAL(Client::Error::bad_changeset, ec);
         CHECK(is_fatal);
         if (!failed_once) {
@@ -7130,13 +6531,13 @@ TEST(Sync_BundledRealmFile)
     });
 
     // We cannot write out file if changes are not synced to server
-    CHECK_THROW_ANY(db->write_copy(path.c_str()));
+    CHECK_THROW_ANY(db->write_copy(path.c_str(), nullptr));
 
     session.wait_for_upload_complete_or_client_stopped();
     session.wait_for_download_complete_or_client_stopped();
 
     // Now we can
-    db->write_copy(path.c_str());
+    db->write_copy(path.c_str(), nullptr);
 }
 
 TEST(Sync_UpgradeToClientHistory)
@@ -7148,7 +6549,7 @@ TEST(Sync_UpgradeToClientHistory)
     {
         auto tr = db_1->start_write();
 
-        auto embedded = tr->add_embedded_table("class_Embedded");
+        auto embedded = tr->add_table("class_Embedded", Table::Type::Embedded);
         auto col_float = embedded->add_column(type_Float, "float");
         auto col_additional = embedded->add_column_dictionary(*embedded, "additional");
 
@@ -7295,6 +6696,79 @@ TEST(Sync_MergeStringPrimaryKey)
         session_2.wait_for_upload_complete_or_client_stopped();
         // Download completion is not important.
     }
+}
+
+TEST(Sync_NonIncreasingServerVersions)
+{
+    TEST_CLIENT_DB(db);
+
+    auto& history = get_history(db);
+    history.set_client_file_ident(SaltedFileIdent{2, 0x1234567812345678}, false);
+    timestamp_type timestamp{1};
+    history.set_local_origin_timestamp_source([&] {
+        return ++timestamp;
+    });
+
+    auto latest_local_verson = [&] {
+        auto tr = db->start_write();
+        tr->add_table_with_primary_key("class_foo", type_String, "_id")->add_column(type_Int, "int_col");
+        return tr->commit();
+    }();
+
+    std::vector<Changeset> server_changesets;
+    auto prep_changeset = [&](auto pk_name, auto int_col_val) {
+        Changeset changeset;
+        changeset.version = 10;
+        changeset.last_integrated_remote_version = latest_local_verson - 1;
+        changeset.origin_timestamp = ++timestamp;
+        changeset.origin_file_ident = 1;
+        instr::PrimaryKey pk{changeset.intern_string(pk_name)};
+        auto table_name = changeset.intern_string("foo");
+        auto col_name = changeset.intern_string("int_col");
+        instr::EraseObject erase_1;
+        erase_1.object = pk;
+        erase_1.table = table_name;
+        changeset.push_back(erase_1);
+        instr::CreateObject create_1;
+        create_1.object = pk;
+        create_1.table = table_name;
+        changeset.push_back(create_1);
+        instr::Update update_1;
+        update_1.table = table_name;
+        update_1.object = pk;
+        update_1.field = col_name;
+        update_1.value = instr::Payload{int64_t(int_col_val)};
+        changeset.push_back(update_1);
+        server_changesets.push_back(std::move(changeset));
+    };
+    prep_changeset("bizz", 1);
+    prep_changeset("buzz", 2);
+    prep_changeset("baz", 3);
+    prep_changeset("bar", 4);
+    ++server_changesets.back().version;
+
+    std::vector<ChangesetEncoder::Buffer> encoded;
+    std::vector<Transformer::RemoteChangeset> server_changesets_encoded;
+    for (const auto& changeset : server_changesets) {
+        encoded.emplace_back();
+        encode_changeset(changeset, encoded.back());
+        server_changesets_encoded.emplace_back(changeset.version, changeset.last_integrated_remote_version,
+                                               BinaryData(encoded.back().data(), encoded.back().size()),
+                                               changeset.origin_timestamp, changeset.origin_file_ident);
+    }
+
+    SyncProgress progress = {};
+    progress.download.server_version = server_changesets.back().version;
+    progress.download.last_integrated_client_version = latest_local_verson - 1;
+    progress.latest_server_version.version = server_changesets.back().version;
+    progress.latest_server_version.salt = 0x7876543217654321;
+
+    uint_fast64_t downloadable_bytes = 0;
+    VersionInfo version_info;
+    util::StderrLogger logger;
+    history.integrate_server_changesets(progress, &downloadable_bytes, server_changesets_encoded.data(),
+                                        server_changesets_encoded.size(), version_info,
+                                        DownloadBatchState::LastInBatch, logger, {});
 }
 
 } // unnamed namespace

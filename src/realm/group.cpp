@@ -33,7 +33,7 @@
 #include <realm/utilities.hpp>
 #include <realm/exceptions.hpp>
 #include <realm/group_writer.hpp>
-#include <realm/db.hpp>
+#include <realm/transaction.hpp>
 #include <realm/replication.hpp>
 
 using namespace realm;
@@ -126,6 +126,8 @@ Group::Group(SlabAlloc* alloc) noexcept
     init_array_parents();
 }
 
+namespace {
+
 class TableRecycler : public std::vector<Table*> {
 public:
     ~TableRecycler()
@@ -149,6 +151,8 @@ auto& g_table_recycler_2 = *new TableRecycler;
 // without crashing.
 const static int g_table_recycling_delay = 100;
 auto& g_table_recycler_mutex = *new std::mutex;
+
+} // namespace
 
 TableKeyIterator& TableKeyIterator::operator++()
 {
@@ -384,160 +388,6 @@ uint64_t Group::get_sync_file_id() const noexcept
     }
     return 0;
 }
-
-void Transaction::upgrade_file_format(int target_file_format_version)
-{
-    REALM_ASSERT(is_attached());
-    if (fake_target_file_format && *fake_target_file_format == target_file_format_version) {
-        // Testing, mockup scenario, not a real upgrade. Just pretend we're done!
-        return;
-    }
-
-    // Be sure to revisit the following upgrade logic when a new file format
-    // version is introduced. The following assert attempt to help you not
-    // forget it.
-    REALM_ASSERT_EX(target_file_format_version == 22, target_file_format_version);
-
-    // DB::do_open() must ensure that only supported version are allowed.
-    // It does that by asking backup if the current file format version is
-    // included in the accepted versions, so be sure to align the list of
-    // versions with the logic below
-
-    int current_file_format_version = get_file_format_version();
-    REALM_ASSERT(current_file_format_version < target_file_format_version);
-
-    // Upgrade from version prior to 7 (new history schema version in top array)
-    if (current_file_format_version <= 6 && target_file_format_version >= 7) {
-        // If top array size is 9, then add the missing 10th element containing
-        // the history schema version.
-        std::size_t top_size = m_top.size();
-        REALM_ASSERT(top_size <= 9);
-        if (top_size == 9) {
-            int initial_history_schema_version = 0;
-            m_top.add(initial_history_schema_version); // Throws
-        }
-        set_file_format_version(7);
-        commit_and_continue_writing();
-    }
-
-    // Upgrade from version prior to 10 (Cluster based db)
-    if (current_file_format_version <= 9 && target_file_format_version >= 10) {
-        DisableReplication disable_replication(*this);
-
-        std::vector<TableRef> table_accessors;
-        TableRef pk_table;
-        TableRef progress_info;
-        ColKey col_objects;
-        ColKey col_links;
-        std::map<TableRef, ColKey> pk_cols;
-
-        // Use table lookup by name. The table keys are not generated yet
-        for (size_t t = 0; t < m_table_names.size(); t++) {
-            StringData name = m_table_names.get(t);
-            // In file format version 9 files, all names represent existing tables.
-            auto table = get_table(name);
-            if (name == "pk") {
-                pk_table = table;
-            }
-            else if (name == "!UPDATE_PROGRESS") {
-                progress_info = table;
-            }
-            else {
-                table_accessors.push_back(table);
-            }
-        }
-
-        if (!progress_info) {
-            // This is the first time. Prepare for moving objects in one go.
-            progress_info = this->add_table_with_primary_key("!UPDATE_PROGRESS", type_String, "table_name");
-            col_objects = progress_info->add_column(type_Bool, "objects_migrated");
-            col_links = progress_info->add_column(type_Bool, "links_migrated");
-
-
-            for (auto k : table_accessors) {
-                k->migrate_column_info();
-            }
-
-            if (pk_table) {
-                pk_table->migrate_column_info();
-                pk_table->migrate_indexes(ColKey());
-                pk_table->create_columns();
-                pk_table->migrate_objects();
-                pk_cols = get_primary_key_columns_from_pk_table(pk_table);
-            }
-
-            for (auto k : table_accessors) {
-                k->migrate_indexes(pk_cols[k]);
-            }
-            for (auto k : table_accessors) {
-                k->migrate_subspec();
-            }
-            for (auto k : table_accessors) {
-                k->create_columns();
-            }
-            commit_and_continue_writing();
-        }
-        else {
-            if (pk_table) {
-                pk_cols = get_primary_key_columns_from_pk_table(pk_table);
-            }
-            col_objects = progress_info->get_column_key("objects_migrated");
-            col_links = progress_info->get_column_key("links_migrated");
-        }
-
-        bool updates = false;
-        for (auto k : table_accessors) {
-            if (k->verify_column_keys()) {
-                updates = true;
-            }
-        }
-        if (updates) {
-            commit_and_continue_writing();
-        }
-
-        // Migrate objects
-        for (auto k : table_accessors) {
-            auto progress_status = progress_info->create_object_with_primary_key(k->get_name());
-            if (!progress_status.get<bool>(col_objects)) {
-                bool no_links = k->migrate_objects();
-                progress_status.set(col_objects, true);
-                progress_status.set(col_links, no_links);
-                commit_and_continue_writing();
-            }
-        }
-        for (auto k : table_accessors) {
-            auto progress_status = progress_info->create_object_with_primary_key(k->get_name());
-            if (!progress_status.get<bool>(col_links)) {
-                k->migrate_links();
-                progress_status.set(col_links, true);
-                commit_and_continue_writing();
-            }
-        }
-
-        // Final cleanup
-        for (auto k : table_accessors) {
-            k->finalize_migration(pk_cols[k]);
-        }
-
-        if (pk_table) {
-            remove_table("pk");
-        }
-        remove_table(progress_info->get_key());
-    }
-
-    // Ensure we have search index on all primary key columns. This is idempotent so no
-    // need to check on current_file_format_version
-    auto table_keys = get_table_keys();
-    for (auto k : table_keys) {
-        auto t = get_table(k);
-        if (auto col = t->get_primary_key_column()) {
-            t->do_add_search_index(col);
-        }
-    }
-
-    // NOTE: Additional future upgrade steps go here.
-}
-
 
 int Group::read_only_version_check(SlabAlloc& alloc, ref_type top_ref, const std::string& path)
 {
@@ -831,13 +681,14 @@ Table* Group::do_get_table(StringData name)
     return table;
 }
 
-TableRef Group::add_table_with_primary_key(StringData name, DataType pk_type, StringData pk_name, bool nullable)
+TableRef Group::add_table_with_primary_key(StringData name, DataType pk_type, StringData pk_name, bool nullable,
+                                           Table::Type table_type)
 {
     if (!is_attached())
         throw LogicError(LogicError::detached_accessor);
     check_table_name_uniqueness(name);
 
-    auto table = do_add_table(name, false, false);
+    auto table = do_add_table(name, table_type, false);
 
     // Add pk column - without replication
     ColumnAttrMask attr;
@@ -848,12 +699,12 @@ TableRef Group::add_table_with_primary_key(StringData name, DataType pk_type, St
     table->do_set_primary_key_column(pk_col);
 
     if (Replication* repl = *get_repl())
-        repl->add_class_with_primary_key(table->get_key(), name, pk_type, pk_name, nullable);
+        repl->add_class_with_primary_key(table->get_key(), name, pk_type, pk_name, nullable, table_type);
 
     return TableRef(table, table->m_alloc.get_instance_version());
 }
 
-Table* Group::do_add_table(StringData name, bool is_embedded, bool do_repl)
+Table* Group::do_add_table(StringData name, Table::Type table_type, bool do_repl)
 {
     if (!m_is_writable)
         throw LogicError(LogicError::wrong_transact_state);
@@ -895,13 +746,12 @@ Table* Group::do_add_table(StringData name, bool is_embedded, bool do_repl)
 
     Replication* repl = *get_repl();
     if (do_repl && repl)
-        repl->add_class(key, name, is_embedded);
+        repl->add_class(key, name, table_type);
 
     ++m_num_tables;
 
     Table* table = create_table_accessor(j);
-    if (is_embedded)
-        table->do_set_embedded(true);
+    table->do_set_table_type(table_type);
 
     return table;
 }
@@ -1080,6 +930,9 @@ void Group::validate(ObjLink link) const
             throw LogicError(LogicError::target_row_index_out_of_range);
         }
         if (target_table->is_embedded()) {
+            throw LogicError(LogicError::wrong_kind_of_table);
+        }
+        if (target_table->is_asymmetric()) {
             throw LogicError(LogicError::wrong_kind_of_table);
         }
     }

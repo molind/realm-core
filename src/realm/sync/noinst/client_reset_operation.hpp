@@ -24,6 +24,10 @@
 #include <realm/util/logger.hpp>
 #include <realm/sync/protocol.hpp>
 
+namespace realm::sync {
+class SubscriptionStore;
+}
+
 namespace realm::_impl {
 
 // A ClientResetOperation object is used per client session to keep track of
@@ -31,15 +35,16 @@ namespace realm::_impl {
 class ClientResetOperation {
 public:
     using CallbackBeforeType = util::UniqueFunction<void(std::string)>;
-    using CallbackAfterType = util::UniqueFunction<void(std::string, VersionID)>;
+    using CallbackAfterType = util::UniqueFunction<void(std::string, VersionID, bool)>;
 
-    ClientResetOperation(util::Logger& logger, DB& db, DBRef db_fresh, bool discard_local,
-                         CallbackBeforeType notify_before, CallbackAfterType notify_after);
+    ClientResetOperation(util::Logger& logger, DBRef db, DBRef db_fresh, ClientResyncMode mode,
+                         CallbackBeforeType notify_before, CallbackAfterType notify_after, bool recovery_is_allowed);
 
     // When the client has received the salted file ident from the server, it
     // should deliver the ident to the ClientResetOperation object. The ident
     // will be inserted in the Realm after download.
-    bool finalize(sync::SaltedFileIdent salted_file_ident); // throws
+    bool finalize(sync::SaltedFileIdent salted_file_ident, sync::SubscriptionStore*,
+                  util::UniqueFunction<void(int64_t)>); // throws
 
     static std::string get_fresh_path_for(const std::string& realm_path);
 
@@ -50,14 +55,15 @@ private:
     void clean_up_state() noexcept;
 
     util::Logger& m_logger;
-    DB& m_db;
+    DBRef m_db;
     DBRef m_db_fresh;
-    bool m_discard_local;
+    ClientResyncMode m_mode;
     sync::SaltedFileIdent m_salted_file_ident = {0, 0};
     realm::VersionID m_client_reset_old_version;
     realm::VersionID m_client_reset_new_version;
     CallbackBeforeType m_notify_before;
     CallbackAfterType m_notify_after;
+    bool m_recovery_is_allowed;
 };
 
 // Implementation

@@ -16,7 +16,7 @@
 //
 ////////////////////////////////////////////////////////////////////////////
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include "collection_fixtures.hpp"
 #include "util/test_file.hpp"
@@ -854,7 +854,7 @@ TEST_CASE("embedded dictionary", "[dictionary]") {
     config.automatic_change_notifications = false;
     config.schema = Schema{
         {"origin", {{"links", PropertyType::Dictionary | PropertyType::Object | PropertyType::Nullable, "target"}}},
-        {"target", ObjectSchema::IsEmbedded{true}, {{"value", PropertyType::Int}}}};
+        {"target", ObjectSchema::ObjectType::Embedded, {{"value", PropertyType::Int}}}};
 
     auto r = Realm::get_shared_realm(config);
 

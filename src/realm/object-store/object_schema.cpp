@@ -29,6 +29,11 @@
 
 using namespace realm;
 
+static_assert(uint8_t(ObjectSchema::ObjectType::TopLevel) == uint8_t(Table::Type::TopLevel) &&
+                  uint8_t(ObjectSchema::ObjectType::Embedded) == uint8_t(Table::Type::Embedded) &&
+                  uint8_t(ObjectSchema::ObjectType::TopLevelAsymmetric) == uint8_t(Table::Type::TopLevelAsymmetric),
+              "Values of 'ObjectSchema::ObjectType' and 'Table::Type' enums don't match");
+
 ObjectSchema::ObjectSchema() = default;
 ObjectSchema::~ObjectSchema() = default;
 
@@ -37,25 +42,25 @@ ObjectSchema::ObjectSchema(std::string name, std::initializer_list<Property> per
 {
 }
 
-ObjectSchema::ObjectSchema(std::string name, IsEmbedded is_embedded,
+ObjectSchema::ObjectSchema(std::string name, ObjectType table_type,
                            std::initializer_list<Property> persisted_properties)
-    : ObjectSchema(std::move(name), is_embedded, persisted_properties, {})
+    : ObjectSchema(std::move(name), table_type, persisted_properties, {})
 {
 }
 
 ObjectSchema::ObjectSchema(std::string name, std::initializer_list<Property> persisted_properties,
                            std::initializer_list<Property> computed_properties, std::string name_alias)
-    : ObjectSchema(std::move(name), IsEmbedded{false}, persisted_properties, computed_properties, name_alias)
+    : ObjectSchema(std::move(name), ObjectType::TopLevel, persisted_properties, computed_properties, name_alias)
 {
 }
 
-ObjectSchema::ObjectSchema(std::string name, IsEmbedded is_embedded,
+ObjectSchema::ObjectSchema(std::string name, ObjectType table_type,
                            std::initializer_list<Property> persisted_properties,
                            std::initializer_list<Property> computed_properties, std::string name_alias)
     : name(std::move(name))
     , persisted_properties(persisted_properties)
     , computed_properties(computed_properties)
-    , is_embedded(is_embedded)
+    , table_type(table_type)
     , alias(name_alias)
 {
     for (auto const& prop : persisted_properties) {
@@ -130,7 +135,7 @@ ObjectSchema::ObjectSchema(Group const& group, StringData name, TableKey key)
         table = ObjectStore::table_for_object_type(group, name);
     }
     table_key = table->get_key();
-    is_embedded = table->is_embedded();
+    table_type = static_cast<ObjectSchema::ObjectType>(table->get_table_type());
 
     size_t count = table->get_column_count();
     ColKey pk_col = table->get_primary_key_column();
@@ -284,10 +289,21 @@ static void validate_property(Schema const& schema, ObjectSchema const& parent_o
                                 string_for_property_type(prop.type), prop.object_type);
         return;
     }
-    if (is_set(prop.type) && it->is_embedded) {
+    if (is_set(prop.type) && it->table_type == ObjectSchema::ObjectType::Embedded) {
         exceptions.emplace_back("Set property '%1.%2' cannot contain embedded object type '%3'. Set semantics are "
                                 "not applicable to embedded objects.",
                                 object_name, prop.name, prop.object_type);
+        return;
+    }
+    if (parent_object_schema.table_type == ObjectSchema::ObjectType::TopLevelAsymmetric &&
+        it->table_type != ObjectSchema::ObjectType::Embedded) {
+        exceptions.emplace_back("Asymmetric table with property '%1.%2' of type '%3' cannot have an object type.",
+                                object_name, prop.name, string_for_property_type(prop.type));
+        return;
+    }
+    if (it->table_type == ObjectSchema::ObjectType::TopLevelAsymmetric) {
+        exceptions.emplace_back("Property '%1.%2' of type '%3' cannot be a link to an asymmetric object.",
+                                object_name, prop.name, string_for_property_type(prop.type));
         return;
     }
     if (prop.type != PropertyType::LinkingObjects)
@@ -392,14 +408,14 @@ void ObjectSchema::validate(Schema const& schema, std::vector<ObjectSchemaValida
         validate_property(schema, *this, prop, &primary, exceptions);
     }
 
-    if (!primary_key.empty() && is_embedded) {
+    if (!primary_key.empty() && table_type == ObjectSchema::ObjectType::Embedded) {
         exceptions.emplace_back("Embedded object type '%1' cannot have a primary key.", name);
     }
     if (!primary_key.empty() && !primary && !primary_key_property()) {
         exceptions.emplace_back("Specified primary key '%1.%2' does not exist.", name, primary_key);
     }
 
-    if (for_sync && !is_embedded) {
+    if (for_sync && table_type != ObjectSchema::ObjectType::Embedded) {
         if (primary_key.empty()) {
             exceptions.emplace_back(util::format("There must be a primary key property named '_id' on a synchronized "
                                                  "Realm but none was found for type '%1'",
@@ -411,12 +427,16 @@ void ObjectSchema::validate(Schema const& schema, std::vector<ObjectSchemaValida
                 primary_key, name));
         }
     }
+
+    if (!for_sync && table_type == ObjectSchema::ObjectType::TopLevelAsymmetric) {
+        exceptions.emplace_back(util::format("Asymmetric table '%1' not allowed in a local Realm", name));
+    }
 }
 
 namespace realm {
 bool operator==(ObjectSchema const& a, ObjectSchema const& b) noexcept
 {
-    return std::tie(a.name, a.is_embedded, a.primary_key, a.persisted_properties, a.computed_properties) ==
-           std::tie(b.name, b.is_embedded, b.primary_key, b.persisted_properties, b.computed_properties);
+    return std::tie(a.name, a.table_type, a.primary_key, a.persisted_properties, a.computed_properties) ==
+           std::tie(b.name, b.table_type, b.primary_key, b.persisted_properties, b.computed_properties);
 }
 } // namespace realm

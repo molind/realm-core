@@ -20,7 +20,7 @@
 
 #include <realm/array.hpp>
 #include <realm/column_fwd.hpp>
-#include <realm/db.hpp>
+#include <realm/transaction.hpp>
 #include <realm/dictionary.hpp>
 #include <realm/query_engine.hpp>
 #include <realm/query_expression.hpp>
@@ -79,6 +79,9 @@ Query::Query(ConstTableRef table, std::unique_ptr<TableView> tv)
 
 void Query::create()
 {
+    if (m_table && m_table->is_asymmetric()) {
+        throw LogicError{LogicError::wrong_kind_of_table};
+    }
     m_groups.emplace_back();
 }
 
@@ -176,6 +179,10 @@ void Query::set_table(TableRef tr)
 {
     if (tr == m_table) {
         return;
+    }
+
+    if (tr->is_asymmetric()) {
+        throw LogicError{LogicError::wrong_kind_of_table};
     }
 
     m_table = tr;

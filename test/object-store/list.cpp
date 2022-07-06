@@ -16,7 +16,7 @@
 //
 ////////////////////////////////////////////////////////////////////////////
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include "util/test_file.hpp"
 #include "util/event_loop.hpp"
@@ -1215,9 +1215,9 @@ TEST_CASE("embedded List") {
         {"origin",
          {{"pk", PropertyType::Int, Property::IsPrimary{true}},
           {"array", PropertyType::Array | PropertyType::Object, "target"}}},
-        {"target", ObjectSchema::IsEmbedded{true}, {{"value", PropertyType::Int}}},
+        {"target", ObjectSchema::ObjectType::Embedded, {{"value", PropertyType::Int}}},
         {"other_origin", {{"array", PropertyType::Array | PropertyType::Object, "other_target"}}},
-        {"other_target", ObjectSchema::IsEmbedded{true}, {{"value", PropertyType::Int}}},
+        {"other_target", ObjectSchema::ObjectType::Embedded, {{"value", PropertyType::Int}}},
     });
 
     auto& coordinator = *_impl::RealmCoordinator::get_coordinator(config.path);
@@ -1647,7 +1647,7 @@ TEST_CASE("list of embedded objects") {
              {"array", PropertyType::Object | PropertyType::Array, "embedded"},
          }},
         {"embedded",
-         ObjectSchema::IsEmbedded{true},
+         ObjectSchema::ObjectType::Embedded,
          {
              {"value", PropertyType::Int},
          }},
@@ -1776,9 +1776,6 @@ TEST_CASE("list with unresolved links") {
 
     auto r1 = Realm::get_shared_realm(config1);
     auto r2 = Realm::get_shared_realm(config2);
-
-    auto coordinator = _impl::RealmCoordinator::get_coordinator(config2.path);
-    coordinator->enable_wait_for_change();
 
     auto origin = r1->read_group().get_table("class_origin");
     auto target = r1->read_group().get_table("class_target");

@@ -18,8 +18,7 @@
 
 #define CATCH_CONFIG_ENABLE_BENCHMARKING
 
-#define CATCH_CONFIG_RUNNER
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <limits.h>
 
@@ -28,6 +27,7 @@
 #pragma comment(lib, "Shlwapi.lib")
 #else
 #include <libgen.h>
+#include <unistd.h>
 #endif
 
 int main(int argc, char** argv)

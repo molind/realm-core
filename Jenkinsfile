@@ -28,7 +28,6 @@ jobWrapper {
 
             dependencies = readProperties file: 'dependencies.list'
             echo "Version in dependencies.list: ${dependencies.VERSION}"
-
             gitTag = readGitTag()
             gitSha = sh(returnStdout: true, script: 'git rev-parse HEAD').trim().take(8)
             gitDescribeVersion = sh(returnStdout: true, script: 'git describe --tags').trim()
@@ -48,13 +47,18 @@ jobWrapper {
             targetSHA1 = 'NONE'
             if (isPullRequest) {
                 targetSHA1 = sh(returnStdout: true, script: "git fetch origin && git merge-base origin/${targetBranch} HEAD").trim()
+            } 
+
+            isCoreCronJob = isCronJob()
+            requireNightlyBuild = false
+            if(isCoreCronJob) {
+                requireNightlyBuild = isNightlyBuildNeeded()
             }
-        }
+        }   
 
         currentBranch = env.BRANCH_NAME
         println "Building branch: ${currentBranch}"
-        println "Target branch: ${targetBranch}"
-
+        println "Target branch: ${targetBranch}"        
         releaseTesting = targetBranch.contains('release')
         isMaster = currentBranch.contains('master')
         longRunningTests = isMaster || currentBranch.contains('next-major')
@@ -62,12 +66,25 @@ jobWrapper {
         if (gitTag) {
             isPublishingRun = currentBranch.contains('release')
         }
+        else if(isCoreCronJob && requireNightlyBuild) {
+            isPublishingRun = true
+            longRunningTests = true
+            def localDate = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.BASIC_ISO_DATE)
+            gitDescribeVersion = "v${dependencies.VERSION}-nightly-${localDate}"
+        }
 
         echo "Pull request: ${isPullRequest ? 'yes' : 'no'}"
         echo "Release Run: ${releaseTesting ? 'yes' : 'no'}"
         echo "Publishing Run: ${isPublishingRun ? 'yes' : 'no'}"
+        echo "Is Realm cron job: ${isCoreCronJob ? 'yes' : 'no'}"
+        echo "Requires nighly build: ${requireNightlyBuild ? 'yes' : 'no'}"
         echo "Long running test: ${longRunningTests ? 'yes' : 'no'}"
 
+        if(isCoreCronJob && !requireNightlyBuild) {
+            currentBuild.result = 'ABORTED'
+            error 'Nightly build is not needed because there are no new commits to build'
+        }
+        
         if (isMaster) {
             // If we're on master, instruct the docker image builds to push to the
             // cache registry
@@ -126,12 +143,11 @@ jobWrapper {
             buildWindows_ARM64_Debug: doBuildWindows('Debug', false, 'ARM64', false),
             buildUWP_ARM64_Debug    : doBuildWindows('Debug', true, 'ARM64', false),
             checkiOSSimulator_Debug : doBuildApplePlatform('iphonesimulator', 'Debug', true),
+            buildAppleTV_Debug      : doBuildApplePlatform('appletvos', 'Debug', false),
             buildAndroidArm64Debug  : doAndroidBuildInDocker('arm64-v8a', 'Debug'),
             buildAndroidTestsArmeabi: doAndroidBuildInDocker('armeabi-v7a', 'Debug', TestAction.Build),
             threadSanitizer         : doCheckSanity(buildOptions + [enableSync: true, sanitizeMode: 'thread']),
             addressSanitizer        : doCheckSanity(buildOptions + [enableSync: true, sanitizeMode: 'address']),
-            // FIXME: disabled due to issues with CI
-	    // performance             : optionalBuildPerformance(releaseTesting), // always build performance on releases, otherwise make it optional
         ]
         if (releaseTesting) {
             extendedChecks = [
@@ -149,6 +165,7 @@ jobWrapper {
     }
 
     if (isPublishingRun) {
+
         stage('BuildPackages') {
             def buildOptions = [
                 enableSync: "ON",
@@ -204,7 +221,7 @@ jobWrapper {
                 for (cocoaStash in cocoaStashes) {
                     unstash name: cocoaStash
                 }
-                sh 'tools/build-cocoa.sh -x'
+                sh "tools/build-cocoa.sh -x -v \"${gitDescribeVersion}\""
                 archiveArtifacts('realm-*.tar.xz')
                 stash includes: 'realm-*.tar.xz', name: "cocoa"
                 publishingStashes << "cocoa"
@@ -214,16 +231,17 @@ jobWrapper {
             rlmNode('docker') {
                 deleteDir()
                 dir('temp') {
-                    withAWS(credentials: 'aws-credentials', region: 'us-east-1') {
+                    withAWS(credentials: 'tightdb-s3-ci', region: 'us-east-1') {
                         for (publishingStash in publishingStashes) {
                             unstash name: publishingStash
                             def path = publishingStash.replaceAll('___', '/')
-                            def files = findFiles(glob: '**')
-                            for (file in files) {
-                                rlmS3Put file: file.path, path: "downloads/core/${gitDescribeVersion}/${path}/${file.name}"
-                                rlmS3Put file: file.path, path: "downloads/core/${file.name}"
-                            }
-                            deleteDir()
+
+                            for (file in findFiles(glob: '**')) {
+                                s3Upload file: file.path, path: "downloads/core/${gitDescribeVersion}/${path}/${file.name}", bucket: 'static.realm.io'
+                                if (!requireNightlyBuild) { // don't publish nightly builds in the non-versioned folder path
+                                    s3Upload file: file.path, path: "downloads/core/${file.name}", bucket: 'static.realm.io'
+                                }
+                            } 
                         }
                     }
                 }
@@ -385,7 +403,7 @@ def doBuildLinux(String buildType) {
                    rm -rf build-dir
                    mkdir build-dir
                    cd build-dir
-                   cmake -DCMAKE_BUILD_TYPE=${buildType} -DREALM_NO_TESTS=1 -G Ninja ..
+                   cmake -DCMAKE_BUILD_TYPE=${buildType} -DREALM_NO_TESTS=1 -DREALM_VERSION="${gitDescribeVersion}" -G Ninja ..
                    ninja
                    cpack -G TGZ
                 """
@@ -414,7 +432,7 @@ def doBuildLinuxClang(String buildType) {
             buildDockerEnv('testing.Dockerfile').inside {
                 withEnv(environment) {
                     dir('build-dir') {
-                        sh "cmake -D CMAKE_BUILD_TYPE=${buildType} -DREALM_NO_TESTS=1 -G Ninja .."
+                        sh "cmake -D CMAKE_BUILD_TYPE=${buildType} -DREALM_NO_TESTS=1 -DREALM_VERSION=\"${gitDescribeVersion}\" -G Ninja .."
                         runAndCollectWarnings(
                             script: 'ninja',
                             parser: "clang",
@@ -568,6 +586,7 @@ def doBuildWindows(String buildType, boolean isUWP, String platform, boolean run
       // set a custom buildtrees path because the default one is too long and msbuild tasks fail
       VCPKG_INSTALL_OPTIONS: '--x-buildtrees-root=%WORKSPACE%/vcpkg-buildtrees',
       VCPKG_TARGET_TRIPLET: triplet,
+      REALM_VERSION: gitDescribeVersion,
     ]
 
      if (isUWP) {
@@ -594,7 +613,7 @@ def doBuildWindows(String buildType, boolean isUWP, String platform, boolean run
             getArchive()
 
             dir('build-dir') {
-                withAWS(credentials: 'aws-credentials', region: 'eu-west-1') {
+                withAWS(credentials: 'tightdb-s3-ci', region: 'eu-west-1') {
                     withEnv(["VCPKG_BINARY_SOURCES=clear;x-aws,s3://vcpkg-binary-caches,readwrite"]) {
                         bat "\"${tool 'cmake'}\" ${cmakeDefinitions} .."
                     }
@@ -663,69 +682,6 @@ def doBuildWindows(String buildType, boolean isUWP, String platform, boolean run
     }
 }
 
-def optionalBuildPerformance(boolean force) {
-    if (force) {
-        return {
-            buildPerformance()
-        }
-    } else {
-        return {
-            def doPerformance = true
-            stage("Input") {
-                try {
-                    timeout(time: 10, unit: 'MINUTES') {
-                        script {
-                            input message: 'Build Performance?', ok: 'Yes'
-                        }
-                    }
-                } catch (err) { // manual abort or timeout
-                    println "Not building performance on this run: ${err}"
-                    doPerformance = false
-                }
-            }
-            if (doPerformance) {
-                stage("Build") {
-                    buildPerformance()
-                }
-            }
-        }
-    }
-}
-
-def buildPerformance() {
-    // Select docker-cph-X.  We want docker, metal (brix) and only one executor
-    // (exclusive), if the machine changes also change REALM_BENCH_MACHID below
-    rlmNode('brix && exclusive') {
-      getArchive()
-
-      // REALM_BENCH_DIR tells the gen_bench_hist.sh script where to place results
-      // REALM_BENCH_MACHID gives the results an id - results are organized by hardware to prevent mixing cached results with runs on different machines
-      // MPLCONFIGDIR gives the python matplotlib library a config directory, otherwise it will try to make one on the user home dir which fails in docker
-      buildDockerEnv('testing.Dockerfile').inside {
-        withEnv(["REALM_BENCH_DIR=${env.WORKSPACE}/test/bench/core-benchmarks", "REALM_BENCH_MACHID=docker-brix","MPLCONFIGDIR=${env.WORKSPACE}/test/bench/config"]) {
-          rlmS3Get file: 'core-benchmarks.zip', path: 'downloads/core/core-benchmarks.zip'
-          sh 'unzip core-benchmarks.zip -d test/bench/'
-          sh 'rm core-benchmarks.zip'
-
-          sh """
-            cd test/bench
-            mkdir -p core-benchmarks results
-            ./gen_bench_hist.sh origin/${env.CHANGE_TARGET}
-          """
-          zip dir: 'test/bench', glob: 'core-benchmarks/**/*', zipFile: 'core-benchmarks.zip'
-          rlmS3Put file: 'core-benchmarks.zip', path: 'downloads/core/core-benchmarks.zip'
-          sh 'cd test/bench && ./parse_bench_hist.py --local-html results/ core-benchmarks/'
-          publishHTML(target: [allowMissing: false, alwaysLinkToLastBuild: false, keepAll: true, reportDir: 'test/bench/results', reportFiles: 'report.html', reportName: 'Performance_Report'])
-          withCredentials([[$class: 'StringBinding', credentialsId: 'bot-github-token', variable: 'githubToken']]) {
-              sh "curl -H \"Authorization: token ${env.githubToken}\" " +
-                 "-d '{ \"body\": \"Check the performance result [here](${env.BUILD_URL}Performance_5fReport).\"}' " +
-                 "\"https://api.github.com/repos/realm/${repo}/issues/${env.CHANGE_ID}/comments\""
-          }
-        }
-      }
-    }
-}
-
 def doBuildMacOs(Map options = [:]) {
     def buildType = options.buildType;
 
@@ -756,7 +712,7 @@ def doBuildMacOs(Map options = [:]) {
             getArchive()
 
             dir('build-macosx') {
-                withEnv(['DEVELOPER_DIR=/Applications/Xcode-12.2.app/Contents/Developer/']) {
+                withEnv(['DEVELOPER_DIR=/Applications/Xcode-13.1.app/Contents/Developer/']) {
                     // This is a dirty trick to work around a bug in xcode
                     // It will hang if launched on the same project (cmake trying the compiler out)
                     // in parallel.
@@ -774,7 +730,7 @@ def doBuildMacOs(Map options = [:]) {
                     )
                 }
             }
-            withEnv(['DEVELOPER_DIR=/Applications/Xcode-12.2.app/Contents/Developer']) {
+            withEnv(['DEVELOPER_DIR=/Applications/Xcode-13.1.app/Contents/Developer']) {
                 runAndCollectWarnings(
                     parser: 'clang',
                     script: 'xcrun swift build',
@@ -833,7 +789,7 @@ def doBuildApplePlatform(String platform, String buildType, boolean test = false
             getArchive()
 
             dir('build-xcode-platforms') {
-                withEnv(['DEVELOPER_DIR=/Applications/Xcode-12.2.app/Contents/Developer/']) {
+                withEnv(['DEVELOPER_DIR=/Applications/Xcode-13.1.app/Contents/Developer/']) {
                     sh "cmake ${cmakeDefinitions} -G Xcode .."
                     runAndCollectWarnings(
                         parser: 'clang',
@@ -864,7 +820,7 @@ def doBuildApplePlatform(String platform, String buildType, boolean test = false
             String tarball = "realm-${buildType}-${gitDescribeVersion}-${platform}-devel.tar.gz";
             archiveArtifacts tarball
 
-            def stashName = "${platform}__${buildType}"
+            def stashName = "${platform}___${buildType}"
             stash includes: tarball, name: stashName
             cocoaStashes << stashName
             publishingStashes << stashName
@@ -927,6 +883,26 @@ def readGitTag() {
         return null
     }
     return sh(returnStdout: true, script: command).trim()
+}
+
+def isCronJob() {
+    def upstreams = currentBuild.getUpstreamBuilds()
+    for(upstream in upstreams) {
+        def upstreamProjectName = upstream.getFullProjectName()
+        def isRealmCronBuild = upstreamProjectName == 'realm-core-cron'
+        if(isRealmCronBuild)
+            return true;
+    }
+    return false;
+}
+
+def isNightlyBuildNeeded() {
+    def command = 'git log -1 --format=%cI'
+    def lastCommitTime = sh(returnStdout: true, script:command).trim()
+    def current_dt = java.time.LocalDateTime.now()
+    def last_commit_dt = java.time.LocalDateTime.parse(lastCommitTime, java.time.format.DateTimeFormatter.ISO_DATE_TIME)
+    echo "Last Commit Time: ${last_commit_dt}"
+    return current_dt.getDayOfYear() - last_commit_dt.getDayOfYear() <= 1;
 }
 
 def setBuildName(newBuildName) {

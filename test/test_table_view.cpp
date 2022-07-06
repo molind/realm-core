@@ -26,7 +26,6 @@
 #include <cwchar>
 
 #include <realm.hpp>
-#include <realm/history.hpp>
 
 #include "util/misc.hpp"
 
@@ -2814,7 +2813,7 @@ public:
     }
 };
 
-TestTableView get_table_view(TestTableView val)
+static TestTableView get_table_view(TestTableView val)
 {
     return val;
 }

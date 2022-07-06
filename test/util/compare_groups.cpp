@@ -1,18 +1,16 @@
+#include "compare_groups.hpp"
+
 #include <algorithm>
 #include <vector>
 #include <set>
 #include <sstream>
 #include <iostream>
 
-#include <realm/group.hpp>
 #include <realm/table.hpp>
 #include <realm/sync/object_id.hpp>
 #include <realm/list.hpp>
 #include <realm/dictionary.hpp>
 #include <realm/set.hpp>
-
-#include "compare_groups.hpp"
-
 
 using namespace realm;
 
@@ -274,10 +272,6 @@ ObjKey row_for_primary_key(const Table& table, sync::PrimaryKey key)
     }
     return {};
 }
-
-} // unnamed namespace
-
-namespace realm::test_util {
 
 bool compare_objects(const Obj& obj_1, const Obj& obj_2, const std::vector<Column>& columns, util::Logger& logger);
 bool compare_objects(sync::PrimaryKey& oid, const Table& table_1, const Table& table_2,
@@ -966,6 +960,10 @@ bool compare_objects(sync::PrimaryKey& oid, const Table& table_1, const Table& t
     return compare_objects(obj_1, obj_2, columns, logger);
 }
 
+} // anonymous namespace
+
+namespace realm::test_util {
+
 bool compare_tables(const Table& table_1, const Table& table_2)
 {
     MuteLogger logger;
@@ -1061,7 +1059,7 @@ bool compare_groups(const Transaction& group_1, const Transaction& group_2,
         for (auto i : table_keys) {
             ConstTableRef table = group.get_table(i);
             StringData name = table->get_name();
-            if (name != "pk" && name != "metadata" && filter_func(name))
+            if (name != "pk" && name != "metadata" && name != "client_reset_metadata" && filter_func(name))
                 tables.push_back(name);
         }
     };

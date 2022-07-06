@@ -31,7 +31,6 @@
 using namespace std::chrono;
 
 #include <realm.hpp>
-#include <realm/history.hpp>
 #include <realm/util/buffer.hpp>
 #include <realm/util/to_string.hpp>
 #include <realm/util/base64.hpp>
@@ -5372,7 +5371,7 @@ TEST(Table_EmbeddedObjects)
     DBRef sg = DB::create(*hist, path, DBOptions(crypt_key()));
 
     auto tr = sg->start_write();
-    auto table = tr->add_embedded_table("mytable");
+    auto table = tr->add_table("mytable", Table::Type::Embedded);
     tr->commit_and_continue_as_read();
     tr->promote_to_write();
     CHECK(table->is_embedded());
@@ -5393,7 +5392,7 @@ TEST(Table_EmbeddedObjectCreateAndDestroy)
 
     {
         auto tr = sg->start_write();
-        auto table = tr->add_embedded_table("myEmbeddedStuff");
+        auto table = tr->add_table("myEmbeddedStuff", Table::Type::Embedded);
         auto col_recurse = table->add_column(*table, "theRecursiveBit");
         CHECK_THROW(table->create_object(), LogicError);
         auto parent = tr->add_table("myParentStuff");
@@ -5445,7 +5444,7 @@ TEST(Table_EmbeddedObjectCreateAndDestroyList)
     DBRef sg = DB::create(*hist, path, DBOptions(crypt_key()));
 
     auto tr = sg->start_write();
-    auto table = tr->add_embedded_table("myEmbeddedStuff");
+    auto table = tr->add_table("myEmbeddedStuff", Table::Type::Embedded);
     auto col_recurse = table->add_column_list(*table, "theRecursiveBit");
     CHECK_THROW(table->create_object(), LogicError);
     auto parent = tr->add_table("myParentStuff");
@@ -5487,7 +5486,7 @@ TEST(Table_EmbeddedObjectCreateAndDestroyDictionary)
     DBRef sg = DB::create(*hist, path, DBOptions(crypt_key()));
 
     auto tr = sg->start_write();
-    auto table = tr->add_embedded_table("myEmbeddedStuff");
+    auto table = tr->add_table("myEmbeddedStuff", Table::Type::Embedded);
     auto col_recurse = table->add_column_dictionary(*table, "theRecursiveBit");
     CHECK_THROW(table->create_object(), LogicError);
     auto parent = tr->add_table("myParentStuff");
@@ -5545,7 +5544,7 @@ TEST(Table_EmbeddedObjectNotifications)
     DBRef sg = DB::create(*hist, path, DBOptions(crypt_key()));
 
     auto tr = sg->start_write();
-    auto table = tr->add_embedded_table("myEmbeddedStuff");
+    auto table = tr->add_table("myEmbeddedStuff", Table::Type::Embedded);
     auto col_recurse = table->add_column_list(*table, "theRecursiveBit");
     CHECK_THROW(table->create_object(), LogicError);
     auto parent = tr->add_table("myParentStuff");
@@ -5602,7 +5601,7 @@ TEST(Table_EmbeddedObjectTableClearNotifications)
     DBRef sg = DB::create(*hist, path, DBOptions(crypt_key()));
 
     auto tr = sg->start_write();
-    auto table = tr->add_embedded_table("myEmbeddedStuff");
+    auto table = tr->add_table("myEmbeddedStuff", Table::Type::Embedded);
     auto col_recurse = table->add_column_list(*table, "theRecursiveBit");
     CHECK_THROW(table->create_object(), LogicError);
     auto parent = tr->add_table("myParentStuff");
@@ -5659,7 +5658,7 @@ TEST(Table_EmbeddedObjectPath)
     DBRef sg = DB::create(*hist, path, DBOptions(crypt_key()));
 
     auto tr = sg->start_write();
-    auto table = tr->add_embedded_table("myEmbeddedStuff");
+    auto table = tr->add_table("myEmbeddedStuff", Table::Type::Embedded);
     auto col_recurse = table->add_column_list(*table, "theRecursiveBit");
     CHECK_THROW(table->create_object(), LogicError);
     auto parent = tr->add_table("myParentStuff");
@@ -5866,6 +5865,35 @@ TEST(Table_ListOfPrimitivesTransaction)
     list.clear();
     tr->commit_and_continue_as_read();
     CHECK_EQUAL(list.size(), 0);
+}
+
+TEST(Table_AsymmetricObjects)
+{
+    SHARED_GROUP_TEST_PATH(path);
+
+    std::unique_ptr<Replication> hist(make_in_realm_history());
+    DBRef sg = DB::create(*hist, path, DBOptions(crypt_key()));
+
+    auto tr = sg->start_write();
+    auto table = tr->add_table("mytable", Table::Type::TopLevelAsymmetric);
+    tr->commit_and_continue_as_read();
+    tr->promote_to_write();
+    CHECK(table->is_asymmetric());
+    table->create_object();
+    tr->commit();
+
+    tr = sg->start_read();
+    table = tr->get_table("mytable");
+    CHECK(table->is_asymmetric());
+
+    tr = sg->start_write();
+    auto table2 = tr->add_table("target table");
+    table = tr->get_table("mytable");
+    // Outgoing link from asymmetric object is not allowed.
+    CHECK_THROW(table->add_column(*table2, "link"), LogicError);
+    // Incoming link to asymmetric object is not allowed.
+    CHECK_THROW(table2->add_column(*table, "link"), LogicError);
+    tr->commit();
 }
 
 #endif // TEST_TABLE

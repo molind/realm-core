@@ -153,6 +153,36 @@ TEST(Set_Mixed)
     CHECK(ref_values == actuals);
 }
 
+TEST(Set_LinksRemoveBacklinks)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    std::unique_ptr<Replication> hist(make_in_realm_history());
+    DBRef sg = DB::create(*hist, path, DBOptions(crypt_key()));
+
+    auto wt = sg->start_write();
+    auto persons = wt->add_table_with_primary_key("class_person", type_String, "name");
+    auto collections = wt->add_table("class_Collection");
+    auto col_set = collections->add_column_set(*persons, "Link");
+    wt->commit_and_continue_as_read();
+
+    wt->promote_to_write();
+    auto collection = collections->create_object();
+    auto person = persons->create_object_with_primary_key("Per");
+    wt->commit_and_continue_as_read();
+
+    wt->promote_to_write();
+    collection.get_linkset(col_set).insert(person.get_key());
+    wt->commit_and_continue_as_read();
+
+    wt->promote_to_write();
+    collection.remove();
+    wt->commit_and_continue_as_read();
+
+    wt->promote_to_write();
+    person.remove();
+    wt->commit();
+}
+
 TEST(Set_Links)
 {
     Group g;
