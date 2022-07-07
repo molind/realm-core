@@ -4463,7 +4463,6 @@ void SyncConnection::receive_bind_message(session_ident_type session_ident, std:
 
     if (!m_client_access_token.path || *m_client_access_token.path != path) {
         logger.error("Permission denied");                       // Throws
-        metrics().increment("protocol.violated");                // Throws
         protocol_error(ProtocolError::permission_denied, &sess); // Throws
         return;
     }
