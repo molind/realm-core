@@ -1583,14 +1583,14 @@ public:
         if (m_is_sending) {
             if (time >= config.http_response_timeout) {
                 // Suicide
-                terminate(Logger::Level::detail,
+                terminate(Logger::Level::error,
                           "HTTP connection closed (request timeout)"); // Throws
             }
         }
         else {
             if (time >= config.http_request_timeout) {
                 // Suicide
-                terminate(Logger::Level::detail,
+                terminate(Logger::Level::error,
                           "HTTP connection closed (response timeout)"); // Throws
             }
         }
@@ -1962,7 +1962,7 @@ private:
                 write_error(ec);
                 return;
             }
-            terminate(Logger::Level::detail, "HTTP connection closed"); // Throws
+            terminate(Logger::Level::error, "HTTP connection closed"); // Throws
         };
         m_http_server.async_send_response(response, std::move(handler));
     }
@@ -2449,7 +2449,7 @@ public:
             // connection is always due to that other connection being a
             // zombie. And when such a situation is detected, we want to close
             // the zombie connection immediately.
-            auto log_level = Logger::Level::detail;
+            auto log_level = Logger::Level::error;
             other_conn.terminate(log_level,
                                  "Sync connection closed (superseded session)"); // Throws
         }
@@ -4390,14 +4390,14 @@ void SyncConnection::terminate_if_dead(SteadyTimePoint now)
     if (m_is_closing) {
         if (time >= config.soft_close_timeout) {
             // Suicide
-            terminate(Logger::Level::detail,
+            terminate(Logger::Level::error,
                       "Sync connection closed (timeout during soft close)"); // Throws
         }
     }
     else {
         if (time >= config.connection_reaper_timeout) {
             // Suicide
-            terminate(Logger::Level::detail,
+            terminate(Logger::Level::error,
                       "Sync connection closed (no heartbeat)"); // Throws
         }
     }
