@@ -596,7 +596,6 @@ TEST(Transform_MergeInsertSetAndErase)
     });
 
     client_2->transaction([](Peer& client_2) {
-        TableRef t;
         client_2.table("class_t")->remove_object(client_2.table("class_t")->begin());
     });
     synchronize(server.get(), {client_1.get(), client_2.get()});
@@ -972,8 +971,8 @@ TEST(Transform_EraseSelectedLinkView)
     }
 }
 
-
-TEST(Transform_Randomized)
+// this test can take upwards of an hour if sync to disk is enabled
+TEST_IF(Transform_Randomized, get_disable_sync_to_disk())
 {
     const char* trace_p = ::getenv("UNITTEST_RANDOMIZED_TRACE");
     bool trace = trace_p && (StringData{trace_p} != "no");
@@ -1705,7 +1704,7 @@ TEST(Transform_AddIntegerSurvivesSetDefault)
         client_1->transaction([&](Peer& c) {
             auto table = c.group->add_table_with_primary_key("class_table", type_Int, "pk");
             table->add_column(type_Int, "int");
-            auto obj = table->create_object_with_primary_key(0);
+            table->create_object_with_primary_key(0);
         });
 
         it.sync_all();
@@ -1761,7 +1760,7 @@ TEST(Transform_AddIntegerSurvivesSetDefault_NoRegularSets)
         client_1->transaction([&](Peer& c) {
             auto table = c.group->add_table_with_primary_key("class_table", type_Int, "pk");
             table->add_column(type_Int, "int");
-            auto obj = table->create_object_with_primary_key(0);
+            table->create_object_with_primary_key(0);
         });
 
         it.sync_all();
@@ -2028,13 +2027,11 @@ TEST(Transform_ArrayEraseVsArrayErase)
     synchronize(server.get(), {client_3.get(), client_4.get(), client_5.get()});
 
     client_5->transaction([](Peer& p) {
-        Obj obj = *p.table("class_A")->begin();
         auto ll = p.table("class_A")->begin()->get_list<String>("h");
         ll.insert(0, "5abc");
     });
 
     client_4->transaction([](Peer& p) {
-        Obj obj = *p.table("class_A")->begin();
         auto ll = p.table("class_A")->begin()->get_list<String>("h");
         ll.insert(0, "4abc");
     });
@@ -2043,13 +2040,11 @@ TEST(Transform_ArrayEraseVsArrayErase)
     server->integrate_next_changeset_from(*client_4);
 
     client_3->transaction([](Peer& p) {
-        Obj obj = *p.table("class_A")->begin();
         auto ll = p.table("class_A")->begin()->get_list<String>("h");
         ll.insert(0, "3abc");
     });
 
     client_5->transaction([](Peer& p) {
-        Obj obj = *p.table("class_A")->begin();
         auto ll = p.table("class_A")->begin()->get_list<String>("h");
         ll.insert(0, "5def");
     });
@@ -2058,13 +2053,11 @@ TEST(Transform_ArrayEraseVsArrayErase)
     server->integrate_next_changeset_from(*client_5);
 
     client_4->transaction([](Peer& p) {
-        Obj obj = *p.table("class_A")->begin();
         auto ll = p.table("class_A")->begin()->get_list<String>("h");
         ll.remove(0);
     });
 
     client_5->transaction([](Peer& p) {
-        Obj obj = *p.table("class_A")->begin();
         auto ll = p.table("class_A")->begin()->get_list<String>("h");
         ll.remove(0);
     });

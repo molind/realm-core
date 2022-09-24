@@ -28,6 +28,16 @@ RLM_API realm_object_t* realm_get_object(const realm_t* realm, realm_class_key_t
     });
 }
 
+RLM_API bool realm_object_get_parent(const realm_object_t* object, realm_object_t* parent)
+{
+    return wrap_err([&]() {
+        if (parent)
+            *parent = realm_object_t{realm::Object{object->get_realm(), object->obj().get_parent_object()}};
+        return true;
+    });
+}
+
+
 RLM_API realm_object_t* realm_object_find_with_primary_key(const realm_t* realm, realm_class_key_t class_key,
                                                            realm_value_t pk, bool* out_found)
 {
@@ -201,6 +211,17 @@ RLM_API bool realm_object_resolve_in(const realm_object_t* from_object, const re
         }
     });
 }
+
+RLM_API bool realm_object_add_int(realm_object_t* object, realm_property_key_t property_key, int64_t value)
+{
+    REALM_ASSERT(object);
+    return wrap_err([&]() {
+        object->verify_attached();
+        object->obj().add_int(ColKey(property_key), value);
+        return true;
+    });
+}
+
 
 RLM_API bool realm_object_is_valid(const realm_object_t* obj)
 {

@@ -194,12 +194,22 @@ std::shared_ptr<SyncSession> Realm::sync_session() const
 
 sync::SubscriptionSet Realm::get_latest_subscription_set()
 {
-    return m_coordinator->sync_session()->get_flx_subscription_store()->get_latest();
+    // If there is a subscription store, then return the latest set
+    if (auto flx_sub_store = m_coordinator->sync_session()->get_flx_subscription_store()) {
+        return flx_sub_store->get_latest();
+    }
+    // Otherwise, throw runtime_error
+    throw std::runtime_error("Flexible sync is not enabled");
 }
 
 sync::SubscriptionSet Realm::get_active_subscription_set()
 {
-    return m_coordinator->sync_session()->get_flx_subscription_store()->get_active();
+    // If there is a subscription store, then return the active set
+    if (auto flx_sub_store = m_coordinator->sync_session()->get_flx_subscription_store()) {
+        return flx_sub_store->get_active();
+    }
+    // Otherwise, throw runtime_error
+    throw std::runtime_error("Flexible sync is not enabled");
 }
 #endif
 
@@ -257,8 +267,7 @@ bool Realm::reset_file(Schema& schema, std::vector<SchemaChange>& required_chang
     // synchronization. The latter is probably fixable, but making it
     // multi-process-safe requires some sort of multi-process exclusive lock
     m_transaction = nullptr;
-    m_coordinator->close();
-    util::File::remove(m_config.path);
+    m_coordinator->delete_and_reopen();
 
     m_schema = ObjectStore::schema_from_group(read_group());
     m_schema_version = ObjectStore::get_schema_version(read_group());
@@ -285,7 +294,7 @@ bool Realm::schema_change_needs_write_transaction(Schema& schema, std::vector<Sc
             REALM_FALLTHROUGH;
         case SchemaMode::ReadOnly:
             ObjectStore::verify_compatible_for_immutable_and_readonly(changes);
-            return false;
+            return m_schema_version == ObjectStore::NotVersioned;
 
         case SchemaMode::SoftResetFile:
             if (m_schema_version == ObjectStore::NotVersioned)
@@ -376,14 +385,17 @@ void Realm::update_schema(Schema schema, uint64_t version, MigrationFunction mig
                           DataInitializationFunction initialization_function, bool in_transaction)
 {
     uint64_t validation_mode = SchemaValidationMode::Basic;
-    if (m_config.sync_config) {
-        validation_mode |= SchemaValidationMode::Sync;
+#if REALM_ENABLE_SYNC
+    if (auto sync_config = m_config.sync_config) {
+        validation_mode |=
+            sync_config->flx_sync_requested ? SchemaValidationMode::SyncFLX : SchemaValidationMode::SyncPBS;
     }
+#endif
     if (m_config.schema_mode == SchemaMode::AdditiveExplicit) {
         validation_mode |= SchemaValidationMode::RejectEmbeddedOrphans;
     }
 
-    schema.validate(validation_mode);
+    schema.validate(static_cast<SchemaValidationMode>(validation_mode));
 
     bool was_in_read_transaction = is_in_read_transaction();
     Schema actual_schema = get_full_schema();
@@ -426,7 +438,8 @@ void Realm::update_schema(Schema schema, uint64_t version, MigrationFunction mig
 
     uint64_t old_schema_version = m_schema_version;
     bool additive = m_config.schema_mode == SchemaMode::AdditiveDiscovered ||
-                    m_config.schema_mode == SchemaMode::AdditiveExplicit;
+                    m_config.schema_mode == SchemaMode::AdditiveExplicit ||
+                    m_config.schema_mode == SchemaMode::ReadOnly;
     if (migration_function && !additive) {
         auto wrapper = [&] {
             auto config = m_config;
@@ -435,6 +448,8 @@ void Realm::update_schema(Schema schema, uint64_t version, MigrationFunction mig
             // Don't go through the normal codepath for opening a Realm because
             // we're using a mismatched config
             auto old_realm = std::make_shared<Realm>(std::move(config), none, m_coordinator, MakeSharedTag{});
+            // block autorefresh for the old realm
+            old_realm->m_auto_refresh = false;
             migration_function(old_realm, shared_from_this(), m_schema);
         };
 
@@ -449,11 +464,12 @@ void Realm::update_schema(Schema schema, uint64_t version, MigrationFunction mig
         });
 
         ObjectStore::apply_schema_changes(transaction(), version, m_schema, m_schema_version, m_config.schema_mode,
-                                          required_changes, wrapper);
+                                          required_changes, m_config.automatic_handle_backlicks_in_migrations,
+                                          wrapper);
     }
     else {
         ObjectStore::apply_schema_changes(transaction(), m_schema_version, schema, version, m_config.schema_mode,
-                                          required_changes);
+                                          required_changes, m_config.automatic_handle_backlicks_in_migrations);
         REALM_ASSERT_DEBUG(additive ||
                            (required_changes = ObjectStore::schema_from_group(read_group()).compare(schema)).empty());
     }
@@ -599,6 +615,7 @@ VersionID Realm::read_transaction_version() const
 {
     verify_thread();
     verify_open();
+    REALM_ASSERT(m_transaction);
     return m_transaction->get_version_of_current_transaction();
 }
 
@@ -627,6 +644,16 @@ util::Optional<VersionID> Realm::current_transaction_version() const
     }
     else if (m_frozen_version) {
         ret = m_frozen_version;
+    }
+    return ret;
+}
+
+// Get the version of the latest snapshot
+util::Optional<DB::version_type> Realm::latest_snapshot_version() const
+{
+    util::Optional<DB::version_type> ret;
+    if (m_transaction) {
+        ret = m_transaction->get_version_of_latest_snapshot();
     }
     return ret;
 }
@@ -962,6 +989,9 @@ void Realm::commit_transaction()
     }
 
     DB::VersionID prev_version = transaction().get_version_of_current_transaction();
+    if (auto audit = audit_context()) {
+        audit->prepare_for_write(prev_version);
+    }
 
     m_coordinator->commit_write(*this, /* commit_to_disk */ true);
     cache_new_schema();
@@ -1055,6 +1085,13 @@ bool Realm::compact()
 void Realm::convert(const Config& config, bool merge_into_existing)
 {
     verify_thread();
+
+#if REALM_ENABLE_SYNC
+    if (config.sync_config && config.sync_config->flx_sync_requested) {
+        throw std::logic_error("Realm cannot be converted if flexible sync is enabled");
+    }
+#endif
+
     if (merge_into_existing && util::File::exists(config.path)) {
         auto destination_realm = Realm::get_shared_realm(config);
         destination_realm->begin_transaction();

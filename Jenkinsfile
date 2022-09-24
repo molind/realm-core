@@ -16,6 +16,7 @@ ctest_cmd = "ctest -VV"
 warningFilters = [
     excludeFile('/external/*'), // submodules and external libraries
     excludeFile('/libuv-src/*'), // libuv, where it was downloaded and built inside cmake
+    excludeFile('/src/realm/parser/generated/*'), // the auto generated parser code we didn't write
 ]
 
 jobWrapper {
@@ -47,18 +48,18 @@ jobWrapper {
             targetSHA1 = 'NONE'
             if (isPullRequest) {
                 targetSHA1 = sh(returnStdout: true, script: "git fetch origin && git merge-base origin/${targetBranch} HEAD").trim()
-            } 
+            }
 
             isCoreCronJob = isCronJob()
             requireNightlyBuild = false
             if(isCoreCronJob) {
                 requireNightlyBuild = isNightlyBuildNeeded()
             }
-        }   
+        }
 
         currentBranch = env.BRANCH_NAME
         println "Building branch: ${currentBranch}"
-        println "Target branch: ${targetBranch}"        
+        println "Target branch: ${targetBranch}"
         releaseTesting = targetBranch.contains('release')
         isMaster = currentBranch.contains('master')
         longRunningTests = isMaster || currentBranch.contains('next-major')
@@ -77,14 +78,14 @@ jobWrapper {
         echo "Release Run: ${releaseTesting ? 'yes' : 'no'}"
         echo "Publishing Run: ${isPublishingRun ? 'yes' : 'no'}"
         echo "Is Realm cron job: ${isCoreCronJob ? 'yes' : 'no'}"
-        echo "Requires nighly build: ${requireNightlyBuild ? 'yes' : 'no'}"
+        echo "Is nightly build: ${requireNightlyBuild ? 'yes' : 'no'}"
         echo "Long running test: ${longRunningTests ? 'yes' : 'no'}"
 
         if(isCoreCronJob && !requireNightlyBuild) {
             currentBuild.result = 'ABORTED'
             error 'Nightly build is not needed because there are no new commits to build'
         }
-        
+
         if (isMaster) {
             // If we're on master, instruct the docker image builds to push to the
             // cache registry
@@ -233,15 +234,17 @@ jobWrapper {
                 dir('temp') {
                     withAWS(credentials: 'tightdb-s3-ci', region: 'us-east-1') {
                         for (publishingStash in publishingStashes) {
-                            unstash name: publishingStash
-                            def path = publishingStash.replaceAll('___', '/')
-
-                            for (file in findFiles(glob: '**')) {
-                                s3Upload file: file.path, path: "downloads/core/${gitDescribeVersion}/${path}/${file.name}", bucket: 'static.realm.io'
-                                if (!requireNightlyBuild) { // don't publish nightly builds in the non-versioned folder path
-                                    s3Upload file: file.path, path: "downloads/core/${file.name}", bucket: 'static.realm.io'
+                            dir(publishingStash) {
+                                unstash name: publishingStash
+                                def path = publishingStash.replaceAll('___', '/')
+                                def files = findFiles(glob: '**')
+                                for (file in files) {
+                                    s3Upload file: file.path, path: "downloads/core/${gitDescribeVersion}/${path}/${file.name}", bucket: 'static.realm.io'
+                                    if (!requireNightlyBuild) { // don't publish nightly builds in the non-versioned folder path
+                                        s3Upload file: file.path, path: "downloads/core/${file.name}", bucket: 'static.realm.io'
+                                    }
                                 }
-                            } 
+                            }
                         }
                     }
                 }
@@ -278,6 +281,8 @@ def doCheckInDocker(Map options = [:]) {
             def buildEnv = buildDockerEnv('testing.Dockerfile')
 
             def environment = environment()
+            environment << 'UNITTEST_XML=unit-test-report.xml'
+            environment << "UNITTEST_SUITE_NAME=Linux-${options.buildType}"
             if (options.useEncryption) {
                 environment << 'UNITTEST_ENCRYPT_ALL=1'
             }
@@ -296,7 +301,7 @@ def doCheckInDocker(Map options = [:]) {
                                 sh "${ctest_cmd}"
                             }
                         } finally {
-                            recordTests("Linux-${options.buildType}")
+                            junit testResults: 'build-dir/test/unit-test-report.xml'
                         }
                     }
                 }
@@ -368,7 +373,9 @@ def doCheckSanity(Map options = [:]) {
 
             def environment = environment() + [
               'CC=clang',
-              'CXX=clang++'
+              'CXX=clang++',
+              'UNITTEST_XML=unit-test-report.xml',
+              "UNITTEST_SUITE_NAME=Linux-${options.buildType}"
             ]
             buildDockerEnv('testing.Dockerfile').inside(privileged) {
                 withEnv(environment) {
@@ -385,7 +392,7 @@ def doCheckSanity(Map options = [:]) {
                         }
 
                     } finally {
-                        recordTests("Linux-${options.buildType}")
+                        junit testResults: 'build-dir/test/unit-test-report.xml'
                     }
                 }
             }
@@ -461,6 +468,7 @@ def doCheckValgrind() {
 
             def environment = environment()
             environment << 'UNITTEST_NO_ERROR_EXITCODE=1'
+            environment << 'UNITTEST_SUITE_NAME=Linux-Valgrind'
 
             buildDockerEnv('testing.Dockerfile').inside {
                 withEnv(environment) {
@@ -481,7 +489,7 @@ def doCheckValgrind() {
                             valgrind --tool=memcheck --leak-check=full --undef-value-errors=yes --track-origins=yes --child-silent-after-fork=no --trace-children=yes --suppressions=$WORKSPACE/test/valgrind.suppress --error-exitcode=1 ./realm-tests
                         '''
                     } finally {
-                        recordTests('Linux-Valgrind')
+                        junit testResults: 'build-dir/test/unit-test-report.xml'
                     }
                 }
             }
@@ -499,6 +507,8 @@ def doAndroidBuildInDocker(String abi, String buildType, TestAction test = TestA
             def buildEnv = buildDockerEnv('android.Dockerfile')
 
             def environment = environment()
+            environment << 'UNITTEST_XML=/data/local/tmp/unit-test-report.xml'
+            environment << 'UNITTEST_SUITE_NAME=android'
             def cmakeArgs = ''
             if (test == TestAction.None) {
                 cmakeArgs = '-DREALM_NO_TESTS=ON'
@@ -541,19 +551,13 @@ def doAndroidBuildInDocker(String abi, String buildType, TestAction test = TestA
                                 adb connect emulator
                                 timeout 30m adb wait-for-device
                                 adb push test/realm-tests /data/local/tmp
-                                find test -type f -name "*.json" -maxdepth 1 -exec adb push {} /data/local/tmp \\;
-                                find test -type f -name "*.realm" -maxdepth 1 -exec adb push {} /data/local/tmp \\;
-                                find test -type f -name "*.txt" -maxdepth 1 -exec adb push {} /data/local/tmp \\;
+                                adb push test/resources /data/local/tmp
                                 adb shell 'cd /data/local/tmp; ${environment.join(' ')} ./realm-tests || echo __ADB_FAIL__' | tee adb.log
                                 ! grep __ADB_FAIL__ adb.log
                             """
                         } finally {
-                            sh '''
-                                mkdir -p build-dir/test
-                                cd build-dir/test
-                                adb pull /data/local/tmp/unit-test-report.xml
-                            '''
-                            recordTests('android')
+                            sh 'adb pull /data/local/tmp/unit-test-report.xml'
+                            junit testResults: 'unit-test-report.xml'
                         }
                     }
                 }
@@ -624,7 +628,7 @@ def doBuildWindows(String buildType, boolean isUWP, String platform, boolean run
                         isWindows: true,
                         script: "\"${tool 'cmake'}\" --build . --config ${buildType}",
                         name: "windows-${platform}-${buildType}-${isUWP?'uwp':'nouwp'}",
-                        filters: [excludeMessage('Publisher name .* does not match signing certificate subject')] + warningFilters,
+                        filters: [excludeMessage('Publisher name .* does not match signing certificate subject'), excludeFile('query_flex.ll')] + warningFilters,
                     )
                 }
                 bat "\"${tool 'cmake'}\\..\\cpack.exe\" -C ${buildType} -D CPACK_GENERATOR=TGZ"
@@ -636,13 +640,13 @@ def doBuildWindows(String buildType, boolean isUWP, String platform, boolean run
                 }
             }
             if (runTests && !isUWP) {
+                def prefix = "Windows-${platform}-${buildType}";
                 def environment = environment() + [ "TMP=${env.WORKSPACE}\\temp", 'UNITTEST_NO_ERROR_EXITCODE=1' ]
-                withEnv(environment) {
+                withEnv(environment + ["UNITTEST_XML=${WORKSPACE}\\core-results.xml", "UNITTEST_SUITE_NAME=${prefix}-core"]) {
                     dir("build-dir/test/${buildType}") {
                         bat '''
                           mkdir %TMP%
                           realm-tests.exe
-                          copy unit-test-report.xml ..\\core-results.xml
                           rmdir /Q /S %TMP%
                         '''
                     }
@@ -652,31 +656,28 @@ def doBuildWindows(String buildType, boolean isUWP, String platform, boolean run
                   // the sync tests in parallel
                   environment << 'UNITTEST_THREADS=1'
                 }
-                withEnv(environment) {
+                withEnv(environment + ["UNITTEST_XML=${WORKSPACE}\\sync-results.xml", "UNITTEST_SUITE_NAME=${prefix}-sync"]) {
                     dir("build-dir/test/${buildType}") {
                         bat '''
                           mkdir %TMP%
                           realm-sync-tests.exe
-                          copy unit-test-report.xml ..\\sync-results.xml
                           rmdir /Q /S %TMP%
                         '''
                     }
                 }
 
-                withEnv(environment) {
+                withEnv(environment + ["UNITTEST_XML=${WORKSPACE}\\object-store-results.xml", "UNITTEST_SUITE_NAME=${prefix}-object-store"]) {
                     dir("build-dir/test/object-store/${buildType}") {
                         bat '''
                           mkdir %TMP%
                           realm-object-store-tests.exe
-                          copy unit-test-report.xml ..\\..\\object-store-results.xml
                           rmdir /Q /S %TMP%
                         '''
                     }
                 }
-                def prefix = "Windows-${platform}-${buildType}";
-                recordTests("${prefix}-core", "core-results.xml")
-                recordTests("${prefix}-sync", "sync-results.xml")
-                recordTests("${prefix}-object-store", "object-store-results.xml")
+                junit testResults: 'core-results.xml'
+                junit testResults: 'sync-results.xml'
+                junit testResults: 'object-store-results.xml'
             }
         }
     }
@@ -752,18 +753,16 @@ def doBuildMacOs(Map options = [:]) {
                 try {
                     def environment = environment()
                     environment << 'CTEST_OUTPUT_ON_FAILURE=1'
+                    environment << "UNITTEST_XML=${WORKSPACE}/unit-test-report.xml"
+                    environment << "UNITTEST_SUITE_NAME=macOS_${buildType}"
+
                     dir('build-macosx') {
                         withEnv(environment) {
                             sh "${ctest_cmd} -C ${buildType}"
                         }
                     }
                 } finally {
-                    // recordTests expects the test results xml file in a build-dir/test/ folder
-                    sh """
-                        mkdir -p build-dir/test
-                        cp build-macosx/test/${buildType}/unit-test-report.xml build-dir/test/
-                    """
-                    recordTests("macosx_${buildType}")
+                    junit testResults: 'unit-test-report.xml'
                 }
             }
         }
@@ -771,51 +770,44 @@ def doBuildMacOs(Map options = [:]) {
 }
 
 def doBuildApplePlatform(String platform, String buildType, boolean test = false) {
-    def cmakeOptions = [
-        CMAKE_TOOLCHAIN_FILE: '$WORKSPACE/tools/cmake/xcode.toolchain.cmake',
-        CPACK_PACKAGE_DIRECTORY: '$WORKSPACE',
-        REALM_VERSION: gitDescribeVersion,
-        REALM_BUILD_LIB_ONLY: 'ON'
-    ]
-    def cmakeDefinitions = cmakeOptions.collect { k,v -> "-D$k=\"$v\"" }.join(' ')
-
-    String buildDestination = "generic/platform=${platform}"
-    if (platform == 'maccatalyst') {
-        buildDestination = 'generic/platform=macOS,variant=Mac Catalyst'
-    }
-
     return {
         rlmNode('osx') {
             getArchive()
 
-            dir('build-xcode-platforms') {
-                withEnv(['DEVELOPER_DIR=/Applications/Xcode-13.1.app/Contents/Developer/']) {
-                    sh "cmake ${cmakeDefinitions} -G Xcode .."
-                    runAndCollectWarnings(
-                        parser: 'clang',
-                        script: """
-                            xcodebuild -scheme ALL_BUILD -configuration ${buildType} -destination "${buildDestination}"
-                        """,
-                        name: "xcode-${platform}-${buildType}",
-                        filters: warningFilters,
-                    )
-                    sh "PLATFORM_NAME=${platform} EFFECTIVE_PLATFORM_NAME=-${platform} cpack -C ${buildType}"
+            withEnv(['DEVELOPER_DIR=/Applications/Xcode-13.1.app/Contents/Developer/',
+                     'XCODE_14_DEVELOPER_DIR=/Applications/Xcode-14.app/Contents/Developer/']) {
+                sh "tools/build-apple-device.sh -p '${platform}' -c '${buildType}' -v '${gitDescribeVersion}'"
 
-                    if (test) {
+                if (test) {
+                    dir('build-xcode-platforms') {
                         if (platform != 'iphonesimulator') error 'Testing is only available for iOS Simulator'
-                        sh "xcodebuild -scheme CoreTests -configuration ${buildType} -destination \"${buildDestination}\""
+                        sh "xcodebuild -scheme CoreTests -configuration ${buildType} -sdk iphonesimulator -arch x86_64"
+                        // sh "xcodebuild -scheme SyncTests -configuration ${buildType} -sdk iphonesimulator -arch x86_64 IPHONEOS_DEPLOYMENT_TARGET=13"
+                        sh "xcodebuild -scheme ObjectStoreTests -configuration ${buildType} -sdk iphonesimulator -arch x86_64 IPHONEOS_DEPLOYMENT_TARGET=13"
+
                         def env = environment().collect { v -> "SIMCTL_CHILD_${v}" }
-                        withEnv(env) {
-                            runSimulator("test/${buildType}-${platform}/realm-tests.app", 'io.realm.core.CoreTests', '$WORKSPACE/')
+                        def resultFile = "${WORKSPACE}/core-test-report.xml"
+                        withEnv(env + ["SIMCTL_CHILD_UNITTEST_XML=${resultFile}", "SIMCTL_CHILD_UNITTEST_SUITE_NAME=iOS-${buildType}-Core"]) {
+                            sh "$WORKSPACE/tools/run-in-simulator.sh 'test/${buildType}-${platform}/realm-tests.app' 'io.realm.CoreTests' '${resultFile}'"
                         }
-                        sh '''
-                            mkdir -p $WORKSPACE/build-dir/test
-                            cp $WORKSPACE/unit-test-report.xml $WORKSPACE/build-dir/test
-                        '''
+                        // Sync tests currently don't work on iOS because they require an unimplemented server feature
+                        // resultFile = "${WORKSPACE}/sync-test-report.xml"
+                        // withEnv(env + ["SIMCTL_CHILD_UNITTEST_XML=${resultFile}", "SIMCTL_CHILD_UNITTEST_SUITE_NAME=iOS-${buildType}-Sync"]) {
+                        //     sh "$WORKSPACE/tools/run-in-simulator.sh 'test/${buildType}-${platform}/realm-sync-tests.app' 'io.realm.SyncTests' '${resultFile}'"
+                        // }
+                        resultFile = "${WORKSPACE}/object-store-test-report.xml"
+                        withEnv(env + ["SIMCTL_CHILD_UNITTEST_XML=${resultFile}", "SIMCTL_CHILD_UNITTEST_SUITE_NAME=iOS-${buildType}-Object-Store"]) {
+                            sh "$WORKSPACE/tools/run-in-simulator.sh 'test/object-store/${buildType}-${platform}/realm-object-store-tests.app' 'io.realm.ObjectStoreTests' '${resultFile}'"
+                        }
                     }
                 }
             }
-            if (test) recordTests("${platform}_${buildType}")
+
+            if (test) {
+                junit testResults: 'core-test-report.xml'
+                // junit testResults: 'sync-test-report.xml'
+                junit testResults: 'object-store-test-report.xml'
+            }
 
             String tarball = "realm-${buildType}-${gitDescribeVersion}-${platform}-devel.tar.gz";
             archiveArtifacts tarball
@@ -858,20 +850,9 @@ def doBuildCoverage() {
   }
 }
 
-/**
- *  Wraps the test recorder by adding a tag which will make the test distinguishible
- */
-def recordTests(tag, String reportName = "unit-test-report.xml") {
-    def tests = readFile("build-dir/test/${reportName}")
-    def modifiedTests = tests.replaceAll('realm-core-tests', tag)
-    writeFile file: 'build-dir/test/modified-test-report.xml', text: modifiedTests
-    junit testResults: 'build-dir/test/modified-test-report.xml'
-}
-
 def environment() {
     return [
         "UNITTEST_SHUFFLE=1",
-        "UNITTEST_XML=1",
         "UNITTEST_PROGRESS=1"
     ]
 }

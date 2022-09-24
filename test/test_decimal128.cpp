@@ -21,7 +21,6 @@
 
 #include "test.hpp"
 
-
 using namespace realm;
 
 TEST(Decimal_Basics)
@@ -99,6 +98,35 @@ TEST(Decimal_Basics)
     Decimal128 d10(10);
     CHECK(d10 < d2);
     CHECK(d10 >= d);
+
+    Decimal128 decimal = Decimal128("+6422018348623853211009174311926606E-32");
+    decimal.unpack(bid, exp, sign);
+    CHECK_EQUAL(exp, -32);
+    Decimal128 decimal2(bid, exp, sign);
+    CHECK_EQUAL(decimal, decimal2);
+
+    decimal = Decimal128("9999999999999999999999999999999999E6111");
+    decimal.unpack(bid, exp, sign);
+    CHECK_EQUAL(exp, 6111);
+    Decimal128 decimal3(bid, exp, sign);
+    CHECK_EQUAL(decimal, decimal3);
+}
+
+TEST(Decimal_Int64_Conversions)
+{
+    auto check_roundtrip = [=](int64_t v) {
+        int64_t v2 = 0;
+        CHECK(Decimal128(v).to_int(v2));
+        CHECK_EQUAL(v, v2);
+    };
+
+    check_roundtrip(std::numeric_limits<int64_t>::lowest());
+    check_roundtrip(std::numeric_limits<int64_t>::lowest() + 1);
+    check_roundtrip(-1);
+    check_roundtrip(0);
+    check_roundtrip(1);
+    check_roundtrip(std::numeric_limits<int64_t>::max() - 1);
+    check_roundtrip(std::numeric_limits<int64_t>::max());
 }
 
 TEST(Decimal_Arithmetics)
@@ -267,26 +295,26 @@ TEST(Decimal_Query)
             }
         }
         size_t actual;
-        CHECK_EQUAL(table->where().equal(col_int, 3).sum_decimal128(col), sum);
-        CHECK_EQUAL(table->where().equal(col_int, 3).average_decimal128(col, &actual), sum / cnt);
+        CHECK_EQUAL(table->where().equal(col_int, 3).sum(col)->get_decimal(), sum);
+        CHECK_EQUAL(table->where().equal(col_int, 3).avg(col, &actual)->get_decimal(), sum / cnt);
         CHECK_EQUAL(actual, cnt);
-        CHECK_EQUAL(table->where().equal(col_int, 3).maximum_decimal128(col), max);
-        CHECK_EQUAL(table->where().equal(col_int, 3).minimum_decimal128(col), min);
-        CHECK_EQUAL(table->where().equal(col_str, "Nice").sum_decimal128(col), Decimal128(285));
-        CHECK_EQUAL(table->where().equal(col_str, "Nice").average_decimal128(col), Decimal128(57));
-        CHECK_EQUAL(table->where().equal(col_str, "Nice").maximum_decimal128(col), Decimal128(95));
-        CHECK_EQUAL(table->where().equal(col_str, "Nice").minimum_decimal128(col), Decimal128(19));
-        CHECK_EQUAL(table->where().average_decimal128(col), Decimal128(50));
+        CHECK_EQUAL(table->where().equal(col_int, 3).max(col)->get_decimal(), max);
+        CHECK_EQUAL(table->where().equal(col_int, 3).min(col)->get_decimal(), min);
+        CHECK_EQUAL(table->where().equal(col_str, "Nice").sum(col)->get_decimal(), Decimal128(285));
+        CHECK_EQUAL(table->where().equal(col_str, "Nice").avg(col)->get_decimal(), Decimal128(57));
+        CHECK_EQUAL(table->where().equal(col_str, "Nice").max(col)->get_decimal(), Decimal128(95));
+        CHECK_EQUAL(table->where().equal(col_str, "Nice").min(col)->get_decimal(), Decimal128(19));
+        CHECK_EQUAL(table->where().avg(col)->get_decimal(), Decimal128(50));
 
         table = rt->get_table("Bar");
         col = table->get_column_key("dummy");
-        CHECK_EQUAL(table->where().average_decimal128(col, &actual), Decimal128(0));
+        CHECK(table->where().avg(col, &actual)->is_null());
         CHECK_EQUAL(actual, 0);
-        CHECK_EQUAL(table->where().sum_decimal128(col), Decimal128(0));
+        CHECK_EQUAL(table->where().sum(col)->get_decimal(), Decimal128(0));
         ObjKey k;
-        CHECK_EQUAL(table->where().maximum_decimal128(col, &k), Decimal128(0));
+        CHECK(table->where().max(col, &k)->is_null());
         CHECK_NOT(k);
-        CHECK_EQUAL(table->where().minimum_decimal128(col, &k), Decimal128(0));
+        CHECK(table->where().min(col, &k)->is_null());
         CHECK_NOT(k);
     }
 }
@@ -301,7 +329,7 @@ TEST(Decimal_Distinct)
         auto table = wt->add_table("Foo");
         auto col_dec = table->add_column(type_Decimal, "price", true);
         for (int i = 1; i < 100; i++) {
-            auto obj = table->create_object().set(col_dec, Decimal128(i % 10));
+            table->create_object().set(col_dec, Decimal128(i % 10));
         }
 
         wt->commit();
@@ -348,9 +376,9 @@ TEST(Decimal_Aggregates)
         auto col = table->get_column_key("price");
         CHECK_EQUAL(table->count_decimal(col, Decimal128(51)), 1);
         CHECK_EQUAL(table->count_decimal(col, Decimal128(31)), 2);
-        CHECK_EQUAL(table->sum_decimal(col), Decimal128(sum));
-        CHECK_EQUAL(table->average_decimal(col), Decimal128(sum) / count);
-        CHECK_EQUAL(table->maximum_decimal(col), Decimal128(59));
-        CHECK_EQUAL(table->minimum_decimal(col), Decimal128(1));
+        CHECK_EQUAL(table->sum(col)->get_decimal(), Decimal128(sum));
+        CHECK_EQUAL(table->avg(col)->get_decimal(), Decimal128(sum) / count);
+        CHECK_EQUAL(table->max(col)->get_decimal(), Decimal128(59));
+        CHECK_EQUAL(table->min(col)->get_decimal(), Decimal128(1));
     }
 }

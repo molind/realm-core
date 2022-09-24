@@ -15,6 +15,7 @@
 #include <realm.hpp>
 #include <realm/chunked_binary.hpp>
 #include <realm/data_type.hpp>
+#include <realm/history.hpp>
 #include <realm/impl/simulated_failure.hpp>
 #include <realm/list.hpp>
 #include <realm/sync/changeset.hpp>
@@ -206,6 +207,30 @@ TEST(Sync_AsyncWaitForUploadCompletion)
         wt.add_table("class_bar");
     });
     wait();
+}
+
+
+TEST(Sync_AsyncWaitForUploadCompletionNoPendingLocalChanges)
+{
+    TEST_DIR(dir);
+    TEST_CLIENT_DB(db);
+    ClientServerFixture fixture(dir, test_context);
+    fixture.start();
+
+    Session session = fixture.make_bound_session(db, "/test");
+
+    write_transaction_notifying_session(db, session, [](WriteTransaction& wt) {
+        wt.add_table("class_foo");
+    });
+
+    auto pf = util::make_promise_future<bool>();
+    session.async_wait_for_upload_completion(
+        [promise = std::move(pf.promise), tr = db->start_read()](std::error_code ec) mutable {
+            REALM_ASSERT(!ec);
+            tr->advance_read();
+            promise.emplace_value(tr->get_history()->no_pending_local_changes(tr->get_version()));
+        });
+    CHECK(pf.future.get());
 }
 
 
@@ -750,312 +775,162 @@ TEST(Sync_Merge)
     CHECK_EQUAL(4, table->size());
 }
 
+struct ExpectChangesetError {
+    unit_test::TestContext& test_context;
+    MultiClientServerFixture& fixture;
+    std::string expected_error;
 
-TEST(Sync_DetectSchemaMismatch_ColumnType)
+    void operator()(ConnectionState state, util::Optional<Session::ErrorInfo> error_info) const noexcept
+    {
+        if (state != ConnectionState::disconnected)
+            return;
+        REALM_ASSERT(error_info);
+        std::error_code ec = error_info->error_code;
+        CHECK_EQUAL(ec, sync::Client::Error::bad_changeset);
+        CHECK(ec.category() == client_error_category());
+        CHECK(error_info->is_fatal());
+        CHECK_EQUAL(error_info->message,
+                    "Bad changeset (DOWNLOAD): Failed to transform received changeset: Schema mismatch: " +
+                        expected_error);
+        fixture.stop();
+    }
+};
+
+void test_schema_mismatch(unit_test::TestContext& test_context, util::FunctionRef<void(WriteTransaction&)> fn_1,
+                          util::FunctionRef<void(WriteTransaction&)> fn_2, const char* expected_error_1,
+                          const char* expected_error_2 = nullptr)
 {
     TEST_CLIENT_DB(db_1);
     TEST_CLIENT_DB(db_2);
 
-    {
-        TEST_DIR(dir);
-        MultiClientServerFixture fixture(2, 1, dir, test_context);
-        fixture.allow_server_errors(0, 1);
-        fixture.start();
+    TEST_DIR(dir);
+    MultiClientServerFixture fixture(2, 1, dir, test_context);
+    fixture.allow_server_errors(0, 1);
+    fixture.start();
 
-        using ErrorInfo = Session::ErrorInfo;
-        auto listener = [&](ConnectionState state, util::Optional<ErrorInfo> error_info) {
-            if (state != ConnectionState::disconnected)
-                return;
-            REALM_ASSERT(error_info);
-            std::error_code ec = error_info->error_code;
-            bool is_fatal = error_info->is_fatal();
-            CHECK(ec == sync::Client::Error::bad_changeset || ec == sync::ProtocolError::invalid_schema_change);
-            CHECK(is_fatal);
-            // FIXME: Check that the message in the log is user-friendly.
-            fixture.stop();
-        };
+    Session session_1 = fixture.make_session(0, db_1);
+    Session session_2 = fixture.make_session(1, db_2);
 
-        Session session_1 = fixture.make_session(0, db_1);
-        Session session_2 = fixture.make_session(1, db_2);
+    if (!expected_error_2)
+        expected_error_2 = expected_error_1;
 
-        session_1.set_connection_state_change_listener(listener);
-        session_2.set_connection_state_change_listener(listener);
+    session_1.set_connection_state_change_listener(ExpectChangesetError{test_context, fixture, expected_error_1});
+    session_2.set_connection_state_change_listener(ExpectChangesetError{test_context, fixture, expected_error_2});
 
-        fixture.bind_session(session_1, 0, "/test");
-        fixture.bind_session(session_2, 0, "/test");
+    fixture.bind_session(session_1, 0, "/test");
+    fixture.bind_session(session_2, 0, "/test");
 
-        write_transaction_notifying_session(db_1, session_1, [](WriteTransaction& wt) {
+    write_transaction_notifying_session(db_1, session_1, fn_1);
+    write_transaction_notifying_session(db_2, session_2, fn_2);
+
+    session_1.wait_for_upload_complete_or_client_stopped();
+    session_2.wait_for_upload_complete_or_client_stopped();
+    session_1.wait_for_download_complete_or_client_stopped();
+    session_2.wait_for_download_complete_or_client_stopped();
+}
+
+
+TEST(Sync_DetectSchemaMismatch_ColumnType)
+{
+    test_schema_mismatch(
+        test_context,
+        [](WriteTransaction& wt) {
             TableRef table = wt.add_table("class_foo");
             ColKey col_ndx = table->add_column(type_Int, "column");
             table->create_object().set<int64_t>(col_ndx, 123);
-        });
-
-        write_transaction_notifying_session(db_2, session_2, [](WriteTransaction& wt) {
+        },
+        [](WriteTransaction& wt) {
             TableRef table = wt.add_table("class_foo");
             ColKey col_ndx = table->add_column(type_String, "column");
             table->create_object().set(col_ndx, "Hello, World!");
-        });
-        session_1.wait_for_upload_complete_or_client_stopped();
-        session_2.wait_for_upload_complete_or_client_stopped();
-        session_1.wait_for_download_complete_or_client_stopped();
-        session_2.wait_for_download_complete_or_client_stopped();
-    }
+        },
+        "Property 'column' in class 'foo' is of type Int on one side and type String on the other.",
+        "Property 'column' in class 'foo' is of type String on one side and type Int on the other.");
 }
 
 
 TEST(Sync_DetectSchemaMismatch_Nullability)
 {
-    TEST_CLIENT_DB(db_1);
-    TEST_CLIENT_DB(db_2);
-
-    {
-        TEST_DIR(dir);
-        MultiClientServerFixture fixture(2, 1, dir, test_context);
-        fixture.allow_server_errors(0, 1);
-        fixture.start();
-
-        using ErrorInfo = Session::ErrorInfo;
-        auto listener = [&](ConnectionState state, util::Optional<ErrorInfo> error_info) {
-            if (state != ConnectionState::disconnected)
-                return;
-            REALM_ASSERT(error_info);
-            std::error_code ec = error_info->error_code;
-            bool is_fatal = error_info->is_fatal();
-            CHECK(ec == sync::Client::Error::bad_changeset || ec == sync::ProtocolError::invalid_schema_change);
-            CHECK(is_fatal);
-            // FIXME: Check that the message in the log is user-friendly.
-            fixture.stop();
-        };
-
-        Session session_1 = fixture.make_session(0, db_1);
-        Session session_2 = fixture.make_session(1, db_2);
-
-        session_1.set_connection_state_change_listener(listener);
-        session_2.set_connection_state_change_listener(listener);
-
-        fixture.bind_session(session_1, 0, "/test");
-        fixture.bind_session(session_2, 0, "/test");
-
-        write_transaction_notifying_session(db_1, session_1, [](WriteTransaction& wt) {
+    test_schema_mismatch(
+        test_context,
+        [](WriteTransaction& wt) {
             TableRef table = wt.add_table("class_foo");
             bool nullable = false;
             ColKey col_ndx = table->add_column(type_Int, "column", nullable);
             table->create_object().set<int64_t>(col_ndx, 123);
-        });
-
-        write_transaction_notifying_session(db_2, session_2, [](WriteTransaction& wt) {
+        },
+        [](WriteTransaction& wt) {
             TableRef table = wt.add_table("class_foo");
             bool nullable = true;
             ColKey col_ndx = table->add_column(type_Int, "column", nullable);
             table->create_object().set<int64_t>(col_ndx, 123);
-        });
-        session_1.wait_for_upload_complete_or_client_stopped();
-        session_2.wait_for_upload_complete_or_client_stopped();
-        session_1.wait_for_download_complete_or_client_stopped();
-        session_2.wait_for_download_complete_or_client_stopped();
-    }
+        },
+        "Property 'column' in class 'foo' is nullable on one side and not on the other.");
 }
 
 
 TEST(Sync_DetectSchemaMismatch_Links)
 {
-    TEST_CLIENT_DB(db_1);
-    TEST_CLIENT_DB(db_2);
-
-    {
-        TEST_DIR(dir);
-        MultiClientServerFixture fixture(2, 1, dir, test_context);
-        fixture.allow_server_errors(0, 1);
-        fixture.start();
-
-        using ErrorInfo = Session::ErrorInfo;
-        auto listener = [&](ConnectionState state, util::Optional<ErrorInfo> error_info) {
-            if (state != ConnectionState::disconnected)
-                return;
-            REALM_ASSERT(error_info);
-            std::error_code ec = error_info->error_code;
-            bool is_fatal = error_info->is_fatal();
-            CHECK(ec == sync::Client::Error::bad_changeset || ec == sync::ProtocolError::invalid_schema_change);
-            CHECK(is_fatal);
-            // FIXME: Check that the message in the log is user-friendly.
-            fixture.stop();
-        };
-
-        Session session_1 = fixture.make_session(0, db_1);
-        Session session_2 = fixture.make_session(1, db_2);
-
-        session_1.set_connection_state_change_listener(listener);
-        session_2.set_connection_state_change_listener(listener);
-
-        fixture.bind_session(session_1, 0, "/test");
-        fixture.bind_session(session_2, 0, "/test");
-
-        write_transaction_notifying_session(db_1, session_1, [](WriteTransaction& wt) {
+    test_schema_mismatch(
+        test_context,
+        [](WriteTransaction& wt) {
             TableRef table = wt.add_table("class_foo");
             TableRef target = wt.add_table("class_bar");
             table->add_column(*target, "column");
-        });
-
-        write_transaction_notifying_session(db_2, session_2, [](WriteTransaction& wt) {
+        },
+        [](WriteTransaction& wt) {
             TableRef table = wt.add_table("class_foo");
             TableRef target = wt.add_table("class_baz");
             table->add_column(*target, "column");
-        });
-        session_1.wait_for_upload_complete_or_client_stopped();
-        session_2.wait_for_upload_complete_or_client_stopped();
-        session_1.wait_for_download_complete_or_client_stopped();
-        session_2.wait_for_download_complete_or_client_stopped();
-    }
+        },
+        "Link property 'column' in class 'foo' points to class 'bar' on one side and to 'baz' on the other.",
+        "Link property 'column' in class 'foo' points to class 'baz' on one side and to 'bar' on the other.");
 }
 
 
 TEST(Sync_DetectSchemaMismatch_PrimaryKeys_Name)
 {
-    TEST_CLIENT_DB(db_1);
-    TEST_CLIENT_DB(db_2);
-
-    {
-        TEST_DIR(dir);
-        MultiClientServerFixture fixture(2, 1, dir, test_context);
-        fixture.allow_server_errors(0, 1);
-        fixture.start();
-
-        using ErrorInfo = Session::ErrorInfo;
-        auto listener = [&](ConnectionState state, util::Optional<ErrorInfo> error_info) {
-            if (state != ConnectionState::disconnected)
-                return;
-            REALM_ASSERT(error_info);
-            std::error_code ec = error_info->error_code;
-            bool is_fatal = error_info->is_fatal();
-            CHECK(ec == sync::Client::Error::bad_changeset || ec == sync::ProtocolError::invalid_schema_change);
-            CHECK(is_fatal);
-            // FIXME: Check that the message in the log is user-friendly.
-            fixture.stop();
-        };
-
-        Session session_1 = fixture.make_session(0, db_1);
-        Session session_2 = fixture.make_session(1, db_2);
-
-        session_1.set_connection_state_change_listener(listener);
-        session_2.set_connection_state_change_listener(listener);
-
-        fixture.bind_session(session_1, 0, "/test");
-        fixture.bind_session(session_2, 0, "/test");
-
-        write_transaction_notifying_session(db_1, session_1, [](WriteTransaction& wt) {
+    test_schema_mismatch(
+        test_context,
+        [](WriteTransaction& wt) {
             wt.get_group().add_table_with_primary_key("class_foo", type_Int, "a");
-        });
-
-        write_transaction_notifying_session(db_2, session_2, [](WriteTransaction& wt) {
+        },
+        [](WriteTransaction& wt) {
             wt.get_group().add_table_with_primary_key("class_foo", type_Int, "b");
-        });
-        session_1.wait_for_upload_complete_or_client_stopped();
-        session_2.wait_for_upload_complete_or_client_stopped();
-        session_1.wait_for_download_complete_or_client_stopped();
-        session_2.wait_for_download_complete_or_client_stopped();
-    }
+        },
+        "'foo' has primary key 'a' on one side, but primary key 'b' on the other.",
+        "'foo' has primary key 'b' on one side, but primary key 'a' on the other.");
 }
 
 
 TEST(Sync_DetectSchemaMismatch_PrimaryKeys_Type)
 {
-    TEST_CLIENT_DB(db_1);
-    TEST_CLIENT_DB(db_2);
-
-    {
-        TEST_DIR(dir);
-        MultiClientServerFixture fixture(2, 1, dir, test_context);
-        fixture.allow_server_errors(0, 1);
-        fixture.start();
-
-        using ErrorInfo = Session::ErrorInfo;
-        auto listener = [&](ConnectionState state, util::Optional<ErrorInfo> error_info) {
-            if (state != ConnectionState::disconnected)
-                return;
-            REALM_ASSERT(error_info);
-            std::error_code ec = error_info->error_code;
-            bool is_fatal = error_info->is_fatal();
-            CHECK(ec == sync::Client::Error::bad_changeset || ec == sync::ProtocolError::invalid_schema_change);
-            CHECK(is_fatal);
-            // FIXME: Check that the message in the log is user-friendly.
-            fixture.stop();
-        };
-
-        Session session_1 = fixture.make_session(0, db_1);
-        Session session_2 = fixture.make_session(1, db_2);
-
-        session_1.set_connection_state_change_listener(listener);
-        session_2.set_connection_state_change_listener(listener);
-
-        fixture.bind_session(session_1, 0, "/test");
-        fixture.bind_session(session_2, 0, "/test");
-
-        write_transaction_notifying_session(db_1, session_1, [](WriteTransaction& wt) {
+    test_schema_mismatch(
+        test_context,
+        [](WriteTransaction& wt) {
             wt.get_group().add_table_with_primary_key("class_foo", type_Int, "a");
-        });
-
-        write_transaction_notifying_session(db_2, session_2, [](WriteTransaction& wt) {
+        },
+        [](WriteTransaction& wt) {
             wt.get_group().add_table_with_primary_key("class_foo", type_String, "a");
-        });
-        session_1.wait_for_upload_complete_or_client_stopped();
-        session_2.wait_for_upload_complete_or_client_stopped();
-        session_1.wait_for_download_complete_or_client_stopped();
-        session_2.wait_for_download_complete_or_client_stopped();
-    }
+        },
+        "'foo' has primary key 'a', which is of type Int on one side and type String on the other.",
+        "'foo' has primary key 'a', which is of type String on one side and type Int on the other.");
 }
 
 
 TEST(Sync_DetectSchemaMismatch_PrimaryKeys_Nullability)
 {
-    TEST_CLIENT_DB(db_1);
-    TEST_CLIENT_DB(db_2);
-
-    {
-        TEST_DIR(dir);
-        MultiClientServerFixture fixture(2, 1, dir, test_context);
-        fixture.allow_server_errors(0, 1);
-        fixture.start();
-
-        bool error_did_occur = false;
-
-        using ErrorInfo = Session::ErrorInfo;
-        auto listener = [&](ConnectionState state, util::Optional<ErrorInfo> error_info) {
-            if (state != ConnectionState::disconnected)
-                return;
-            REALM_ASSERT(error_info);
-            std::error_code ec = error_info->error_code;
-            bool is_fatal = error_info->is_fatal();
-            CHECK(ec == sync::Client::Error::bad_changeset || ec == sync::ProtocolError::invalid_schema_change);
-            CHECK(is_fatal);
-            // FIXME: Check that the message in the log is user-friendly.
-            error_did_occur = true;
-            fixture.stop();
-        };
-
-        Session session_1 = fixture.make_session(0, db_1);
-        Session session_2 = fixture.make_session(1, db_2);
-
-        session_1.set_connection_state_change_listener(listener);
-        session_2.set_connection_state_change_listener(listener);
-
-        fixture.bind_session(session_1, 0, "/test");
-        fixture.bind_session(session_2, 0, "/test");
-
-        write_transaction_notifying_session(db_1, session_1, [](WriteTransaction& wt) {
+    test_schema_mismatch(
+        test_context,
+        [](WriteTransaction& wt) {
             bool nullable = false;
             wt.get_group().add_table_with_primary_key("class_foo", type_Int, "a", nullable);
-        });
-
-        write_transaction_notifying_session(db_2, session_2, [](WriteTransaction& wt) {
+        },
+        [](WriteTransaction& wt) {
             bool nullable = true;
             wt.get_group().add_table_with_primary_key("class_foo", type_Int, "a", nullable);
-        });
-        session_1.wait_for_upload_complete_or_client_stopped();
-        session_2.wait_for_upload_complete_or_client_stopped();
-        session_1.wait_for_download_complete_or_client_stopped();
-        session_2.wait_for_download_complete_or_client_stopped();
-        CHECK(error_did_occur);
-    }
+        },
+        "'foo' has primary key 'a', which is nullable on one side, but not the other.");
 }
 
 
@@ -1801,7 +1676,7 @@ TEST(Sync_HTTP404NotFound)
     server_config.listen_port = "";
     server_config.tcp_no_delay = true;
 
-    util::Optional<PKey> public_key = PKey::load_public(g_test_server_key_path);
+    util::Optional<PKey> public_key = PKey::load_public(test_server_key_path());
     Server server(server_dir, std::move(public_key), server_config);
     server.start();
     util::network::Endpoint endpoint = server.listen_endpoint();
@@ -1907,7 +1782,7 @@ TEST(Sync_HTTP_ContentLength)
     server_config.listen_port = "";
     server_config.tcp_no_delay = true;
 
-    util::Optional<PKey> public_key = PKey::load_public(g_test_server_key_path);
+    util::Optional<PKey> public_key = PKey::load_public(test_server_key_path());
     Server server(server_dir, std::move(public_key), server_config);
     server.start();
     util::network::Endpoint endpoint = server.listen_endpoint();
@@ -2818,19 +2693,19 @@ TEST(Sync_SSL_Certificate_1)
 {
     TEST_DIR(server_dir);
     TEST_CLIENT_DB(db);
-    std::string ca_dir = get_test_resource_path() + "../certificate-authority";
+    std::string ca_dir = get_test_resource_path();
 
     ClientServerFixture::Config config;
     config.enable_server_ssl = true;
-    config.server_ssl_certificate_path = ca_dir + "/certs/localhost-chain.crt.pem";
-    config.server_ssl_certificate_key_path = ca_dir + "/certs/localhost-server.key.pem";
+    config.server_ssl_certificate_path = ca_dir + "localhost-chain.crt.pem";
+    config.server_ssl_certificate_key_path = ca_dir + "localhost-server.key.pem";
 
     ClientServerFixture fixture{server_dir, test_context, std::move(config)};
 
     Session::Config session_config;
     session_config.protocol_envelope = ProtocolEnvelope::realms;
     session_config.verify_servers_ssl_certificate = true;
-    session_config.ssl_trust_certificate_path = ca_dir + "/root-ca/crt.pem";
+    session_config.ssl_trust_certificate_path = ca_dir + "crt.pem";
 
     Session session = fixture.make_session(db, std::move(session_config));
     fixture.bind_session(session, "/test", g_signed_test_user_token, ProtocolEnvelope::realms);
@@ -2848,19 +2723,19 @@ TEST(Sync_SSL_Certificate_2)
     bool did_fail = false;
     TEST_DIR(server_dir);
     TEST_CLIENT_DB(db);
-    std::string ca_dir = get_test_resource_path() + "../certificate-authority";
+    std::string ca_dir = get_test_resource_path();
 
     ClientServerFixture::Config config;
     config.enable_server_ssl = true;
-    config.server_ssl_certificate_path = ca_dir + "/certs/localhost-chain.crt.pem";
-    config.server_ssl_certificate_key_path = ca_dir + "/certs/localhost-server.key.pem";
+    config.server_ssl_certificate_path = ca_dir + "localhost-chain.crt.pem";
+    config.server_ssl_certificate_key_path = ca_dir + "localhost-server.key.pem";
 
     ClientServerFixture fixture{server_dir, test_context, std::move(config)};
 
     Session::Config session_config;
     session_config.protocol_envelope = ProtocolEnvelope::realms;
     session_config.verify_servers_ssl_certificate = true;
-    session_config.ssl_trust_certificate_path = ca_dir + "/certs/dns-chain.crt.pem";
+    session_config.ssl_trust_certificate_path = ca_dir + "dns-chain.crt.pem";
 
     auto error_handler = [&](std::error_code ec, bool, const std::string&) {
         CHECK_EQUAL(ec, Client::Error::ssl_server_cert_rejected);
@@ -2886,19 +2761,19 @@ TEST(Sync_SSL_Certificate_3)
 {
     TEST_DIR(server_dir);
     TEST_CLIENT_DB(db);
-    std::string ca_dir = get_test_resource_path() + "../certificate-authority";
+    std::string ca_dir = get_test_resource_path();
 
     ClientServerFixture::Config config;
     config.enable_server_ssl = true;
-    config.server_ssl_certificate_path = ca_dir + "/certs/localhost-chain.crt.pem";
-    config.server_ssl_certificate_key_path = ca_dir + "/certs/localhost-server.key.pem";
+    config.server_ssl_certificate_path = ca_dir + "localhost-chain.crt.pem";
+    config.server_ssl_certificate_key_path = ca_dir + "localhost-server.key.pem";
 
     ClientServerFixture fixture{server_dir, test_context, std::move(config)};
 
     Session::Config session_config;
     session_config.protocol_envelope = ProtocolEnvelope::realms;
     session_config.verify_servers_ssl_certificate = false;
-    session_config.ssl_trust_certificate_path = ca_dir + "/certs/dns-chain.crt.pem";
+    session_config.ssl_trust_certificate_path = ca_dir + "dns-chain.crt.pem";
 
     Session session = fixture.make_bound_session(db, "/test", g_signed_test_user_token, std::move(session_config));
     fixture.start();
@@ -2913,19 +2788,19 @@ TEST(Sync_SSL_Certificate_DER)
 {
     TEST_DIR(server_dir);
     TEST_CLIENT_DB(db);
-    std::string ca_dir = get_test_resource_path() + "../certificate-authority";
+    std::string ca_dir = get_test_resource_path();
 
     ClientServerFixture::Config config;
     config.enable_server_ssl = true;
-    config.server_ssl_certificate_path = ca_dir + "/certs/localhost-chain.crt.pem";
-    config.server_ssl_certificate_key_path = ca_dir + "/certs/localhost-server.key.pem";
+    config.server_ssl_certificate_path = ca_dir + "localhost-chain.crt.pem";
+    config.server_ssl_certificate_key_path = ca_dir + "localhost-server.key.pem";
 
     ClientServerFixture fixture{server_dir, test_context, std::move(config)};
 
     Session::Config session_config;
     session_config.protocol_envelope = ProtocolEnvelope::realms;
     session_config.verify_servers_ssl_certificate = true;
-    session_config.ssl_trust_certificate_path = ca_dir + "/certs/localhost-chain.crt.cer";
+    session_config.ssl_trust_certificate_path = ca_dir + "localhost-chain.crt.cer";
 
     Session session = fixture.make_session(db, std::move(session_config));
     fixture.bind_session(session, "/test", g_signed_test_user_token, ProtocolEnvelope::realms);
@@ -2945,7 +2820,7 @@ TEST(Sync_SSL_Certificate_Verify_Callback_1)
 {
     TEST_DIR(server_dir);
     TEST_CLIENT_DB(db);
-    std::string ca_dir = get_test_resource_path() + "../certificate-authority";
+    std::string ca_dir = get_test_resource_path();
 
     Session::port_type server_port_ssl;
     auto ssl_verify_callback = [&](const std::string server_address, Session::port_type server_port, const char*,
@@ -2957,8 +2832,8 @@ TEST(Sync_SSL_Certificate_Verify_Callback_1)
 
     ClientServerFixture::Config config;
     config.enable_server_ssl = true;
-    config.server_ssl_certificate_path = ca_dir + "/certs/localhost-chain.crt.pem";
-    config.server_ssl_certificate_key_path = ca_dir + "/certs/localhost-server.key.pem";
+    config.server_ssl_certificate_path = ca_dir + "localhost-chain.crt.pem";
+    config.server_ssl_certificate_key_path = ca_dir + "localhost-server.key.pem";
 
     ClientServerFixture fixture{server_dir, test_context, config};
 
@@ -2985,7 +2860,7 @@ TEST(Sync_SSL_Certificate_Verify_Callback_2)
     bool did_fail = false;
     TEST_DIR(server_dir);
     TEST_CLIENT_DB(db);
-    std::string ca_dir = get_test_resource_path() + "../certificate-authority";
+    std::string ca_dir = get_test_resource_path();
 
     Session::port_type server_port_ssl;
     auto ssl_verify_callback = [&](const std::string server_address, Session::port_type server_port,
@@ -3007,8 +2882,8 @@ TEST(Sync_SSL_Certificate_Verify_Callback_2)
 
     ClientServerFixture::Config config;
     config.enable_server_ssl = true;
-    config.server_ssl_certificate_path = ca_dir + "/certs/localhost-chain.crt.pem";
-    config.server_ssl_certificate_key_path = ca_dir + "/certs/localhost-server.key.pem";
+    config.server_ssl_certificate_path = ca_dir + "localhost-chain.crt.pem";
+    config.server_ssl_certificate_key_path = ca_dir + "localhost-server.key.pem";
 
     ClientServerFixture fixture{server_dir, test_context, config};
 
@@ -3040,7 +2915,7 @@ TEST(Sync_SSL_Certificate_Verify_Callback_3)
 {
     TEST_DIR(server_dir);
     TEST_CLIENT_DB(db);
-    std::string ca_dir = get_test_resource_path() + "../certificate-authority";
+    std::string ca_dir = get_test_resource_path();
 
     Session::port_type server_port_ssl = 0;
     auto ssl_verify_callback = [&](const std::string server_address, Session::port_type server_port,
@@ -3066,8 +2941,8 @@ TEST(Sync_SSL_Certificate_Verify_Callback_3)
 
     ClientServerFixture::Config config;
     config.enable_server_ssl = true;
-    config.server_ssl_certificate_path = ca_dir + "/certs/localhost-chain.crt.pem";
-    config.server_ssl_certificate_key_path = ca_dir + "/certs/localhost-server.key.pem";
+    config.server_ssl_certificate_path = ca_dir + "localhost-chain.crt.pem";
+    config.server_ssl_certificate_key_path = ca_dir + "localhost-server.key.pem";
 
     ClientServerFixture fixture{server_dir, test_context, config};
 
@@ -3513,7 +3388,7 @@ TEST(Sync_UploadDownloadProgress_3)
     server_config.listen_port = "";
     server_config.tcp_no_delay = true;
 
-    util::Optional<PKey> public_key = PKey::load_public(g_test_server_key_path);
+    util::Optional<PKey> public_key = PKey::load_public(test_server_key_path());
     Server server(server_dir, std::move(public_key), server_config);
     server.start();
     auto server_port = server.listen_endpoint().port();
@@ -3822,7 +3697,7 @@ TEST(Sync_UploadDownloadProgress_6)
     server_config.listen_port = "";
     server_config.tcp_no_delay = true;
 
-    util::Optional<PKey> public_key = PKey::load_public(g_test_server_key_path);
+    util::Optional<PKey> public_key = PKey::load_public(test_server_key_path());
     Server server(server_dir, std::move(public_key), server_config);
     server.start();
 
@@ -4798,43 +4673,6 @@ TEST(Sync_ReadOnlyClientSideHistoryTrim)
     CHECK_LESS(util::File{db_1_path}.get_size(), 0x400000);
 }
 
-#if 0 // FIXME: enable when history and file format upgrade is implemented
-TEST(Sync_DownloadLogCompactionClassUnderScorePrefix)
-{
-    TEST_DIR(server_dir);
-    TEST_CLIENT_DB(db);
-
-    std::string virtual_path = "/test";
-    std::string origin_server_path =
-        util::File::resolve("admin_realm_issue_1794.realm", "resources");
-    std::string target_server_path;
-    {
-        ClientServerFixture fixture{server_dir, test_context};
-        target_server_path = fixture.map_virtual_to_real_path(virtual_path);
-        fixture.start();
-    }
-    util::File::copy(origin_server_path, target_server_path);
-
-    // Synchronize a client with the migrated server file
-    {
-        ClientServerFixture fixture{server_dir, test_context};
-        fixture.start();
-        Session session = fixture.make_bound_session(client_path, virtual_path);
-        session.wait_for_download_complete_or_client_stopped();
-    }
-
-    {
-        // Verify the migrated server file
-        TestServerHistoryContext context;
-        _impl::ServerHistory::DummyCompactionControl compaction_control;
-        _impl::ServerHistory history{context, compaction_control};
-        SharedGroup db{history, target_server_path};
-        ReadTransaction rt{db};
-        rt.get_group().verify();
-    }
-}
-#endif
-
 // This test creates two objects in a target table and a link list
 // in a source table. The first target object is inserted in the link list,
 // and later the link is set to the second target object.
@@ -5035,8 +4873,7 @@ TEST(Sync_VerifyServerHistoryAfterLargeUpload)
     {
         std::string server_path = fixture.map_virtual_to_real_path("/test");
         TestServerHistoryContext context;
-        _impl::ServerHistory::DummyCompactionControl compaction_control;
-        _impl::ServerHistory history{context, compaction_control};
+        _impl::ServerHistory history{context};
         DBRef db = DB::create(history, server_path);
         {
             ReadTransaction rt{db};
@@ -5062,8 +4899,7 @@ TEST(Sync_ServerSideModify_Randomize)
 
     std::string server_path = fixture.map_virtual_to_real_path("/test");
     TestServerHistoryContext context;
-    _impl::ServerHistory::DummyCompactionControl compaction_control;
-    _impl::ServerHistory history_1{context, compaction_control};
+    _impl::ServerHistory history_1{context};
     DBRef db_1 = DB::create(history_1, server_path);
 
     auto server_side_program = [num_server_side_transacts, &db_1, &fixture, &session] {
@@ -5537,8 +5373,7 @@ TEST_IF(Sync_Issue2104, false)
     integratable_changesets[client_file_ident].changesets.push_back(integratable_changeset);
 
     issue2104::ServerHistoryContext history_context;
-    _impl::ServerHistory::DummyCompactionControl compaction_control;
-    _impl::ServerHistory history{history_context, compaction_control};
+    _impl::ServerHistory history{history_context};
     DBRef db = DB::create(history, realm_path_copy);
 
     VersionInfo version_info;
@@ -5819,6 +5654,8 @@ TEST(Sync_ResumeAfterClientSideFailureToIntegrate)
     bool failed_twice = false;
     using ConnectionState = ConnectionState;
     using ErrorInfo = Session::ErrorInfo;
+    std::mutex mx;
+    std::condition_variable cv;
     auto listener = [&](ConnectionState state, util::Optional<ErrorInfo> error_info) {
         if (state != ConnectionState::disconnected)
             return;
@@ -5832,8 +5669,10 @@ TEST(Sync_ResumeAfterClientSideFailureToIntegrate)
             fixture.cancel_reconnect_delay();
         }
         else {
+            std::unique_lock<std::mutex> lk(mx);
             failed_twice = true;
             fixture.stop();
+            cv.notify_one();
         }
     };
     Session::Config config;
@@ -5841,8 +5680,12 @@ TEST(Sync_ResumeAfterClientSideFailureToIntegrate)
     Session session = fixture.make_session(db_2, std::move(config));
     session.set_connection_state_change_listener(listener);
     fixture.bind_session(session, "/test");
-    session.wait_for_download_complete_or_client_stopped();
-    CHECK(failed_twice);
+    using namespace std::chrono_literals;
+    std::unique_lock<std::mutex> lk(mx);
+    bool completed_within_time_limit = cv.wait_for(lk, 1s, [&] {
+        return failed_twice;
+    });
+    CHECK(completed_within_time_limit);
 }
 
 template <typename T>
@@ -5928,7 +5771,7 @@ NONCONCURRENT_TEST_TYPES(Sync_PrimaryKeyTypes, Int, String, ObjectId, UUID, util
         auto obj_1 = table_1->create_object_with_primary_key(sequence_next<underlying_type>());
         auto obj_2 = table_2->create_object_with_primary_key(sequence_next<underlying_type>());
         if constexpr (is_optional) {
-            auto obj_3 = table_2->create_object_with_primary_key(default_or_null);
+            table_2->create_object_with_primary_key(default_or_null);
         }
 
         auto list = obj_1.template get_list<TEST_TYPE>("oids");
@@ -6527,7 +6370,7 @@ TEST(Sync_BundledRealmFile)
 
     write_transaction_notifying_session(db, session, [](WriteTransaction& tr) {
         auto foos = tr.get_group().add_table_with_primary_key("class_Foo", type_Int, "id");
-        auto foo = foos->create_object_with_primary_key(123);
+        foos->create_object_with_primary_key(123);
     });
 
     // We cannot write out file if changes are not synced to server
@@ -6606,7 +6449,7 @@ TEST(Sync_UpgradeToClientHistory)
         auto col_link = baas->add_column(*foos, "link");
 
         auto foo = foos->create_object_with_primary_key("123").set(col_str, "Goodbye");
-        auto baa = baas->create_object_with_primary_key(888).set(col_link, foo.get_key());
+        baas->create_object_with_primary_key(888).set(col_link, foo.get_key());
 
         tr->commit();
     }
@@ -6625,7 +6468,7 @@ TEST(Sync_UpgradeToClientHistory)
 
     write_transaction_notifying_session(db_1, session_1, [](WriteTransaction& tr) {
         auto foos = tr.get_group().get_table("class_Foo");
-        auto foo = foos->create_object_with_primary_key("456");
+        foos->create_object_with_primary_key("456");
     });
     session_1.wait_for_upload_complete_or_client_stopped();
     session_2.wait_for_upload_complete_or_client_stopped();
@@ -6766,9 +6609,37 @@ TEST(Sync_NonIncreasingServerVersions)
     uint_fast64_t downloadable_bytes = 0;
     VersionInfo version_info;
     util::StderrLogger logger;
-    history.integrate_server_changesets(progress, &downloadable_bytes, server_changesets_encoded.data(),
-                                        server_changesets_encoded.size(), version_info,
-                                        DownloadBatchState::LastInBatch, logger, {});
+    history.integrate_server_changesets(progress, &downloadable_bytes, server_changesets_encoded, version_info,
+                                        DownloadBatchState::LastInBatch, logger);
+}
+
+TEST(Sync_InvalidChangesetFromServer)
+{
+    TEST_CLIENT_DB(db);
+
+    auto& history = get_history(db);
+    history.set_client_file_ident(SaltedFileIdent{2, 0x1234567812345678}, false);
+
+    instr::CreateObject bad_instr;
+    bad_instr.object = InternString{1};
+    bad_instr.table = InternString{2};
+
+    Changeset changeset;
+    changeset.push_back(bad_instr);
+
+    ChangesetEncoder::Buffer encoded;
+    encode_changeset(changeset, encoded);
+    Transformer::RemoteChangeset server_changeset;
+    server_changeset.origin_file_ident = 1;
+    server_changeset.remote_version = 1;
+    server_changeset.data = BinaryData(encoded.data(), encoded.size());
+
+    VersionInfo version_info;
+    util::StderrLogger logger;
+    CHECK_THROW_EX(history.integrate_server_changesets({}, nullptr, util::Span(&server_changeset, 1), version_info,
+                                                       DownloadBatchState::LastInBatch, logger),
+                   sync::IntegrationException,
+                   StringData(e.what()).contains("Failed to parse received changeset: Invalid interned string"));
 }
 
 } // unnamed namespace

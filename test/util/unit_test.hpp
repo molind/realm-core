@@ -19,22 +19,22 @@
 #ifndef REALM_TEST_UTIL_UNIT_TEST_HPP
 #define REALM_TEST_UTIL_UNIT_TEST_HPP
 
-#include <stddef.h>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <memory>
-#include <algorithm>
-#include <vector>
 #include <list>
-#include <string>
+#include <memory>
 #include <sstream>
-#include <ostream>
+#include <stddef.h>
+#include <string>
+#include <vector>
 
-#include <realm/util/features.h>
-#include <realm/util/type_traits.hpp>
-#include <realm/util/safe_int_ops.hpp>
 #include <realm/util/bind_ptr.hpp>
+#include <realm/util/optional.hpp>
+#include <realm/util/features.h>
 #include <realm/util/logger.hpp>
+#include <realm/util/safe_int_ops.hpp>
+#include <realm/util/type_traits.hpp>
 
 
 #define TEST(name) TEST_IF(name, true)
@@ -119,7 +119,8 @@
                 test_context.check_succeeded();                                                                      \
                 return true;                                                                                         \
             }                                                                                                        \
-            test_context.throw_ex_cond_failed(__FILE__, __LINE__, #expr, #exception_class, #exception_cond);         \
+            test_context.throw_ex_cond_failed(__FILE__, __LINE__, e.what(), #expr, #exception_class,                 \
+                                              #exception_cond);                                                      \
         }                                                                                                            \
         return false;                                                                                                \
     }())
@@ -417,12 +418,12 @@ std::unique_ptr<Reporter> create_xml_reporter(std::ostream&);
 
 /// Generates output that is compatible with the XML output of JUnit. See
 /// http://llg.cubic.org/docs/junit/
-std::unique_ptr<Reporter> create_junit_reporter(std::ostream&);
+std::unique_ptr<Reporter> create_junit_reporter(std::ostream&, std::string_view test_suite_name);
 
 /// Generates output that is compatible with the evergreen test results api.
 std::unique_ptr<Reporter> create_evergreen_reporter(const std::string&);
 
-std::unique_ptr<Reporter> create_twofold_reporter(Reporter& subreporter_1, Reporter& subreporter_2);
+std::unique_ptr<Reporter> create_combined_reporter(const std::vector<std::unique_ptr<Reporter>>&);
 
 /// Run only those tests whose name is both included and not
 /// excluded.
@@ -521,8 +522,8 @@ public:
     void throw_failed(const char* file, long line, const char* expr_text, const char* exception_name);
     void throw_ex_failed(const char* file, long line, const char* expr_text, const char* exception_name,
                          const char* exception_cond_text);
-    void throw_ex_cond_failed(const char* file, long line, const char* expr_text, const char* exception_name,
-                              const char* exception_cond_text);
+    void throw_ex_cond_failed(const char* file, long line, const char* exception_what, const char* expr_text,
+                              const char* exception_name, const char* exception_cond_text);
     void throw_any_failed(const char* file, long line, const char* expr_text);
 
     std::string get_test_name() const;
@@ -749,6 +750,16 @@ void to_string(const T& value, std::string& str)
     std::ostringstream out;
     SetPrecision<T, std::is_floating_point<T>::value>::exec(out);
     out << value;
+    str = out.str();
+}
+
+template <class T>
+void to_string(const std::optional<T>& value, std::string& str)
+{
+    // FIXME: Put string values in quotes, and escape non-printables as well as '"' and '\\'.
+    std::ostringstream out;
+    SetPrecision<T, std::is_floating_point<T>::value>::exec(out);
+    util::stream_possible_optional(out, value);
     str = out.str();
 }
 

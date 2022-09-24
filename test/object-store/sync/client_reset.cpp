@@ -33,6 +33,7 @@
 #include <realm/object-store/thread_safe_reference.hpp>
 #include <realm/object-store/util/scheduler.hpp>
 #include <realm/object-store/impl/object_accessor_impl.hpp>
+#include <realm/object-store/impl/realm_coordinator.hpp>
 #include <realm/object-store/property.hpp>
 #include <realm/object-store/sync/app.hpp>
 #include <realm/object-store/sync/app_credentials.hpp>
@@ -258,13 +259,11 @@ TEST_CASE("sync: client reset", "[client reset]") {
             auto obj = results.get<Obj>(0);
             REQUIRE(obj.get<Int>("value") == 4);
             object = Object(realm, obj);
-            object_token = object.add_notification_callback([&](CollectionChangeSet changes, std::exception_ptr err) {
-                REQUIRE_FALSE(err);
+            object_token = object.add_notification_callback([&](CollectionChangeSet changes) {
                 object_changes = std::move(changes);
             });
         }
-        results_token = results.add_notification_callback([&](CollectionChangeSet changes, std::exception_ptr err) {
-            REQUIRE_FALSE(err);
+        results_token = results.add_notification_callback([&](CollectionChangeSet changes) {
             results_changes = std::move(changes);
         });
     };
@@ -679,6 +678,31 @@ TEST_CASE("sync: client reset", "[client reset]") {
             REQUIRE(after_callback_invocations == 0);
         }
 
+        SECTION("callbacks are seeded with Realm instances even if the coordinator dies") {
+            auto client_reset_harness = make_reset(local_config, remote_config);
+            client_reset_harness->disable_wait_for_reset_completion();
+            std::shared_ptr<SyncSession> session;
+            client_reset_harness
+                ->on_post_local_changes([&](SharedRealm local) {
+                    // retain a reference so the sync session completes, even though the Realm is cleaned up
+                    session = local->sync_session();
+                })
+                ->run();
+            auto local_coordinator = realm::_impl::RealmCoordinator::get_existing_coordinator(local_config.path);
+            REQUIRE(!local_coordinator);
+            REQUIRE(before_callback_invoctions == 0);
+            REQUIRE(after_callback_invocations == 0);
+            timed_sleeping_wait_for(
+                [&]() -> bool {
+                    std::lock_guard<std::mutex> lock(mtx);
+                    return after_callback_invocations > 0;
+                },
+                std::chrono::seconds(60));
+            // this test also relies on the test config above to verify the Realm instances in the callbacks
+            REQUIRE(before_callback_invoctions == 1);
+            REQUIRE(after_callback_invocations == 1);
+        }
+
         SECTION("notifiers work if the session instance changes") {
             // run this test with ASAN to check for use after free
             size_t before_callback_invoctions_2 = 0;
@@ -715,6 +739,7 @@ TEST_CASE("sync: client reset", "[client reset]") {
             }
             realm::SyncError synthetic(sync::make_error_code(sync::ProtocolError::bad_client_file),
                                        "A fake client reset error", true);
+            synthetic.server_requests_action = sync::ProtocolErrorInfo::Action::ClientReset;
             SyncSession::OnlyForTesting::handle_error(*session, synthetic);
 
             session->revive_if_needed();
@@ -1613,13 +1638,11 @@ TEMPLATE_TEST_CASE("client reset types", "[client reset][local]", cf::MixedVal, 
         if (results.size() >= 1) {
             auto obj = *ObjectStore::table_for_object_type(realm->read_group(), "test type")->begin();
             object = Object(realm, obj);
-            object_token = object.add_notification_callback([&](CollectionChangeSet changes, std::exception_ptr err) {
-                REQUIRE_FALSE(err);
+            object_token = object.add_notification_callback([&](CollectionChangeSet changes) {
                 object_changes = std::move(changes);
             });
         }
-        results_token = results.add_notification_callback([&](CollectionChangeSet changes, std::exception_ptr err) {
-            REQUIRE_FALSE(err);
+        results_token = results.add_notification_callback([&](CollectionChangeSet changes) {
             results_changes = std::move(changes);
         });
     };
@@ -2252,7 +2275,7 @@ TEMPLATE_TEST_CASE("client reset collections of links", "[client reset][local][l
     auto create_one_source_object = [&](realm::SharedRealm r, int64_t val, std::vector<ObjLink> links = {}) {
         auto object = Object::create(
             c, r, "source",
-            util::Any(realm::AnyDict{{valid_pk_name, util::Any(val)}, {"realm_id", std::string(partition)}}),
+            std::any(realm::AnyDict{{valid_pk_name, std::any(val)}, {"realm_id", std::string(partition)}}),
             CreatePolicy::ForceCreate);
 
         for (auto link : links) {
@@ -2261,13 +2284,13 @@ TEMPLATE_TEST_CASE("client reset collections of links", "[client reset][local][l
     };
 
     auto create_one_dest_object = [&](realm::SharedRealm r, util::Optional<int64_t> val) -> ObjLink {
-        util::Any v;
+        std::any v;
         if (val) {
-            v = util::Any(*val);
+            v = std::any(*val);
         }
         auto obj = Object::create(
             c, r, "dest",
-            util::Any(realm::AnyDict{{valid_pk_name, std::move(v)}, {"realm_id", std::string(partition)}}),
+            std::any(realm::AnyDict{{valid_pk_name, std::move(v)}, {"realm_id", std::string(partition)}}),
             CreatePolicy::ForceCreate);
         return ObjLink{obj.obj().get_table()->get_key(), obj.obj().get_key()};
     };
@@ -2306,13 +2329,11 @@ TEMPLATE_TEST_CASE("client reset collections of links", "[client reset][local][l
         results = Results(realm, source_table->where().equal(id_col, source_pk));
         if (auto obj = results.first()) {
             object = Object(realm, *obj);
-            object_token = object.add_notification_callback([&](CollectionChangeSet changes, std::exception_ptr err) {
-                REQUIRE_FALSE(err);
+            object_token = object.add_notification_callback([&](CollectionChangeSet changes) {
                 object_changes = std::move(changes);
             });
         }
-        results_token = results.add_notification_callback([&](CollectionChangeSet changes, std::exception_ptr err) {
-            REQUIRE_FALSE(err);
+        results_token = results.add_notification_callback([&](CollectionChangeSet changes) {
             results_changes = std::move(changes);
         });
     };
@@ -2877,7 +2898,11 @@ TEST_CASE("client reset with embedded object", "[client reset][local][embedded o
         util::Optional<EmbeddedContent> link_value = EmbeddedContent();
         std::vector<EmbeddedContent> array_values{3};
         using DictType = util::FlatMap<std::string, util::Optional<EmbeddedContent>>;
-        DictType dict_values = DictType::container_type{{"foo", {{}}}, {"bar", {{}}}, {"baz", {{}}}};
+        DictType dict_values = DictType::container_type{
+            {"foo", EmbeddedContent()},
+            {"bar", EmbeddedContent()},
+            {"baz", EmbeddedContent()},
+        };
         void apply_recovery_from(const TopLevelContent& other)
         {
             combine_array_values(array_values, other.array_values);
@@ -3674,7 +3699,10 @@ TEST_CASE("client reset with embedded object", "[client reset][local][embedded o
                 actual.test(test_mode == ClientResyncMode::Recover ? expected_recovered : initial);
             });
             int64_t initial_value = initial.dict_values[existing_key]->int_value;
-            int64_t addition = random_int();
+            std::mt19937_64 engine(std::random_device{}());
+            std::uniform_int_distribution<int64_t> rng(-10'000'000'000, 10'000'000'000);
+
+            int64_t addition = rng(engine);
             SECTION("local add_int to an existing dictionary item") {
                 INFO("adding " << initial_value << " with " << addition);
                 expected_recovered = initial;
@@ -3686,7 +3714,7 @@ TEST_CASE("client reset with embedded object", "[client reset][local][embedded o
                     ->run();
             }
             SECTION("local and remote both create the same dictionary item and add to it") {
-                int64_t remote_addition = random_int();
+                int64_t remote_addition = rng(engine);
                 INFO("adding " << initial_value << " with local " << addition << " and remote " << remote_addition);
                 expected_recovered = initial;
                 expected_recovered.dict_values[existing_key]->int_value += (addition + remote_addition);

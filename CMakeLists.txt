@@ -99,6 +99,11 @@ else()
         add_cxx_flag_if_supported(-Wno-deprecated-declarations)
     endif()
 
+    # By default GCC warns that it changed how it passes bitfields by value as
+    # function arguments on arm64 every time this happens. This warning is just
+    # an FYI and not pointing out a problem, so just disable it.
+    add_cxx_flag_if_supported(-Wno-psabi)
+
     add_cxx_flag_if_supported(-Wpartial-availability)
 
     # This warning is too agressive. It warns about moves that are not redundant on older
@@ -327,20 +332,13 @@ if(CMAKE_SYSTEM_NAME MATCHES "^Windows")
 elseif(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(CATCH_CONFIG_NO_POSIX_SIGNALS ON CACHE BOOL "Disable Catch support for POSIX signals on Apple platforms other than macOS")
 endif()
+set(CATCH_CONFIG_ENABLE_ALL_STRINGMAKERS ON CACHE BOOL "Enable Catch2's optional standard library stringmakers")
 
 add_subdirectory(external/catch EXCLUDE_FROM_ALL)
 
-# This disables a c++17 feature that Apple doesn't support yet and Catch2 uses
-# The following define could be removed if we drop support for MacOS 10.12
-target_compile_definitions(Catch2 PRIVATE
-    CATCH_CONFIG_NO_CPP17_UNCAUGHT_EXCEPTIONS=1
-    _SILENCE_CXX17_UNCAUGHT_EXCEPTION_DEPRECATION_WARNING=1
-)
-if (NOT MSVC)
-    target_compile_options(Catch2 PRIVATE
-        -Wno-deprecated-declarations
-    )
-endif()
+# Cmake does not let us easily set the deployment target per-target, but Catch2
+# can use modern features because we only run tests on recent OS versions.
+target_compile_definitions(Catch2 PRIVATE _LIBCPP_DISABLE_AVAILABILITY)
 
 # Enable CTest and include unit tests
 enable_testing()

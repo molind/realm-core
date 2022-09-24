@@ -96,8 +96,17 @@ void on_change_but_no_notify(realm::Realm& realm);
 #if REALM_ENABLE_SYNC
 
 #ifndef TEST_ENABLE_SYNC_LOGGING
-#define TEST_ENABLE_SYNC_LOGGING 0 // change to 1 to enable logging
+#define TEST_ENABLE_SYNC_LOGGING 0 // change to 1 to enable trace-level logging
 #endif
+
+#ifndef TEST_ENABLE_SYNC_LOGGING_LEVEL
+#if TEST_ENABLE_SYNC_LOGGING
+#define TEST_ENABLE_SYNC_LOGGING_LEVEL all
+#else
+#define TEST_ENABLE_SYNC_LOGGING_LEVEL off
+#endif // TEST_ENABLE_SYNC_LOGGING
+#endif // TEST_ENABLE_SYNC_LOGGING_LEVEL
+
 
 struct TestLogger : realm::util::Logger::LevelThreshold, realm::util::Logger {
     void do_log(realm::util::Logger::Level, std::string const&) override {}
@@ -216,7 +225,7 @@ public:
         std::string base_path;
         realm::SyncManager::MetadataMode metadata_mode = realm::SyncManager::MetadataMode::NoEncryption;
         bool should_teardown_test_directory = true;
-        bool verbose_sync_client_logging = TEST_ENABLE_SYNC_LOGGING;
+        realm::util::Logger::Level sync_client_log_level = realm::util::Logger::Level::TEST_ENABLE_SYNC_LOGGING_LEVEL;
         bool override_sync_route = true;
         std::shared_ptr<realm::app::GenericNetworkTransport> transport;
     };
@@ -240,21 +249,31 @@ public:
 
     // Capture the token refresh callback so that we can invoke it later with
     // the desired result
-    realm::util::UniqueFunction<void(const realm::app::Response&)> network_callback;
+    struct TransportCallback {
+        realm::app::Request request;
+        realm::app::HttpCompletion completion_block;
+
+        void operator()(realm::app::Response&& response)
+        {
+            REQUIRE(completion_block);
+            completion_block(request, std::move(response));
+        }
+    };
+
+    TransportCallback network_callback;
     struct Transport : realm::app::GenericNetworkTransport {
-        Transport(realm::util::UniqueFunction<void(const realm::app::Response&)>* network_callback)
+        Transport(TransportCallback* network_callback)
             : network_callback(network_callback)
         {
         }
 
-        void send_request_to_server(
-            realm::app::Request&&,
-            realm::util::UniqueFunction<void(const realm::app::Response&)>&& completion_block) override
+        void send_request_to_server(realm::app::Request&& request,
+                                    realm::app::HttpCompletion&& completion_block) override
         {
-            *network_callback = std::move(completion_block);
+            *network_callback = TransportCallback{std::move(request), std::move(completion_block)};
         }
 
-        realm::util::UniqueFunction<void(const realm::app::Response&)>* network_callback;
+        TransportCallback* network_callback;
     };
     std::shared_ptr<realm::app::GenericNetworkTransport> transport = std::make_shared<Transport>(&network_callback);
 

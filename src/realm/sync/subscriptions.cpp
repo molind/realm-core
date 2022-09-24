@@ -105,7 +105,7 @@ std::string_view Subscription::name() const
     if (!m_name) {
         return std::string_view{};
     }
-    return m_name.value();
+    return *m_name;
 }
 
 std::string_view Subscription::object_class_name() const
@@ -364,11 +364,9 @@ MutableSubscriptionSet SubscriptionSet::make_mutable_copy() const
 void SubscriptionSet::refresh()
 {
     auto mgr = get_flx_subscription_store(); // Throws
-    auto refreshed_self = mgr->get_by_version(version());
-    m_state = refreshed_self.m_state;
-    m_error_str = refreshed_self.m_error_str;
-    m_cur_version = refreshed_self.m_cur_version;
-    *this = mgr->get_by_version(version());
+    if (mgr->would_refresh(m_cur_version)) {
+        *this = mgr->get_by_version(version());
+    }
 }
 
 util::Future<SubscriptionSet::State> SubscriptionSet::get_state_change_notification(State notify_when) const
@@ -629,10 +627,10 @@ SubscriptionSet SubscriptionStore::get_latest() const
     if (sub_sets->is_empty()) {
         return SubscriptionSet(weak_from_this(), *tr, Obj{});
     }
-    auto latest_id = sub_sets->maximum_int(sub_sets->get_primary_key_column());
-    auto latest_obj = sub_sets->get_object_with_primary_key(Mixed{latest_id});
+    auto latest_id = *sub_sets->max(sub_sets->get_primary_key_column());
+    auto latest_obj = sub_sets->get_object_with_primary_key(latest_id);
 
-    return SubscriptionSet(weak_from_this(), *tr, std::move(latest_obj));
+    return SubscriptionSet(weak_from_this(), *tr, latest_obj);
 }
 
 SubscriptionSet SubscriptionStore::get_active() const
@@ -664,7 +662,7 @@ std::pair<int64_t, int64_t> SubscriptionStore::get_active_and_latest_versions() 
         return {0, 0};
     }
 
-    auto latest_id = sub_sets->maximum_int(sub_sets->get_primary_key_column());
+    auto latest_id = *sub_sets->max(sub_sets->get_primary_key_column());
     DescriptorOrdering descriptor_ordering;
     descriptor_ordering.append_sort(SortDescriptor{{{sub_sets->get_primary_key_column()}}, {false}});
     descriptor_ordering.append_limit(LimitDescriptor{1});
@@ -673,11 +671,11 @@ std::pair<int64_t, int64_t> SubscriptionStore::get_active_and_latest_versions() 
                    .find_all(descriptor_ordering);
 
     if (res.is_empty()) {
-        return {-1, latest_id};
+        return {-1, latest_id.get_int()};
     }
 
     auto active_id = res.get_object(0).get_primary_key();
-    return {active_id.get_int(), latest_id};
+    return {active_id.get_int(), latest_id.get_int()};
 }
 
 util::Optional<SubscriptionStore::PendingSubscription>
@@ -766,8 +764,8 @@ SubscriptionStore::TableSet SubscriptionStore::get_tables_for_latest(const Trans
     if (sub_sets->is_empty()) {
         return {};
     }
-    auto latest_id = sub_sets->maximum_int(sub_sets->get_primary_key_column());
-    auto latest_obj = sub_sets->get_object_with_primary_key(Mixed{latest_id});
+    auto latest_id = *sub_sets->max(sub_sets->get_primary_key_column());
+    auto latest_obj = sub_sets->get_object_with_primary_key(latest_id);
 
     TableSet ret;
     auto subs = latest_obj.get_linklist(m_sub_set_subscriptions);
@@ -821,7 +819,7 @@ MutableSubscriptionSet SubscriptionStore::make_mutable_copy(const SubscriptionSe
     auto new_tr = m_db->start_write();
 
     auto sub_sets = new_tr->get_table(m_sub_set_table);
-    auto new_pk = sub_sets->maximum_int(sub_sets->get_primary_key_column()) + 1;
+    auto new_pk = sub_sets->max(sub_sets->get_primary_key_column())->get_int() + 1;
 
     MutableSubscriptionSet new_set_obj(weak_from_this(), std::move(new_tr),
                                        sub_sets->create_object_with_primary_key(Mixed{new_pk}));
@@ -830,6 +828,11 @@ MutableSubscriptionSet SubscriptionStore::make_mutable_copy(const SubscriptionSe
     }
 
     return new_set_obj;
+}
+
+bool SubscriptionStore::would_refresh(DB::version_type version) const noexcept
+{
+    return version < m_db->get_version_of_latest_snapshot();
 }
 
 } // namespace realm::sync

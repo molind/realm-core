@@ -136,9 +136,6 @@ struct RealmConfig {
         return schema_mode == SchemaMode::ReadOnly;
     }
 
-    // The following are intended for internal/testing purposes and
-    // should not be publicly exposed in binding APIs
-
     // If false, always return a new Realm instance, and don't return
     // that Realm instance for other requests for a cached Realm. Useful
     // for dynamic Realms and for tests that need multiple instances on
@@ -149,11 +146,6 @@ struct RealmConfig {
     // format. Used by the browser to warn the user that it'll modify
     // the file.
     bool disable_format_upgrade = false;
-    // Disable the background worker thread for producing change
-    // notifications. Useful for tests for those notifications so that
-    // everything can be done deterministically on one thread, and
-    // speeds up tests that don't need notifications.
-    bool automatic_change_notifications = true;
 
     // The Scheduler which this Realm should be bound to. If not supplied,
     // a default one for the current thread will be used.
@@ -175,6 +167,17 @@ struct RealmConfig {
 
     // Disable automatic backup at file format upgrade by setting to false
     bool backup_at_file_format_change = true;
+
+    // delete embedded orphan objects
+    bool automatic_handle_backlicks_in_migrations = false;
+
+    // Only for internal testing. Not to be used by SDKs.
+    //
+    // Disable the background worker thread for producing change
+    // notifications. Useful for tests for those notifications so that
+    // everything can be done deterministically on one thread, and
+    // speeds up tests that don't need notifications.
+    bool automatic_change_notifications = true;
 };
 
 class Realm : public std::enable_shared_from_this<Realm> {
@@ -320,6 +323,8 @@ public:
     // Get the version of the current read or frozen transaction, or `none` if the Realm
     // is not in a read transaction
     util::Optional<VersionID> current_transaction_version() const;
+    // Get the version of the latest snapshot
+    util::Optional<DB::version_type> latest_snapshot_version() const;
 
     TransactionRef duplicate() const;
 
@@ -420,9 +425,6 @@ public:
      * @throws DeleteOnOpenRealmException if the function was called on an open Realm.
      */
     static void delete_files(const std::string& realm_file_path, bool* did_delete_realm = nullptr);
-
-    // returns the file format version upgraded from if an upgrade took place
-    util::Optional<int> file_format_upgraded_from_version() const;
 
     bool has_pending_async_work() const;
 
