@@ -11,7 +11,6 @@
 
 #include <realm/util/buffer.hpp>
 #include <realm/util/functional.hpp>
-#include <realm/util/logger.hpp>
 #include <realm/sync/client_base.hpp>
 #include <realm/sync/subscriptions.hpp>
 
@@ -209,12 +208,18 @@ public:
         /// change in the C++ mock server.
         std::string service_identifier = "";
 
+        ///
+        /// DEPRECATED - Will be removed in a future release
+        ///
         /// authorization_header_name is the name of the HTTP header containing
         /// the Realm access token. The value of the HTTP header is "Bearer <token>".
         /// authorization_header_name does not participate in session
         /// multiplexing partitioning.
         std::string authorization_header_name = "Authorization";
 
+        ///
+        /// DEPRECATED - Will be removed in a future release
+        ///
         /// custom_http_headers is a map of custom HTTP headers. The keys of the map
         /// are HTTP header names, and the values are the corresponding HTTP
         /// header values.
@@ -222,10 +227,16 @@ public:
         /// authorization_header_name must be set to anther value.
         std::map<std::string, std::string> custom_http_headers;
 
+        ///
+        /// DEPRECATED - Will be removed in a future release
+        ///
         /// Controls whether the server certificate is verified for SSL
         /// connections. It should generally be true in production.
         bool verify_servers_ssl_certificate = true;
 
+        ///
+        /// DEPRECATED - Will be removed in a future release
+        ///
         /// ssl_trust_certificate_path is the path of a trust/anchor
         /// certificate used by the client to verify the server certificate.
         /// ssl_trust_certificate_path is only used if the protocol is ssl and
@@ -243,6 +254,9 @@ public:
         /// store is used otherwise.
         util::Optional<std::string> ssl_trust_certificate_path;
 
+        ///
+        /// DEPRECATED - Will be removed in a future release
+        ///
         /// If Client::Config::ssl_verify_callback is set, that function is called
         /// to verify the certificate, unless verify_servers_ssl_certificate is
         /// false.
@@ -305,7 +319,14 @@ public:
         using ClientReset = sync::ClientReset;
         util::Optional<ClientReset> client_reset_config;
 
+        ///
+        /// DEPRECATED - Will be removed in a future release
+        ///
         util::Optional<SyncConfig::ProxyConfig> proxy_config;
+
+        /// When integrating a flexible sync bootstrap, process this many bytes of
+        /// changeset data in a single integration attempt.
+        size_t flx_bootstrap_batch_size_bytes = 1024 * 1024;
 
         /// Set to true to cause the integration of the first received changeset
         /// (in a DOWNLOAD message) to fail.
@@ -459,7 +480,6 @@ public:
     /// the session object is destroyed. Please see "Callback semantics" section
     /// under Session for more on this.
     void set_progress_handler(util::UniqueFunction<ProgressHandler>);
-
 
     using ConnectionStateChangeListener = void(ConnectionState, util::Optional<SessionErrorInfo>);
 

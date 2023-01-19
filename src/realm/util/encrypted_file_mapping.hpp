@@ -44,11 +44,11 @@ public:
     EncryptedFileMapping(const EncryptedFileMapping&) = delete;
     EncryptedFileMapping& operator=(const EncryptedFileMapping&) = delete;
 
-    // Write all dirty pages to disk and mark them read-only
+    // Encrypt all dirty pages, push them to shared cache and mark them read-only
     // Does not call fsync
     void flush() noexcept;
 
-    // Sync this file to disk
+    // Sync the image of this file in shared cache to disk. Does not imply flush.
     void sync() noexcept;
 
     // Make sure that memory in the specified range is synchronized with any
@@ -146,7 +146,7 @@ private:
 
     void mark_outdated(size_t local_page_ndx) noexcept;
     bool copy_up_to_date_page(size_t local_page_ndx) noexcept;
-    void refresh_page(size_t local_page_ndx, bool allow_missing);
+    void refresh_page(size_t local_page_ndx, size_t required);
     void write_and_update_all(size_t local_page_ndx, size_t begin_offset, size_t end_offset) noexcept;
     void reclaim_page(size_t page_ndx);
     void validate_page(size_t local_page_ndx) noexcept;

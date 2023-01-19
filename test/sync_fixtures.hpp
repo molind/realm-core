@@ -4,8 +4,8 @@
 #include <vector>
 #include <sstream>
 
-#include <realm/util/network.hpp>
-#include <realm/util/http.hpp>
+#include <realm/sync/network/http.hpp>
+#include <realm/sync/network/network.hpp>
 #include <realm/string_data.hpp>
 #include <realm/impl/simulated_failure.hpp>
 #include <realm/sync/noinst/protocol_codec.hpp>
@@ -301,7 +301,7 @@ public:
 
     util::PrefixLogger logger;
 
-    HTTPRequestClient(util::Logger& logger, const util::network::Endpoint& endpoint, const util::HTTPRequest& request)
+    HTTPRequestClient(util::Logger& logger, const network::Endpoint& endpoint, const HTTPRequest& request)
         : logger{"HTTP client: ", logger}
         , m_endpoint{endpoint}
         , m_http_client{*this, logger}
@@ -319,7 +319,7 @@ public:
 
     // get_response is used to retrieve the response after
     // fetch_response returns.
-    util::HTTPResponse& get_response()
+    HTTPResponse& get_response()
     {
         return m_response;
     }
@@ -340,13 +340,13 @@ public:
     }
 
 private:
-    util::network::Service m_service;
-    util::network::Socket m_socket{m_service};
-    util::network::ReadAheadBuffer m_read_ahead_buffer;
-    util::network::Endpoint m_endpoint;
-    util::HTTPClient<HTTPRequestClient> m_http_client;
-    util::HTTPRequest m_request;
-    util::HTTPResponse m_response;
+    network::Service m_service;
+    network::Socket m_socket{m_service};
+    network::ReadAheadBuffer m_read_ahead_buffer;
+    network::Endpoint m_endpoint;
+    HTTPClient<HTTPRequestClient> m_http_client;
+    HTTPRequest m_request;
+    HTTPResponse m_response;
 
     void initiate_tcp_connect()
     {
@@ -367,7 +367,7 @@ private:
             return;
         }
 
-        m_socket.set_option(util::network::SocketBase::no_delay(true));
+        m_socket.set_option(network::SocketBase::no_delay(true));
         logger.debug("Connected to endpoint '%1:%2'", m_endpoint.address(), m_endpoint.port());
 
 
@@ -376,7 +376,7 @@ private:
 
     void initiate_http_request()
     {
-        auto handler = [this](util::HTTPResponse response, std::error_code ec) {
+        auto handler = [this](HTTPResponse response, std::error_code ec) {
             if (ec != util::error::operation_aborted) {
                 if (ec) {
                     logger.debug("HTTP response error, ec = %1", ec.message());
@@ -389,7 +389,7 @@ private:
         m_http_client.async_request(m_request, handler);
     }
 
-    void handle_http_response(const util::HTTPResponse response)
+    void handle_http_response(const HTTPResponse response)
     {
         logger.debug("HTTP response received, status = %1", int(response.status));
         m_response = response;
@@ -413,7 +413,7 @@ public:
 
         // Optional thread-safe logger. If none is specified, the one available
         // through unit_test::TestContext will be used.
-        util::Logger* logger = nullptr;
+        std::shared_ptr<util::Logger> logger;
 
         // These values will disable the heartbeats by default.
         milliseconds_type client_ping_period = 100000000;  // do not send pings
@@ -463,7 +463,7 @@ public:
 
     MultiClientServerFixture(int num_clients, int num_servers, std::string server_dir,
                              unit_test::TestContext& test_context, Config config = {})
-        : m_logger{config.logger ? *config.logger : test_context.logger}
+        : m_logger{config.logger ? config.logger : test_context.logger}
         , m_num_servers{num_servers}
         , m_num_clients{num_clients}
         , m_enable_server_ssl{config.enable_server_ssl}
@@ -475,22 +475,22 @@ public:
         m_client_loggers.resize(num_clients);
 
         if (num_servers == 1) {
-            m_server_loggers[0] = std::make_unique<util::PrefixLogger>("Server: ", m_logger);
+            m_server_loggers[0] = std::make_shared<util::PrefixLogger>("Server: ", m_logger);
         }
         else {
             for (int i = 0; i < num_servers; ++i) {
                 std::string prefix = "Server[" + std::to_string(i + 1) + "]: ";
-                m_server_loggers[i] = std::make_unique<util::PrefixLogger>(std::move(prefix), m_logger);
+                m_server_loggers[i] = std::make_shared<util::PrefixLogger>(std::move(prefix), m_logger);
             }
         }
 
         if (num_clients == 1) {
-            m_client_loggers[0] = std::make_unique<util::PrefixLogger>("Client: ", m_logger);
+            m_client_loggers[0] = std::make_shared<util::PrefixLogger>("Client: ", m_logger);
         }
         else {
             for (int i = 0; i < num_clients; ++i) {
                 std::string prefix = "Client[" + std::to_string(i + 1) + "]: ";
-                m_client_loggers[i] = std::make_unique<util::PrefixLogger>(std::move(prefix), m_logger);
+                m_client_loggers[i] = std::make_shared<util::PrefixLogger>(std::move(prefix), m_logger);
             }
         }
 
@@ -510,7 +510,7 @@ public:
                 public_key = PKey::load_public(config.server_public_key_path);
             Server::Config config_2;
             config_2.max_open_files = config.server_max_open_files;
-            config_2.logger = &*m_server_loggers[i];
+            config_2.logger = m_server_loggers[i];
             config_2.token_expiration_clock = &m_fake_token_expiration_clock;
             config_2.ssl = m_enable_server_ssl;
             config_2.ssl_certificate_path = config.server_ssl_certificate_path;
@@ -534,7 +534,7 @@ public:
         for (int i = 0; i < num_clients; ++i) {
             Client::Config config_2;
             config_2.user_agent_application_info = "TestFixture/" REALM_VERSION_STRING;
-            config_2.logger = &*m_client_loggers[i];
+            config_2.logger = m_client_loggers[i];
             config_2.reconnect_mode = ReconnectMode::testing;
             config_2.ping_keepalive_period = config.client_ping_period;
             config_2.pong_keepalive_timeout = config.client_pong_timeout;
@@ -688,9 +688,8 @@ public:
                     return;
                 REALM_ASSERT(error);
                 unit_test::TestContext& test_context = m_test_context;
-                util::Logger& logger = test_context.logger;
-                logger.error("Client disconnect: %1: %2 (is_fatal=%3)", error->error_code, error->message,
-                             error->is_fatal());
+                test_context.logger->error("Client disconnect: %1: %2 (is_fatal=%3)", error->error_code,
+                                           error->message, error->is_fatal());
                 bool client_error_occurred = true;
                 CHECK_NOT(client_error_occurred);
                 stop();
@@ -784,13 +783,13 @@ public:
 private:
     using ConnectionStateChangeListener = Session::ConnectionStateChangeListener;
     using port_type = Session::port_type;
-    util::Logger& m_logger;
+    std::shared_ptr<util::Logger> m_logger;
     const int m_num_servers;
     const int m_num_clients;
     const bool m_enable_server_ssl;
     unit_test::TestContext& m_test_context;
-    std::vector<std::unique_ptr<util::Logger>> m_server_loggers;
-    std::vector<std::unique_ptr<util::Logger>> m_client_loggers;
+    std::vector<std::shared_ptr<util::Logger>> m_server_loggers;
+    std::vector<std::shared_ptr<util::Logger>> m_client_loggers;
     std::vector<std::unique_ptr<Server>> m_servers;
     std::vector<std::unique_ptr<Client>> m_clients;
     std::vector<std::function<ConnectionStateChangeListener>> m_connection_state_change_listeners;
@@ -1039,8 +1038,11 @@ inline void RealmFixture::empty_transact()
 inline void RealmFixture::nonempty_transact()
 {
     auto func = [](Transaction& tr) {
-        TableRef table = tr.get_or_add_table("class_Table");
-        table->create_object();
+        TableRef table = tr.get_or_add_table_with_primary_key("class_Table", type_Int, "id");
+        int id = 1;
+        bool did_create = false;
+        while (!did_create)
+            table->create_object_with_primary_key(id++, &did_create);
         return true;
     };
     transact(func);
@@ -1048,8 +1050,8 @@ inline void RealmFixture::nonempty_transact()
 
 inline bool RealmFixture::transact(TransactFunc transact_func)
 {
-    auto tr = m_db->start_write();           // Throws
-    if (!transact_func(*tr))                 // Throws
+    auto tr = m_db->start_write(); // Throws
+    if (!transact_func(*tr))       // Throws
         return false;
     version_type new_version = tr->commit();        // Throws
     m_session.nonsync_transact_notify(new_version); // Throws

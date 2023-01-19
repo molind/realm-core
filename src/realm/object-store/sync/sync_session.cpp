@@ -30,10 +30,11 @@
 #include <realm/db_options.hpp>
 #include <realm/sync/client.hpp>
 #include <realm/sync/config.hpp>
+#include <realm/sync/network/http.hpp>
+#include <realm/sync/network/websocket.hpp>
 #include <realm/sync/noinst/client_history_impl.hpp>
 #include <realm/sync/noinst/client_reset_operation.hpp>
 #include <realm/sync/protocol.hpp>
-#include <realm/util/websocket.hpp>
 
 using namespace realm;
 using namespace realm::_impl;
@@ -185,6 +186,32 @@ void SyncSession::handle_bad_auth(const std::shared_ptr<SyncUser>& user, std::er
     }
 }
 
+static bool check_for_auth_failure(const app::AppError& error)
+{
+    using namespace realm::sync;
+    // Auth failure is returned as a 401 (unauthorized) or 403 (forbidden) response
+    if (error.http_status_code) {
+        auto status_code = HTTPStatus(*error.http_status_code);
+        if (status_code == HTTPStatus::Unauthorized || status_code == HTTPStatus::Forbidden)
+            return true;
+    }
+
+    return false;
+}
+
+static bool check_for_redirect_response(const app::AppError& error)
+{
+    using namespace realm::sync;
+    // Check for unhandled 301/308 permanent redirect response
+    if (error.http_status_code) {
+        auto status_code = HTTPStatus(*error.http_status_code);
+        if (status_code == HTTPStatus::MovedPermanently || status_code == HTTPStatus::PermanentRedirect)
+            return true;
+    }
+
+    return false;
+}
+
 util::UniqueFunction<void(util::Optional<app::AppError>)>
 SyncSession::handle_refresh(const std::shared_ptr<SyncSession>& session)
 {
@@ -201,15 +228,22 @@ SyncSession::handle_refresh(const std::shared_ptr<SyncSession>& session)
             else if (error->error_code.category() == app::client_error_category()) {
                 // any other client errors other than app_deallocated are considered fatal because
                 // there was a problem locally before even sending the request to the server
-                // eg. ClientErrorCode::user_not_found, ClientErrorCode::user_not_logged_in
+                // eg. ClientErrorCode::user_not_found, ClientErrorCode::user_not_logged_in,
+                // ClientErrorCode::too_many_redirects
                 session->handle_bad_auth(session_user, error->error_code, error->message);
             }
-            else if (error->http_status_code &&
-                     (*error->http_status_code == 401 || *error->http_status_code == 403)) {
+            else if (check_for_auth_failure(*error)) {
                 // A 401 response on a refresh request means that the token cannot be refreshed and we should not
                 // retry. This can be because an admin has revoked this user's sessions, the user has been disabled,
                 // or the refresh token has expired according to the server's clock.
                 session->handle_bad_auth(session_user, error->error_code, "Unable to refresh the user access token.");
+            }
+            else if (check_for_redirect_response(*error)) {
+                // A 301 or 308 response is an unhandled permanent redirect response (which should not happen) - if
+                // this is received, fail the request with an appropriate error message.
+                // Temporary redirect responses (302, 307) are not supported
+                session->handle_bad_auth(session_user, error->error_code,
+                                         "Unhandled redirect response when trying to reach the server.");
             }
             else {
                 // A refresh request has failed. This is an unexpected non-fatal error and we would
@@ -401,28 +435,7 @@ void SyncSession::download_fresh_realm(sync::ProtocolErrorInfo::Action server_re
         std::move(fresh_mut_sub)
             .commit()
             .get_state_change_notification(sync::SubscriptionSet::State::Complete)
-            .then([=, weak_self = weak_from_this()](sync::SubscriptionSet::State) {
-                auto pf = util::make_promise_future<void>();
-                sync_session->wait_for_download_completion([=, promise = std::move(pf.promise)](
-                                                               std::error_code ec) mutable {
-                    auto strong_self = weak_self.lock();
-                    if (!strong_self) {
-                        return promise.set_error({ErrorCodes::RuntimeError,
-                                                  "SyncSession was destroyed before download could be completed"});
-                    }
-
-                    if (ec) {
-                        return promise.set_error(
-                            {ErrorCodes::RuntimeError,
-                             util::format("Error waiting for download completion for fresh realm (code: %1): %2",
-                                          ec.value(), ec.message())});
-                    }
-
-                    promise.emplace_value();
-                });
-                return std::move(pf.future);
-            })
-            .get_async([=, weak_self = weak_from_this()](Status s) {
+            .get_async([=, weak_self = weak_from_this()](StatusWith<sync::SubscriptionSet::State> s) {
                 // Keep the sync session alive while it's downloading, but then close
                 // it immediately
                 sync_session->close();
@@ -431,7 +444,8 @@ void SyncSession::download_fresh_realm(sync::ProtocolErrorInfo::Action server_re
                         strong_self->handle_fresh_realm_downloaded(db, none, server_requests_action);
                     }
                     else {
-                        strong_self->handle_fresh_realm_downloaded(nullptr, s.reason(), server_requests_action);
+                        strong_self->handle_fresh_realm_downloaded(nullptr, s.get_status().reason(),
+                                                                   server_requests_action);
                     }
                 }
             });
@@ -618,7 +632,7 @@ void SyncSession::handle_error(SyncError error)
         // is disabled. In this scenario we attempt an automatic token refresh and if that succeeds continue as
         // normal. If the refresh request also fails with 401 then we need to stop retrying and pass along the error;
         // see handle_refresh().
-        if (error_code == util::websocket::make_error_code(util::websocket::Error::bad_response_401_unauthorized)) {
+        if (error_code == sync::websocket::make_error_code(sync::websocket::Error::bad_response_401_unauthorized)) {
             if (auto u = user()) {
                 u->refresh_custom_data(handle_refresh(shared_from_this()));
                 return;
@@ -747,6 +761,7 @@ void SyncSession::create_sync_session()
     session_config.ssl_verify_callback = sync_config.ssl_verify_callback;
     session_config.proxy_config = sync_config.proxy_config;
     session_config.simulate_integration_error = sync_config.simulate_integration_error;
+    session_config.flx_bootstrap_batch_size_bytes = sync_config.flx_bootstrap_batch_size_bytes;
     if (sync_config.on_sync_client_event_hook) {
         session_config.on_sync_client_event_hook = [hook = sync_config.on_sync_client_event_hook,
                                                     anchor = weak_from_this()](const SyncClientHookData& data) {

@@ -100,6 +100,7 @@ public:
             }
         }
     };
+
     std::vector<Service> get_services(const std::string& app_id) const;
     std::vector<std::string> get_errors(const std::string& app_id) const;
     Service get_sync_service(const std::string& app_id) const;
@@ -114,6 +115,7 @@ public:
                                           ServiceConfig sync_config, bool disable) const;
     bool is_sync_enabled(const std::string& app_id) const;
     bool is_sync_terminated(const std::string& app_id) const;
+    bool is_initial_sync_complete(const std::string& app_id) const;
 
     const std::string& base_url() const noexcept
     {
@@ -236,9 +238,8 @@ inline app::App::Config get_config(Factory factory, const AppSession& app_sessio
             util::none,
             util::Optional<std::string>("A Local App Version"),
             util::none,
-            "Object Store Platform Tests",
-            "Object Store Platform Version Blah",
-            "An sdk version"};
+            {"Object Store Platform Tests", "Object Store Platform Version Blah", "An sdk version", "An sdk name",
+             "A cpu arch", "A device name", "A device version", "A framework name", "A framework version"}};
 }
 
 } // namespace realm

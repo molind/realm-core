@@ -330,17 +330,48 @@ RLM_API void realm_app_config_set_default_request_timeout(realm_app_config_t* co
 
 RLM_API void realm_app_config_set_platform(realm_app_config_t* config, const char* platform) noexcept
 {
-    config->platform = std::string(platform);
+    config->device_info.platform = std::string(platform);
 }
 
 RLM_API void realm_app_config_set_platform_version(realm_app_config_t* config, const char* platform_version) noexcept
 {
-    config->platform_version = std::string(platform_version);
+    config->device_info.platform_version = std::string(platform_version);
 }
 
 RLM_API void realm_app_config_set_sdk_version(realm_app_config_t* config, const char* sdk_version) noexcept
 {
-    config->sdk_version = std::string(sdk_version);
+    config->device_info.sdk_version = std::string(sdk_version);
+}
+
+RLM_API void realm_app_config_set_sdk(realm_app_config_t* config, const char* sdk) noexcept
+{
+    config->device_info.sdk = std::string(sdk);
+}
+
+RLM_API void realm_app_config_set_cpu_arch(realm_app_config_t* config, const char* cpu_arch) noexcept
+{
+    config->device_info.cpu_arch = std::string(cpu_arch);
+}
+
+RLM_API void realm_app_config_set_device_name(realm_app_config_t* config, const char* device_name) noexcept
+{
+    config->device_info.device_name = std::string(device_name);
+}
+
+RLM_API void realm_app_config_set_device_version(realm_app_config_t* config, const char* device_version) noexcept
+{
+    config->device_info.device_version = std::string(device_version);
+}
+
+RLM_API void realm_app_config_set_framework_name(realm_app_config_t* config, const char* framework_name) noexcept
+{
+    config->device_info.framework_name = std::string(framework_name);
+}
+
+RLM_API void realm_app_config_set_framework_version(realm_app_config_t* config,
+                                                    const char* framework_version) noexcept
+{
+    config->device_info.framework_version = std::string(framework_version);
 }
 
 RLM_API const char* realm_app_credentials_serialize_as_json(realm_app_credentials_t* app_credentials) noexcept
@@ -689,23 +720,23 @@ RLM_API bool realm_app_push_notification_client_deregister_device(const realm_ap
     });
 }
 
-RLM_API bool realm_app_call_function(
-    const realm_app_t* app, const realm_user_t* user, const char* function_name, const char* serialized_ejson_payload,
-    void (*callback)(realm_userdata_t userdata, const char* serialized_ejson_response, const realm_app_error_t*),
-    realm_userdata_t userdata, realm_free_userdata_func_t userdata_free)
+RLM_API bool realm_app_call_function(const realm_app_t* app, const realm_user_t* user, const char* function_name,
+                                     const char* serialized_ejson_payload, realm_return_string_func_t callback,
+                                     realm_userdata_t userdata, realm_free_userdata_func_t userdata_free)
 {
     return wrap_err([&] {
         auto cb = [callback, userdata = SharedUserdata{userdata, FreeUserdata(userdata_free)}](
-                      util::Optional<bson::Bson>&& bson, util::Optional<AppError> error) {
+                      const std::string* reply, util::Optional<AppError> error) {
             if (error) {
                 realm_app_error_t c_error(to_capi(*error));
                 callback(userdata.get(), nullptr, &c_error);
             }
             else {
-                callback(userdata.get(), bson->toJson().c_str(), nullptr);
+                callback(userdata.get(), reply->c_str(), nullptr);
             }
         };
-        (*app)->call_function(*user, function_name, parse_ejson_array(serialized_ejson_payload), std::move(cb));
+        (*app)->call_function(*user, function_name, serialized_ejson_payload, /*service_name=*/std::nullopt,
+                              std::move(cb));
         return true;
     });
 }

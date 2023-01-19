@@ -1,10 +1,10 @@
 #include "test.hpp"
 
-#include <realm/util/network.hpp>
-#include <realm/util/websocket.hpp>
+#include <realm/sync/network/network.hpp>
+#include <realm/sync/network/websocket.hpp>
 
 using namespace realm;
-using namespace realm::util;
+using namespace realm::sync;
 
 using WriteCompletionHandler = websocket::WriteCompletionHandler;
 using ReadCompletionHandler = websocket::ReadCompletionHandler;
@@ -103,7 +103,7 @@ private:
     {
         m_logger.trace("delim_not_found");
         m_reader_waiting = false;
-        m_handler(MiscExtErrors::delim_not_found, 0);
+        m_handler(util::MiscExtErrors::delim_not_found, 0);
     }
 };
 
@@ -298,7 +298,7 @@ public:
 TEST(WebSocket_Pipe)
 {
     {
-        PipeTest pipe_test{test_context.logger};
+        PipeTest pipe_test{*(test_context.logger)};
         std::string input_1 = "Hello World";
         pipe_test.write(input_1);
         pipe_test.read_plain(input_1.size());
@@ -345,7 +345,7 @@ TEST(WebSocket_Pipe)
 
 TEST(WebSocket_Messages)
 {
-    Fixture fixt{test_context.logger};
+    Fixture fixt{*(test_context.logger)};
     WSConfig& config_1 = fixt.config_1;
     WSConfig& config_2 = fixt.config_2;
 
@@ -407,7 +407,7 @@ TEST(WebSocket_Messages)
 
 TEST(WebSocket_Fragmented_Messages)
 {
-    Fixture fixt{test_context.logger};
+    Fixture fixt{*(test_context.logger)};
     WSConfig& config_1 = fixt.config_1;
     WSConfig& config_2 = fixt.config_2;
 
@@ -442,7 +442,7 @@ TEST(WebSocket_Fragmented_Messages)
 
 TEST(WebSocket_Interleaved_Fragmented_Messages)
 {
-    Fixture fixt{test_context.logger};
+    Fixture fixt{*(test_context.logger)};
     WSConfig& config_1 = fixt.config_1;
     WSConfig& config_2 = fixt.config_2;
 
