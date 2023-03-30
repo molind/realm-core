@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <realm/error_codes.h>
 
 #if defined(_WIN32) || defined(__CYGWIN__)
 
@@ -62,7 +63,7 @@ typedef struct realm_thread_safe_reference realm_thread_safe_reference_t;
 typedef void (*realm_free_userdata_func_t)(realm_userdata_t userdata);
 typedef realm_userdata_t (*realm_clone_userdata_func_t)(const realm_userdata_t userdata);
 typedef void (*realm_on_object_store_thread_callback_t)(realm_userdata_t userdata);
-typedef void (*realm_on_object_store_error_callback_t)(realm_userdata_t userdata, const char*);
+typedef bool (*realm_on_object_store_error_callback_t)(realm_userdata_t userdata, const char*);
 
 /* Accessor types */
 typedef struct realm_object realm_object_t;
@@ -94,6 +95,13 @@ typedef enum realm_schema_mode {
     RLM_SCHEMA_MODE_ADDITIVE_EXPLICIT,
     RLM_SCHEMA_MODE_MANUAL,
 } realm_schema_mode_e;
+
+typedef enum realm_schema_subset_mode {
+    RLM_SCHEMA_SUBSET_MODE_STRICT,
+    RLM_SCHEMA_SUBSET_MODE_ALL_CLASSES,
+    RLM_SCHEMA_SUBSET_MODE_ALL_PROPERTIES,
+    RLM_SCHEMA_SUBSET_MODE_COMPLETE
+} realm_schema_subset_mode_e;
 
 /* Key types */
 typedef uint32_t realm_class_key_t;
@@ -219,75 +227,16 @@ typedef struct realm_version_id {
 
 /* Error types */
 typedef struct realm_async_error realm_async_error_t;
-typedef enum realm_errno {
-    RLM_ERR_NONE = 0,
-    RLM_ERR_UNKNOWN,
-    RLM_ERR_OTHER_EXCEPTION,
-    RLM_ERR_OUT_OF_MEMORY,
-    RLM_ERR_NOT_CLONABLE,
-
-    RLM_ERR_NOT_IN_A_TRANSACTION,
-    RLM_ERR_WRONG_THREAD,
-
-    RLM_ERR_INVALIDATED_OBJECT,
-    RLM_ERR_INVALID_PROPERTY,
-    RLM_ERR_MISSING_PROPERTY_VALUE,
-    RLM_ERR_PROPERTY_TYPE_MISMATCH,
-    RLM_ERR_MISSING_PRIMARY_KEY,
-    RLM_ERR_UNEXPECTED_PRIMARY_KEY,
-    RLM_ERR_WRONG_PRIMARY_KEY_TYPE,
-    RLM_ERR_MODIFY_PRIMARY_KEY,
-    RLM_ERR_READ_ONLY_PROPERTY,
-    RLM_ERR_PROPERTY_NOT_NULLABLE,
-    RLM_ERR_INVALID_ARGUMENT,
-
-    RLM_ERR_LOGIC,
-    RLM_ERR_NO_SUCH_TABLE,
-    RLM_ERR_NO_SUCH_OBJECT,
-    RLM_ERR_CROSS_TABLE_LINK_TARGET,
-    RLM_ERR_UNSUPPORTED_FILE_FORMAT_VERSION,
-    RLM_ERR_MULTIPLE_SYNC_AGENTS,
-    RLM_ERR_ADDRESS_SPACE_EXHAUSTED,
-    RLM_ERR_MAXIMUM_FILE_SIZE_EXCEEDED,
-    RLM_ERR_OUT_OF_DISK_SPACE,
-    RLM_ERR_KEY_NOT_FOUND,
-    RLM_ERR_COLUMN_NOT_FOUND,
-    RLM_ERR_COLUMN_ALREADY_EXISTS,
-    RLM_ERR_KEY_ALREADY_USED,
-    RLM_ERR_SERIALIZATION_ERROR,
-    RLM_ERR_INVALID_PATH_ERROR,
-    RLM_ERR_DUPLICATE_PRIMARY_KEY_VALUE,
-
-    RLM_ERR_INDEX_OUT_OF_BOUNDS,
-
-    RLM_ERR_INVALID_QUERY_STRING,
-    RLM_ERR_INVALID_QUERY,
-
-    RLM_ERR_FILE_ACCESS_ERROR,
-    RLM_ERR_FILE_PERMISSION_DENIED,
-
-    RLM_ERR_DELETE_OPENED_REALM,
-    RLM_ERR_ILLEGAL_OPERATION,
-
-    RLM_ERR_CALLBACK = 1000000, /**< A user-provided callback failed. */
-} realm_errno_e;
-
-typedef enum realm_logic_error_kind {
-    RLM_LOGIC_ERR_NONE = 0,
-    RLM_LOGIC_ERR_STRING_TOO_BIG,
-    // ...
-} realm_logic_error_kind_e;
+typedef unsigned realm_error_categories;
 
 typedef struct realm_error {
     realm_errno_e error;
+    realm_error_categories categories;
     const char* message;
     // When error is RLM_ERR_CALLBACK this is an opaque pointer to an SDK-owned error object
     // thrown by user code inside a callback with realm_register_user_code_callback_error(), otherwise null.
     void* usercode_error;
-    union {
-        int code;
-        realm_logic_error_kind_e logic_error_kind;
-    } kind;
+    const char* path;
 } realm_error_t;
 
 /* Schema types */
@@ -370,11 +319,12 @@ typedef enum realm_property_flags {
 typedef struct realm_notification_token realm_notification_token_t;
 typedef struct realm_callback_token realm_callback_token_t;
 typedef struct realm_refresh_callback_token realm_refresh_callback_token_t;
-typedef struct realm_thread_observer_token realm_thread_observer_token_t;
 typedef struct realm_object_changes realm_object_changes_t;
 typedef struct realm_collection_changes realm_collection_changes_t;
+typedef struct realm_dictionary_changes realm_dictionary_changes_t;
 typedef void (*realm_on_object_change_func_t)(realm_userdata_t userdata, const realm_object_changes_t*);
 typedef void (*realm_on_collection_change_func_t)(realm_userdata_t userdata, const realm_collection_changes_t*);
+typedef void (*realm_on_dictionary_change_func_t)(realm_userdata_t userdata, const realm_dictionary_changes_t*);
 typedef void (*realm_on_realm_change_func_t)(realm_userdata_t userdata);
 typedef void (*realm_on_realm_refresh_func_t)(realm_userdata_t userdata);
 typedef void (*realm_async_begin_write_func_t)(realm_userdata_t userdata);
@@ -395,6 +345,46 @@ typedef bool (*realm_scheduler_is_same_as_func_t)(const realm_userdata_t schedul
                                                   const realm_userdata_t scheduler_userdata_2);
 typedef bool (*realm_scheduler_can_deliver_notifications_func_t)(realm_userdata_t userdata);
 typedef realm_scheduler_t* (*realm_scheduler_default_factory_func_t)(realm_userdata_t userdata);
+
+/* Sync Socket Provider types */
+typedef struct realm_websocket_endpoint {
+    const char* address;    // Host address
+    uint16_t port;          // Host port number
+    const char* path;       // Includes access token in query.
+    const char** protocols; // Array of one or more websocket protocols
+    size_t num_protocols;   // Number of protocols in array
+    bool is_ssl;            // true if SSL should be used
+} realm_websocket_endpoint_t;
+
+typedef struct realm_sync_socket realm_sync_socket_t;
+typedef struct realm_sync_socket_callback realm_sync_socket_callback_t;
+typedef void* realm_sync_socket_timer_t;
+typedef void* realm_sync_socket_websocket_t;
+typedef struct realm_websocket_observer realm_websocket_observer_t;
+
+typedef void (*realm_sync_socket_post_func_t)(realm_userdata_t userdata,
+                                              realm_sync_socket_callback_t* realm_callback);
+
+typedef realm_sync_socket_timer_t (*realm_sync_socket_create_timer_func_t)(
+    realm_userdata_t userdata, uint64_t delay_ms, realm_sync_socket_callback_t* realm_callback);
+
+typedef void (*realm_sync_socket_timer_canceled_func_t)(realm_userdata_t userdata,
+                                                        realm_sync_socket_timer_t timer_userdata);
+
+typedef void (*realm_sync_socket_timer_free_func_t)(realm_userdata_t userdata,
+                                                    realm_sync_socket_timer_t timer_userdata);
+
+typedef realm_sync_socket_websocket_t (*realm_sync_socket_connect_func_t)(
+    realm_userdata_t userdata, realm_websocket_endpoint_t endpoint,
+    realm_websocket_observer_t* realm_websocket_observer);
+
+typedef void (*realm_sync_socket_websocket_async_write_func_t)(realm_userdata_t userdata,
+                                                               realm_sync_socket_websocket_t websocket_userdata,
+                                                               const char* data, size_t size,
+                                                               realm_sync_socket_callback_t* realm_callback);
+
+typedef void (*realm_sync_socket_websocket_free_func_t)(realm_userdata_t userdata,
+                                                        realm_sync_socket_websocket_t websocket_userdata);
 
 /**
  * Get the VersionID of the current transaction.
@@ -562,6 +552,29 @@ RLM_API bool realm_equals(const void*, const void*);
  */
 RLM_API bool realm_is_frozen(const void*);
 
+/* Logging */
+// equivalent to realm::util::Logger::Level in util/logger.hpp and must be kept in sync.
+typedef enum realm_log_level {
+    RLM_LOG_LEVEL_ALL = 0,
+    RLM_LOG_LEVEL_TRACE = 1,
+    RLM_LOG_LEVEL_DEBUG = 2,
+    RLM_LOG_LEVEL_DETAIL = 3,
+    RLM_LOG_LEVEL_INFO = 4,
+    RLM_LOG_LEVEL_WARNING = 5,
+    RLM_LOG_LEVEL_ERROR = 6,
+    RLM_LOG_LEVEL_FATAL = 7,
+    RLM_LOG_LEVEL_OFF = 8,
+} realm_log_level_e;
+
+typedef void (*realm_log_func_t)(realm_userdata_t userdata, realm_log_level_e level, const char* message);
+
+/**
+ * Install the default logger
+ */
+RLM_API void realm_set_log_callback(realm_log_func_t, realm_log_level_e, realm_userdata_t userdata,
+                                    realm_free_userdata_func_t userdata_free) RLM_API_NOEXCEPT;
+RLM_API void realm_set_log_level(realm_log_level_e) RLM_API_NOEXCEPT;
+
 /**
  * Get a thread-safe reference representing the same underlying object as some
  * API object.
@@ -673,6 +686,20 @@ RLM_API realm_schema_mode_e realm_config_get_schema_mode(const realm_config_t*);
  * This function cannot fail.
  */
 RLM_API void realm_config_set_schema_mode(realm_config_t*, realm_schema_mode_e);
+
+/**
+ * Get the subset schema mode.
+ *
+ * This function cannot fail.
+ */
+RLM_API realm_schema_subset_mode_e realm_config_get_schema_subset_mode(const realm_config_t*);
+
+/**
+ * Set schema subset mode
+ *
+ * This function cannot fail
+ */
+RLM_API void realm_config_set_schema_subset_mode(realm_config_t*, realm_schema_subset_mode_e);
 
 /**
  * Set the migration callback.
@@ -1803,16 +1830,6 @@ RLM_API bool realm_list_clear(realm_list_t*);
 RLM_API bool realm_list_remove_all(realm_list_t*);
 
 /**
- * Replace the contents of a list with values.
- *
- * This is equivalent to calling `realm_list_clear()`, and then
- * `realm_list_insert()` repeatedly.
- *
- * @return True if no exception occurred.
- */
-RLM_API bool realm_list_assign(realm_list_t*, const realm_value_t* values, size_t num_values);
-
-/**
  * Subscribe to notifications for this object.
  *
  * @return A non-null pointer if no exception occurred.
@@ -1863,10 +1880,11 @@ RLM_API size_t realm_object_changes_get_modified_properties(const realm_object_c
  * @param out_num_insertions The number of insertions. May be NULL.
  * @param out_num_modifications The number of modifications. May be NULL.
  * @param out_num_moves The number of moved elements. May be NULL.
+ * @param out_collection_was_cleared a flag to signal if the collection has been cleared. May be NULL
  */
 RLM_API void realm_collection_changes_get_num_changes(const realm_collection_changes_t*, size_t* out_num_deletions,
                                                       size_t* out_num_insertions, size_t* out_num_modifications,
-                                                      size_t* out_num_moves);
+                                                      size_t* out_num_moves, bool* out_collection_was_cleared);
 
 /**
  * Get the number of various types of changes in a collection notification,
@@ -1884,7 +1902,6 @@ RLM_API void realm_collection_changes_get_num_ranges(const realm_collection_chan
                                                      size_t* out_num_deletion_ranges,
                                                      size_t* out_num_insertion_ranges,
                                                      size_t* out_num_modification_ranges, size_t* out_num_moves);
-
 typedef struct realm_collection_move {
     size_t from;
     size_t to;
@@ -1940,6 +1957,35 @@ RLM_API void realm_collection_changes_get_ranges(
     realm_index_range_t* out_modification_ranges, size_t max_modification_ranges,
     realm_index_range_t* out_modification_ranges_after, size_t max_modification_ranges_after,
     realm_collection_move_t* out_moves, size_t max_moves);
+
+/**
+ * Returns the number of changes occured to the dictionary passed as argument
+ *
+ * @param changes valid ptr to the dictionary changes structure
+ * @param out_deletions_size number of deletions
+ * @param out_insertion_size number of insertions
+ * @param out_modification_size number of modifications
+ */
+RLM_API void realm_dictionary_get_changes(const realm_dictionary_changes_t* changes, size_t* out_deletions_size,
+                                          size_t* out_insertion_size, size_t* out_modification_size);
+
+/**
+ * Returns the list of keys changed for the dictionary passed as argument.
+ * The user must assure that there is enough memory to accomodate all the keys
+ * calling `realm_dictionary_get_changes` before.
+ *
+ * @param changes valid ptr to the dictionary changes structure
+ * @param deletions list of deleted keys
+ * @param deletions_size size of the list of deleted keys
+ * @param insertions list of inserted keys
+ * @param insertions_size size of the list of inserted keys
+ * @param modifications list of modified keys
+ * @param modification_size size of the list of modified keys
+ */
+RLM_API void realm_dictionary_get_changed_keys(const realm_dictionary_changes_t* changes, realm_value_t* deletions,
+                                               size_t* deletions_size, realm_value_t* insertions,
+                                               size_t* insertions_size, realm_value_t* modifications,
+                                               size_t* modification_size);
 
 /**
  * Get a set instance for the property of an object.
@@ -2075,18 +2121,6 @@ RLM_API bool realm_set_clear(realm_set_t*);
  * @return True if no exception occurred.
  */
 RLM_API bool realm_set_remove_all(realm_set_t*);
-
-/**
- * Replace the contents of a set with values.
- *
- * The provided values may contain duplicates, in which case the size of the set
- * after calling this function will be less than @a num_values.
- *
- * @param values The list of values to insert.
- * @param num_values The number of elements.
- * @return True if no exception occurred.
- */
-RLM_API bool realm_set_assign(realm_set_t*, const realm_value_t* values, size_t num_values);
 
 /**
  * Subscribe to notifications for this object.
@@ -2236,25 +2270,39 @@ RLM_API realm_object_t* realm_dictionary_get_linked_object(realm_dictionary_t*, 
 RLM_API bool realm_dictionary_erase(realm_dictionary_t*, realm_value_t key, bool* out_erased);
 
 /**
+ * Return the list of keys stored in the dictionary
+ *
+ * @param out_size number of keys
+ * @param out_keys the list of keys in the dictionary, the memory has to be released once it is no longer used.
+ * @return True if no exception occurred.
+ */
+RLM_API bool realm_dictionary_get_keys(realm_dictionary_t*, size_t* out_size, realm_results_t** out_keys);
+
+/**
+ * Check if the dictionary contains a certain key
+ *
+ * @param key to search in the dictionary
+ * @param found True if the such key exists
+ * @return True if no exception occured
+ */
+RLM_API bool realm_dictionary_contains_key(const realm_dictionary_t*, realm_value_t key, bool* found);
+
+/**
+ * Check if the dictionary contains a certain value
+ *
+ * @param value to search in the dictionary
+ * @param index the index of the value in the dictionry if such value exists
+ * @return True if no exception occured
+ */
+RLM_API bool realm_dictionary_contains_value(const realm_dictionary_t*, realm_value_t value, size_t* index);
+
+
+/**
  * Clear a dictionary.
  *
  * @return True if no exception occurred.
  */
 RLM_API bool realm_dictionary_clear(realm_dictionary_t*);
-
-/**
- * Replace the contents of a dictionary with key/value pairs.
- *
- * The provided keys may contain duplicates, in which case the size of the
- * dictionary after calling this function will be less than @a num_pairs.
- *
- * @param keys An array of keys of length @a num_pairs.
- * @param values An array of values of length @a num_pairs.
- * @param num_pairs The number of key-value pairs to assign.
- * @return True if no exception occurred.
- */
-RLM_API bool realm_dictionary_assign(realm_dictionary_t*, size_t num_pairs, const realm_value_t* keys,
-                                     const realm_value_t* values);
 
 /**
  * Subscribe to notifications for this object.
@@ -2264,7 +2312,7 @@ RLM_API bool realm_dictionary_assign(realm_dictionary_t*, size_t num_pairs, cons
 RLM_API realm_notification_token_t*
 realm_dictionary_add_notification_callback(realm_dictionary_t*, realm_userdata_t userdata,
                                            realm_free_userdata_func_t userdata_free, realm_key_path_array_t*,
-                                           realm_on_collection_change_func_t on_change);
+                                           realm_on_dictionary_change_func_t on_change);
 
 /**
  * Get an dictionary from a thread-safe reference, potentially originating in a
@@ -2430,6 +2478,12 @@ RLM_API realm_results_t* realm_get_backlinks(realm_object_t* object, realm_class
  * Delete all objects matched by a query.
  */
 RLM_API bool realm_query_delete_all(const realm_query_t*);
+
+/**
+ * Set the boolean passed as argument to true or false whether the realm_results passed is valid or not
+ * @return true/false if no exception has occured.
+ */
+RLM_API bool realm_results_is_valid(const realm_results_t*, bool*);
 
 /**
  * Count the number of results.
@@ -2607,22 +2661,6 @@ RLM_API realm_notification_token_t* realm_results_add_notification_callback(real
  */
 RLM_API realm_results_t* realm_results_from_thread_safe_reference(const realm_t*, realm_thread_safe_reference_t*);
 
-/* Logging */
-// equivalent to realm::util::Logger::Level in util/logger.hpp and must be kept in sync.
-typedef enum realm_log_level {
-    RLM_LOG_LEVEL_ALL = 0,
-    RLM_LOG_LEVEL_TRACE = 1,
-    RLM_LOG_LEVEL_DEBUG = 2,
-    RLM_LOG_LEVEL_DETAIL = 3,
-    RLM_LOG_LEVEL_INFO = 4,
-    RLM_LOG_LEVEL_WARNING = 5,
-    RLM_LOG_LEVEL_ERROR = 6,
-    RLM_LOG_LEVEL_FATAL = 7,
-    RLM_LOG_LEVEL_OFF = 8,
-} realm_log_level_e;
-
-typedef void (*realm_log_func_t)(realm_userdata_t userdata, realm_log_level_e level, const char* message);
-
 /* HTTP transport */
 typedef enum realm_http_request_method {
     RLM_HTTP_REQUEST_METHOD_GET,
@@ -2697,102 +2735,6 @@ typedef enum realm_user_state {
     RLM_USER_STATE_REMOVED
 } realm_user_state_e;
 
-/**
- * Possible error categories the realm_app_error_t error code can fall in.
- */
-typedef enum realm_app_error_category {
-    /**
-     * Error category for HTTP-related errors. The error code value can be interpreted as a HTTP status code.
-     */
-    RLM_APP_ERROR_CATEGORY_HTTP,
-    /**
-     * JSON response parsing related errors. The error code is a member of realm_app_errno_json_e.
-     */
-    RLM_APP_ERROR_CATEGORY_JSON,
-    /**
-     * Client-side related errors. The error code is a member of realm_app_errno_client_e.
-     */
-    RLM_APP_ERROR_CATEGORY_CLIENT,
-    /**
-     * Errors reported by the backend. The error code is a member of realm_app_errno_service_e.
-     */
-    RLM_APP_ERROR_CATEGORY_SERVICE,
-    /**
-     * Custom error code was set in realm_http_response_t.custom_status_code.
-     * The error code is the custom_status_code value.
-     */
-    RLM_APP_ERROR_CATEGORY_CUSTOM,
-} realm_app_error_category_e;
-
-typedef enum realm_app_errno_json {
-    RLM_APP_ERR_JSON_BAD_TOKEN = 1,
-    RLM_APP_ERR_JSON_MALFORMED_JSON = 2,
-    RLM_APP_ERR_JSON_MISSING_JSON_KEY = 3,
-    RLM_APP_ERR_JSON_BAD_BSON_PARSE = 4
-} realm_app_errno_json_e;
-
-typedef enum realm_app_errno_client {
-    RLM_APP_ERR_CLIENT_USER_NOT_FOUND = 1,
-    RLM_APP_ERR_CLIENT_USER_NOT_LOGGED_IN = 2,
-    RLM_APP_ERR_CLIENT_APP_DEALLOCATED = 3
-} realm_app_errno_client_e;
-
-typedef enum realm_app_errno_service {
-    RLM_APP_ERR_SERVICE_MISSING_AUTH_REQ = 1,
-    RLM_APP_ERR_SERVICE_INVALID_SESSION = 2,
-    RLM_APP_ERR_SERVICE_USER_APP_DOMAIN_MISMATCH = 3,
-    RLM_APP_ERR_SERVICE_DOMAIN_NOT_ALLOWED = 4,
-    RLM_APP_ERR_SERVICE_READ_SIZE_LIMIT_EXCEEDED = 5,
-    RLM_APP_ERR_SERVICE_INVALID_PARAMETER = 6,
-    RLM_APP_ERR_SERVICE_MISSING_PARAMETER = 7,
-    RLM_APP_ERR_SERVICE_TWILIO_ERROR = 8,
-    RLM_APP_ERR_SERVICE_GCM_ERROR = 9,
-    RLM_APP_ERR_SERVICE_HTTP_ERROR = 10,
-    RLM_APP_ERR_SERVICE_AWS_ERROR = 11,
-    RLM_APP_ERR_SERVICE_MONGODB_ERROR = 12,
-    RLM_APP_ERR_SERVICE_ARGUMENTS_NOT_ALLOWED = 13,
-    RLM_APP_ERR_SERVICE_FUNCTION_EXECUTION_ERROR = 14,
-    RLM_APP_ERR_SERVICE_NO_MATCHING_RULE_FOUND = 15,
-    RLM_APP_ERR_SERVICE_INTERNAL_SERVER_ERROR = 16,
-    RLM_APP_ERR_SERVICE_AUTH_PROVIDER_NOT_FOUND = 17,
-    RLM_APP_ERR_SERVICE_AUTH_PROVIDER_ALREADY_EXISTS = 18,
-    RLM_APP_ERR_SERVICE_SERVICE_NOT_FOUND = 19,
-    RLM_APP_ERR_SERVICE_SERVICE_TYPE_NOT_FOUND = 20,
-    RLM_APP_ERR_SERVICE_SERVICE_ALREADY_EXISTS = 21,
-    RLM_APP_ERR_SERVICE_SERVICE_COMMAND_NOT_FOUND = 22,
-    RLM_APP_ERR_SERVICE_VALUE_NOT_FOUND = 23,
-    RLM_APP_ERR_SERVICE_VALUE_ALREADY_EXISTS = 24,
-    RLM_APP_ERR_SERVICE_VALUE_DUPLICATE_NAME = 25,
-    RLM_APP_ERR_SERVICE_FUNCTION_NOT_FOUND = 26,
-    RLM_APP_ERR_SERVICE_FUNCTION_ALREADY_EXISTS = 27,
-    RLM_APP_ERR_SERVICE_FUNCTION_DUPLICATE_NAME = 28,
-    RLM_APP_ERR_SERVICE_FUNCTION_SYNTAX_ERROR = 29,
-    RLM_APP_ERR_SERVICE_FUNCTION_INVALID = 30,
-    RLM_APP_ERR_SERVICE_INCOMING_WEBHOOK_NOT_FOUND = 31,
-    RLM_APP_ERR_SERVICE_INCOMING_WEBHOOK_ALREADY_EXISTS = 32,
-    RLM_APP_ERR_SERVICE_INCOMING_WEBHOOK_DUPLICATE_NAME = 33,
-    RLM_APP_ERR_SERVICE_RULE_NOT_FOUND = 34,
-    RLM_APP_ERR_SERVICE_API_KEY_NOT_FOUND = 35,
-    RLM_APP_ERR_SERVICE_RULE_ALREADY_EXISTS = 36,
-    RLM_APP_ERR_SERVICE_RULE_DUPLICATE_NAME = 37,
-    RLM_APP_ERR_SERVICE_AUTH_PROVIDER_DUPLICATE_NAME = 38,
-    RLM_APP_ERR_SERVICE_RESTRICTED_HOST = 39,
-    RLM_APP_ERR_SERVICE_API_KEY_ALREADY_EXISTS = 40,
-    RLM_APP_ERR_SERVICE_INCOMING_WEBHOOK_AUTH_FAILED = 41,
-    RLM_APP_ERR_SERVICE_EXECUTION_TIME_LIMIT_EXCEEDED = 42,
-    RLM_APP_ERR_SERVICE_NOT_CALLABLE = 43,
-    RLM_APP_ERR_SERVICE_USER_ALREADY_CONFIRMED = 44,
-    RLM_APP_ERR_SERVICE_USER_NOT_FOUND = 45,
-    RLM_APP_ERR_SERVICE_USER_DISABLED = 46,
-    RLM_APP_ERR_SERVICE_AUTH_ERROR = 47,
-    RLM_APP_ERR_SERVICE_BAD_REQUEST = 48,
-    RLM_APP_ERR_SERVICE_ACCOUNT_NAME_IN_USE = 49,
-    RLM_APP_ERR_SERVICE_INVALID_EMAIL_PASSWORD = 50,
-
-    RLM_APP_ERR_SERVICE_UNKNOWN = -1,
-    RLM_APP_ERR_SERVICE_NONE = 0
-} realm_app_errno_service_e;
-
 typedef enum realm_auth_provider {
     RLM_AUTH_PROVIDER_ANONYMOUS,
     RLM_AUTH_PROVIDER_ANONYMOUS_NO_REUSE,
@@ -2818,16 +2760,15 @@ typedef struct realm_app_user_apikey {
 // Pointers to this struct and its pointer members are only valid inside the scope
 // of the callback they were passed to.
 typedef struct realm_app_error {
-    realm_app_error_category_e error_category;
-    int error_code;
+    realm_errno_e error;
+    realm_error_categories categories;
+    const char* message;
 
     /**
      * The underlying HTTP status code returned by the server,
      * otherwise zero.
      */
     int http_status_code;
-
-    const char* message;
 
     /**
      * A link to MongoDB Realm server logs related to the error,
@@ -3391,6 +3332,7 @@ typedef enum realm_sync_session_state {
     RLM_SYNC_SESSION_STATE_DYING,
     RLM_SYNC_SESSION_STATE_INACTIVE,
     RLM_SYNC_SESSION_STATE_WAITING_FOR_ACCESS_TOKEN,
+    RLM_SYNC_SESSION_STATE_PAUSED,
 } realm_sync_session_state_e;
 
 typedef enum realm_sync_connection_state {
@@ -3411,7 +3353,7 @@ typedef enum realm_sync_error_category {
     RLM_SYNC_ERROR_CATEGORY_CLIENT,
     RLM_SYNC_ERROR_CATEGORY_CONNECTION,
     RLM_SYNC_ERROR_CATEGORY_SESSION,
-    RLM_SYNC_ERROR_CATEGORY_RESOLVE,
+    RLM_SYNC_ERROR_CATEGORY_WEBSOCKET,
 
     /**
      * System error - POSIX errno, Win32 HRESULT, etc.
@@ -3424,92 +3366,6 @@ typedef enum realm_sync_error_category {
     RLM_SYNC_ERROR_CATEGORY_UNKNOWN,
 } realm_sync_error_category_e;
 
-typedef enum realm_sync_errno_client {
-    RLM_SYNC_ERR_CLIENT_CONNECTION_CLOSED = 100,
-    RLM_SYNC_ERR_CLIENT_UNKNOWN_MESSAGE = 101,
-    RLM_SYNC_ERR_CLIENT_BAD_SYNTAX = 102,
-    RLM_SYNC_ERR_CLIENT_LIMITS_EXCEEDED = 103,
-    RLM_SYNC_ERR_CLIENT_BAD_SESSION_IDENT = 104,
-    RLM_SYNC_ERR_CLIENT_BAD_MESSAGE_ORDER = 105,
-    RLM_SYNC_ERR_CLIENT_BAD_CLIENT_FILE_IDENT = 106,
-    RLM_SYNC_ERR_CLIENT_BAD_PROGRESS = 107,
-    RLM_SYNC_ERR_CLIENT_BAD_CHANGESET_HEADER_SYNTAX = 108,
-    RLM_SYNC_ERR_CLIENT_BAD_CHANGESET_SIZE = 109,
-    RLM_SYNC_ERR_CLIENT_BAD_ORIGIN_FILE_IDENT = 110,
-    RLM_SYNC_ERR_CLIENT_BAD_SERVER_VERSION = 111,
-    RLM_SYNC_ERR_CLIENT_BAD_CHANGESET = 112,
-    RLM_SYNC_ERR_CLIENT_BAD_REQUEST_IDENT = 113,
-    RLM_SYNC_ERR_CLIENT_BAD_ERROR_CODE = 114,
-    RLM_SYNC_ERR_CLIENT_BAD_COMPRESSION = 115,
-    RLM_SYNC_ERR_CLIENT_BAD_CLIENT_VERSION = 116,
-    RLM_SYNC_ERR_CLIENT_SSL_SERVER_CERT_REJECTED = 117,
-    RLM_SYNC_ERR_CLIENT_PONG_TIMEOUT = 118,
-    RLM_SYNC_ERR_CLIENT_BAD_CLIENT_FILE_IDENT_SALT = 119,
-    RLM_SYNC_ERR_CLIENT_BAD_FILE_IDENT = 120,
-    RLM_SYNC_ERR_CLIENT_CONNECT_TIMEOUT = 121,
-    RLM_SYNC_ERR_CLIENT_BAD_TIMESTAMP = 122,
-    RLM_SYNC_ERR_CLIENT_BAD_PROTOCOL_FROM_SERVER = 123,
-    RLM_SYNC_ERR_CLIENT_CLIENT_TOO_OLD_FOR_SERVER = 124,
-    RLM_SYNC_ERR_CLIENT_CLIENT_TOO_NEW_FOR_SERVER = 125,
-    RLM_SYNC_ERR_CLIENT_PROTOCOL_MISMATCH = 126,
-    RLM_SYNC_ERR_CLIENT_BAD_STATE_MESSAGE = 127,
-    RLM_SYNC_ERR_CLIENT_MISSING_PROTOCOL_FEATURE = 128,
-    RLM_SYNC_ERR_CLIENT_HTTP_TUNNEL_FAILED = 131,
-    RLM_SYNC_ERR_CLIENT_AUTO_CLIENT_RESET_FAILURE = 132,
-} realm_sync_errno_client_e;
-
-typedef enum realm_sync_errno_connection {
-    RLM_SYNC_ERR_CONNECTION_CONNECTION_CLOSED = 100,
-    RLM_SYNC_ERR_CONNECTION_OTHER_ERROR = 101,
-    RLM_SYNC_ERR_CONNECTION_UNKNOWN_MESSAGE = 102,
-    RLM_SYNC_ERR_CONNECTION_BAD_SYNTAX = 103,
-    RLM_SYNC_ERR_CONNECTION_LIMITS_EXCEEDED = 104,
-    RLM_SYNC_ERR_CONNECTION_WRONG_PROTOCOL_VERSION = 105,
-    RLM_SYNC_ERR_CONNECTION_BAD_SESSION_IDENT = 106,
-    RLM_SYNC_ERR_CONNECTION_REUSE_OF_SESSION_IDENT = 107,
-    RLM_SYNC_ERR_CONNECTION_BOUND_IN_OTHER_SESSION = 108,
-    RLM_SYNC_ERR_CONNECTION_BAD_MESSAGE_ORDER = 109,
-    RLM_SYNC_ERR_CONNECTION_BAD_DECOMPRESSION = 110,
-    RLM_SYNC_ERR_CONNECTION_BAD_CHANGESET_HEADER_SYNTAX = 111,
-    RLM_SYNC_ERR_CONNECTION_BAD_CHANGESET_SIZE = 112,
-    RLM_SYNC_ERR_CONNECTION_SWITCH_TO_FLX_SYNC = 113,
-    RLM_SYNC_ERR_CONNECTION_SWITCH_TO_PBS = 114,
-} realm_sync_errno_connection_e;
-
-typedef enum realm_sync_errno_session {
-    RLM_SYNC_ERR_SESSION_SESSION_CLOSED = 200,
-    RLM_SYNC_ERR_SESSION_OTHER_SESSION_ERROR = 201,
-    RLM_SYNC_ERR_SESSION_TOKEN_EXPIRED = 202,
-    RLM_SYNC_ERR_SESSION_BAD_AUTHENTICATION = 203,
-    RLM_SYNC_ERR_SESSION_ILLEGAL_REALM_PATH = 204,
-    RLM_SYNC_ERR_SESSION_NO_SUCH_REALM = 205,
-    RLM_SYNC_ERR_SESSION_PERMISSION_DENIED = 206,
-    RLM_SYNC_ERR_SESSION_BAD_SERVER_FILE_IDENT = 207,
-    RLM_SYNC_ERR_SESSION_BAD_CLIENT_FILE_IDENT = 208,
-    RLM_SYNC_ERR_SESSION_BAD_SERVER_VERSION = 209,
-    RLM_SYNC_ERR_SESSION_BAD_CLIENT_VERSION = 210,
-    RLM_SYNC_ERR_SESSION_DIVERGING_HISTORIES = 211,
-    RLM_SYNC_ERR_SESSION_BAD_CHANGESET = 212,
-    RLM_SYNC_ERR_SESSION_PARTIAL_SYNC_DISABLED = 214,
-    RLM_SYNC_ERR_SESSION_UNSUPPORTED_SESSION_FEATURE = 215,
-    RLM_SYNC_ERR_SESSION_BAD_ORIGIN_FILE_IDENT = 216,
-    RLM_SYNC_ERR_SESSION_BAD_CLIENT_FILE = 217,
-    RLM_SYNC_ERR_SESSION_SERVER_FILE_DELETED = 218,
-    RLM_SYNC_ERR_SESSION_CLIENT_FILE_BLACKLISTED = 219,
-    RLM_SYNC_ERR_SESSION_USER_BLACKLISTED = 220,
-    RLM_SYNC_ERR_SESSION_TRANSACT_BEFORE_UPLOAD = 221,
-    RLM_SYNC_ERR_SESSION_CLIENT_FILE_EXPIRED = 222,
-    RLM_SYNC_ERR_SESSION_USER_MISMATCH = 223,
-    RLM_SYNC_ERR_SESSION_TOO_MANY_SESSIONS = 224,
-    RLM_SYNC_ERR_SESSION_INVALID_SCHEMA_CHANGE = 225,
-    RLM_SYNC_ERR_SESSION_BAD_QUERY = 226,
-    RLM_SYNC_ERR_SESSION_OBJECT_ALREADY_EXISTS = 227,
-    RLM_SYNC_ERR_SESSION_SERVER_PERMISSIONS_CHANGED = 228,
-    RLM_SYNC_ERR_SESSION_INITIAL_SYNC_NOT_COMPLETED = 229,
-    RLM_SYNC_ERR_SESSION_WRITE_NOT_ALLOWED = 230,
-    RLM_SYNC_ERR_SESSION_COMPENSATING_WRITE = 231,
-} realm_sync_errno_session_e;
-
 typedef enum realm_sync_error_action {
     RLM_SYNC_ERROR_ACTION_NO_ACTION,
     RLM_SYNC_ERROR_ACTION_PROTOCOL_VIOLATION,
@@ -3519,6 +3375,8 @@ typedef enum realm_sync_error_action {
     RLM_SYNC_ERROR_ACTION_DELETE_REALM,
     RLM_SYNC_ERROR_ACTION_CLIENT_RESET,
     RLM_SYNC_ERROR_ACTION_CLIENT_RESET_NO_RECOVERY,
+    RLM_SYNC_ERROR_ACTION_MIGRATE_TO_FLX,
+    RLM_SYNC_ERROR_ACTION_REVERT_TO_PBS,
 } realm_sync_error_action_e;
 
 typedef struct realm_sync_session realm_sync_session_t;
@@ -3532,6 +3390,7 @@ typedef struct realm_sync_error_code {
     realm_sync_error_category_e category;
     int value;
     const char* message;
+    const char* category_name;
 } realm_sync_error_code_t;
 
 typedef struct realm_sync_error_user_info {
@@ -3631,10 +3490,6 @@ RLM_API void realm_sync_client_config_set_metadata_mode(realm_sync_client_config
                                                         realm_sync_client_metadata_mode_e) RLM_API_NOEXCEPT;
 RLM_API void realm_sync_client_config_set_metadata_encryption_key(realm_sync_client_config_t*,
                                                                   const uint8_t[64]) RLM_API_NOEXCEPT;
-RLM_API void realm_sync_client_config_set_log_callback(realm_sync_client_config_t*, realm_log_func_t,
-                                                       realm_userdata_t userdata,
-                                                       realm_free_userdata_func_t userdata_free) RLM_API_NOEXCEPT;
-RLM_API void realm_sync_client_config_set_log_level(realm_sync_client_config_t*, realm_log_level_e) RLM_API_NOEXCEPT;
 RLM_API void realm_sync_client_config_set_reconnect_mode(realm_sync_client_config_t*,
                                                          realm_sync_client_reconnect_mode_e) RLM_API_NOEXCEPT;
 RLM_API void realm_sync_client_config_set_multiplex_sessions(realm_sync_client_config_t*, bool) RLM_API_NOEXCEPT;
@@ -3651,6 +3506,12 @@ RLM_API void realm_sync_client_config_set_pong_keepalive_timeout(realm_sync_clie
                                                                  uint64_t) RLM_API_NOEXCEPT;
 RLM_API void realm_sync_client_config_set_fast_reconnect_limit(realm_sync_client_config_t*,
                                                                uint64_t) RLM_API_NOEXCEPT;
+RLM_API void realm_sync_client_config_set_sync_socket(realm_sync_client_config_t*,
+                                                      realm_sync_socket_t*) RLM_API_NOEXCEPT;
+RLM_API void realm_sync_client_config_set_default_binding_thread_observer(
+    realm_sync_client_config_t* config, realm_on_object_store_thread_callback_t on_thread_create,
+    realm_on_object_store_thread_callback_t on_thread_destroy, realm_on_object_store_error_callback_t on_error,
+    realm_userdata_t user_data, realm_free_userdata_func_t free_userdata);
 
 RLM_API realm_sync_config_t* realm_sync_config_new(const realm_user_t*, const char* partition_value) RLM_API_NOEXCEPT;
 RLM_API realm_sync_config_t* realm_flx_sync_config_new(const realm_user_t*) RLM_API_NOEXCEPT;
@@ -4022,20 +3883,6 @@ RLM_API void realm_sync_session_handle_error_for_testing(const realm_sync_sessio
  */
 RLM_API void realm_register_user_code_callback_error(realm_userdata_t usercode_error) RLM_API_NOEXCEPT;
 
-/**
- * Register a callback handler for bindings interested in registering callbacks before/after the ObjectStore thread
- * runs.
- * @param on_thread_create callback invoked when the object store thread is created
- * @param on_thread_destroy callback invoked when the object store thread is destroyed
- * @param on_error callback invoked to signal to the listener that some error has occured.
- * @return a token that has to be released in order to stop receiving notifications
- */
-RLM_API realm_thread_observer_token_t*
-realm_set_binding_callback_thread_observer(realm_on_object_store_thread_callback_t on_thread_create,
-                                           realm_on_object_store_thread_callback_t on_thread_destroy,
-                                           realm_on_object_store_error_callback_t on_error, realm_userdata_t,
-                                           realm_free_userdata_func_t free_userdata);
-
 typedef struct realm_mongodb_collection realm_mongodb_collection_t;
 
 typedef struct realm_mongodb_find_options {
@@ -4254,5 +4101,26 @@ RLM_API bool realm_mongo_collection_find_one_and_delete(realm_mongodb_collection
                                                         realm_userdata_t data, realm_free_userdata_func_t delete_data,
                                                         realm_mongodb_callback_t callback);
 
+RLM_API realm_sync_socket_t* realm_sync_socket_new(
+    realm_userdata_t userdata, realm_free_userdata_func_t userdata_free, realm_sync_socket_post_func_t post_func,
+    realm_sync_socket_create_timer_func_t create_timer_func,
+    realm_sync_socket_timer_canceled_func_t cancel_timer_func, realm_sync_socket_timer_free_func_t free_timer_func,
+    realm_sync_socket_connect_func_t websocket_connect_func,
+    realm_sync_socket_websocket_async_write_func_t websocket_write_func,
+    realm_sync_socket_websocket_free_func_t websocket_free_func);
+
+RLM_API void realm_sync_socket_callback_complete(realm_sync_socket_callback_t* realm_callback,
+                                                 realm_web_socket_errno_e status, const char* reason);
+
+RLM_API void realm_sync_socket_websocket_connected(realm_websocket_observer_t* realm_websocket_observer,
+                                                   const char* protocol);
+
+RLM_API void realm_sync_socket_websocket_error(realm_websocket_observer_t* realm_websocket_observer);
+
+RLM_API void realm_sync_socket_websocket_message(realm_websocket_observer_t* realm_websocket_observer,
+                                                 const char* data, size_t data_size);
+
+RLM_API void realm_sync_socket_websocket_closed(realm_websocket_observer_t* realm_websocket_observer, bool was_clean,
+                                                realm_web_socket_errno_e status, const char* reason);
 
 #endif // REALM_H

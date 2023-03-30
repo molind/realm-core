@@ -1070,13 +1070,15 @@ private:
 
 class SyncConnection : public websocket::Config {
 public:
-    util::PrefixLogger logger;
+    const std::shared_ptr<util::Logger> logger_ptr;
+    util::Logger& logger;
 
     SyncConnection(ServerImpl& serv, std::int_fast64_t id, std::unique_ptr<network::Socket>&& socket,
                    std::unique_ptr<network::ssl::Stream>&& ssl_stream,
                    std::unique_ptr<network::ReadAheadBuffer>&& read_ahead_buffer, int client_protocol_version,
                    std::string client_user_agent, AccessToken access_token, std::string remote_endpoint)
-        : logger{make_logger_prefix(id), serv.logger} // Throws
+        : logger_ptr{std::make_shared<util::PrefixLogger>(make_logger_prefix(id), serv.logger_ptr)} // Throws
+        , logger{*logger_ptr}
         , m_server{serv}
         , m_id{id}
         , m_socket{std::move(socket)}
@@ -1129,9 +1131,9 @@ public:
         return m_remote_endpoint;
     }
 
-    util::Logger& websocket_get_logger() noexcept final
+    const std::shared_ptr<util::Logger>& websocket_get_logger() noexcept final
     {
-        return logger;
+        return logger_ptr;
     }
 
     std::mt19937_64& websocket_get_random() noexcept final override
@@ -1438,15 +1440,17 @@ std::string g_user_agent = "User-Agent";
 
 class HTTPConnection {
 public:
-    util::PrefixLogger logger;
+    const std::shared_ptr<Logger> logger_ptr;
+    util::Logger& logger;
 
     HTTPConnection(ServerImpl& serv, int_fast64_t id, bool is_ssl)
-        : logger{make_logger_prefix(id), serv.logger} // Throws
+        : logger_ptr{std::make_shared<PrefixLogger>(make_logger_prefix(id), serv.logger_ptr)} // Throws
+        , logger{*logger_ptr}
         , m_server{serv}
         , m_id{id}
         , m_socket{new network::Socket{serv.get_service()}} // Throws
         , m_read_ahead_buffer{new network::ReadAheadBuffer} // Throws
-        , m_http_server{*this, logger}
+        , m_http_server{*this, logger_ptr}
     {
         // Make the output buffer stream throw std::bad_alloc if it fails to
         // expand the buffer
@@ -1820,16 +1824,16 @@ private:
             websocket::make_http_response(request, sec_websocket_protocol_2, ec); // Throws
 
         if (ec) {
-            if (ec == websocket::Error::bad_request_header_upgrade) {
+            if (ec == websocket::HttpError::bad_request_header_upgrade) {
                 logger.error("There must be a header of the form 'Upgrade: websocket'");
             }
-            else if (ec == websocket::Error::bad_request_header_connection) {
+            else if (ec == websocket::HttpError::bad_request_header_connection) {
                 logger.error("There must be a header of the form 'Connection: Upgrade'");
             }
-            else if (ec == websocket::Error::bad_request_header_websocket_version) {
+            else if (ec == websocket::HttpError::bad_request_header_websocket_version) {
                 logger.error("There must be a header of the form 'Sec-WebSocket-Version: 13'");
             }
-            else if (ec == websocket::Error::bad_request_header_websocket_key) {
+            else if (ec == websocket::HttpError::bad_request_header_websocket_key) {
                 logger.error("The header Sec-WebSocket-Key is missing");
             }
 
@@ -1852,13 +1856,13 @@ private:
                 start += bearer.length();
                 token = auth_header.substr(start, auth_header.length() - start);
             }
-        } 
+        }
         if (token.length() == 0) { // Check baas_at param. Used by iOS
             auto paramName = std::string_view("baas_at=");
             auto start = request.path.find(paramName);
             if (start != std::string::npos) {
                 start += paramName.length();
-        
+
                 auto end = request.path.find('&', start);
                 if (end == std::string::npos) {
                     end = request.path.length();
@@ -1870,7 +1874,7 @@ private:
 
         if (token.length() == 0) {
             logger.error("Missing Authorization header and baas_at param");
-            close_due_to_error(websocket::Error::bad_response_401_unauthorized);
+            close_due_to_error(websocket::HttpError::bad_response_401_unauthorized);
             return;
         }
 
@@ -1880,7 +1884,7 @@ private:
 
         if (error != AccessToken::ParseError::none && !access_token) {
             logger.error("Invalid token");
-            close_due_to_error(websocket::Error::bad_response_401_unauthorized);
+            close_due_to_error(websocket::HttpError::bad_response_401_unauthorized);
             return;
         }
 
@@ -1894,9 +1898,9 @@ private:
                 user_agent = i->second; // Throws (copy)
         }
 
-        auto handler = [negotiated_protocol_version, 
-                        user_agent = std::move(user_agent), 
-                        access_token = std::move(*access_token), 
+        auto handler = [negotiated_protocol_version,
+                        user_agent = std::move(user_agent),
+                        access_token = std::move(*access_token),
                         this](std::error_code ec) {
             // If the operation is aborted, the socket object may have been destroyed.
             if (ec != util::error::operation_aborted) {
@@ -2098,7 +2102,7 @@ public:
     util::PrefixLogger logger;
 
     Session(SyncConnection& conn, session_ident_type session_ident)
-        : logger{make_logger_prefix(session_ident), conn.logger} // Throws
+        : logger{make_logger_prefix(session_ident), conn.logger_ptr} // Throws
         , m_connection{conn}
         , m_session_ident{session_ident}
     {
@@ -3206,7 +3210,7 @@ void SessionQueue::clear() noexcept
 
 ServerFile::ServerFile(ServerImpl& server, ServerFileAccessCache& cache, const std::string& virt_path,
                        std::string real_path, bool disable_sync_to_disk)
-    : logger{"ServerFile[" + virt_path + "]: ", server.logger}               // Throws
+    : logger{"ServerFile[" + virt_path + "]: ", server.logger_ptr}           // Throws
     , wlogger{"ServerFile[" + virt_path + "]: ", server.get_worker().logger} // Throws
     , m_server{server}
     , m_file{cache, real_path, virt_path, false, disable_sync_to_disk} // Throws
@@ -3742,7 +3746,7 @@ void ServerFile::finalize_work_stage_2()
 // ============================ Worker implementation ============================
 
 Worker::Worker(ServerImpl& server)
-    : logger{"Worker: ", server.logger} // Throws
+    : logger{"Worker: ", server.logger_ptr} // Throws
     , m_server{server}
     , m_transformer{make_transformer()} // Throws
     , m_file_access_cache{server.get_config().max_open_files, logger, *this, server.get_config().encryption_key}

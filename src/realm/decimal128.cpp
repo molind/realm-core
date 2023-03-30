@@ -1510,7 +1510,15 @@ bool Decimal128::operator==(const Decimal128& rhs) const noexcept
     BID_UINT128 l = to_BID_UINT128(*this);
     BID_UINT128 r = to_BID_UINT128(rhs);
     bid128_quiet_equal(&ret, &l, &r, &flags);
-    return ret != 0;
+    if (ret) {
+        return true;
+    }
+    bool lhs_is_nan = is_nan();
+    bool rhs_is_nan = rhs.is_nan();
+    if (lhs_is_nan && rhs_is_nan) {
+        return m_value.w[1] == rhs.m_value.w[1] && m_value.w[0] == rhs.m_value.w[0];
+    }
+    return 0;
 }
 
 bool Decimal128::operator!=(const Decimal128& rhs) const noexcept
@@ -1737,7 +1745,7 @@ auto Decimal128::to_bid64() const -> Bid64
     BID_UINT128 tmp = to_BID_UINT128(*this);
     bid128_to_bid64(&buffer, &tmp, &flags);
     if (flags & ~BID_INEXACT_EXCEPTION)
-        throw std::overflow_error("Decimal128::to_bid64 failed");
+        throw RuntimeError(ErrorCodes::RangeError, "Decimal128::to_bid64 failed");
     return Bid64(buffer);
 }
 

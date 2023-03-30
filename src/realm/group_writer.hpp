@@ -116,6 +116,11 @@ public:
         return m_backoff ? 0 : m_evacuation_limit;
     }
 
+    size_t get_free_list_size()
+    {
+        return m_free_positions.size() * size_per_free_list_entry();
+    }
+
     std::vector<size_t>& get_evacuation_progress()
     {
         return m_evacuation_progress;
@@ -149,6 +154,7 @@ public:
     void flush_all_mappings();
 
 private:
+    friend class InMemoryWriter;
     struct FreeSpaceEntry {
         FreeSpaceEntry(size_t r, size_t s, uint64_t v)
             : ref(r)
@@ -244,7 +250,8 @@ private:
     /// size, and `chunk_size` is the size of that chunk.
     FreeListElement extend_free_space(size_t requested_size);
 
-    void write_array_at(MapWindow* window, ref_type, const char* data, size_t size);
+    template <class T>
+    void write_array_at(T* translator, ref_type, const char* data, size_t size);
     FreeListElement split_freelist_chunk(FreeListElement, size_t alloc_pos);
 
     /// Backdate (if possible) any blocks in the freelist belonging to
@@ -254,6 +261,13 @@ private:
 
     /// Debug helper - extends the TopRefMap with list of reachable blocks
     void map_reachable();
+
+    size_t size_per_free_list_entry() const
+    {
+        // If current size is less than 128 MB, the database need not expand above 2 GB
+        // which means that the positions and sizes can still be in 32 bit.
+        return (m_logical_size < 0x8000000 ? 8 : 16) + 8;
+    }
 };
 
 

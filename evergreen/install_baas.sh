@@ -36,13 +36,13 @@ case $(uname -s) in
             MONGODB_DOWNLOAD_URL="https://downloads.mongodb.com/osx/mongodb-macos-x86_64-enterprise-5.0.3.tgz"
         fi
 
-        NODE_URL="https://nodejs.org/dist/v14.17.0/node-v14.17.0-darwin-x64.tar.gz"
+        NODE_URL="https://s3.amazonaws.com/static.realm.io/evergreen-assets/node-v14.17.0-darwin-x64.tar.gz"
         JQ_DOWNLOAD_URL="https://s3.amazonaws.com/static.realm.io/evergreen-assets/jq-1.6-darwin-amd64"
     ;;
     Linux)
         GO_URL="https://s3.amazonaws.com/static.realm.io/evergreen-assets/go1.19.1.linux-amd64.tar.gz"
         JQ_DOWNLOAD_URL="https://s3.amazonaws.com/static.realm.io/evergreen-assets/jq-1.6-linux-amd64"
-        NODE_URL="https://nodejs.org/dist/v14.17.0/node-v14.17.0-linux-x64.tar.gz"
+        NODE_URL="https://s3.amazonaws.com/static.realm.io/evergreen-assets/node-v14.17.0-linux-x64.tar.gz"
 
         # Detect what distro/versionf of Linux we are running on to download the right version of MongoDB to download
         # /etc/os-release covers debian/ubuntu/suse
@@ -227,7 +227,7 @@ YARN="$WORK_PATH/yarn/bin/yarn"
 if [[ ! -x "$YARN" ]]; then
     echo "Getting yarn"
     mkdir yarn && cd yarn
-    $CURL -LsS https://s3.amazonaws.com/stitch-artifacts/yarn/latest.tar.gz | tar -xz --strip-components=1
+    $CURL -LsS https://yarnpkg.com/latest.tar.gz | tar -xz --strip-components=1
     cd -
     mkdir "$WORK_PATH/yarn_cache"
 fi
@@ -302,13 +302,14 @@ echo "Starting mongodb"
     --replSet rs \
     --bind_ip_all \
     --port 26000 \
+    --oplogMinRetentionHours 1.0 \
     --logpath "$WORK_PATH/mongodb-dbpath/mongod.log" \
     --dbpath "$WORK_PATH/mongodb-dbpath/" \
     --pidfilepath "$WORK_PATH/mongod.pid" &
 
 echo "Initializing replica set"
 retries=0
-until "./mongodb-binaries/bin/$MONGOSH"  --port 26000 --eval 'try { rs.initiate(); } catch (e) { if (e.codeName != "AlreadyInitialized") { throw e; } }' > /dev/null
+until "./mongodb-binaries/bin/$MONGOSH" mongodb://localhost:26000/auth --eval 'try { rs.initiate(); } catch (e) { if (e.codeName != "AlreadyInitialized") { throw e; } }' > /dev/null
 do
     if (( retries++ < 5 )); then
         sleep 1
@@ -336,6 +337,17 @@ go build -o "$WORK_PATH/baas_server" cmd/server/main.go
     --configFile=etc/configs/test_config.json --configFile="$BASE_PATH"/config_overrides.json > "$WORK_PATH/baas_server.log" 2>&1 &
 echo $! > "$WORK_PATH/baas_server.pid"
 "$BASE_PATH"/wait_for_baas.sh "$WORK_PATH/baas_server.pid"
+
+echo "Adding roles to admin user"
+$CURL 'http://localhost:9090/api/admin/v3.0/auth/providers/local-userpass/login' \
+  -H 'Accept: application/json' \
+  -H 'Content-Type: application/json' \
+  --silent \
+  --fail \
+  --output /dev/null \
+  --data-raw '{"username":"unique_user@domain.com","password":"password"}'
+
+"../mongodb-binaries/bin/$MONGOSH"  --quiet mongodb://localhost:26000/auth "$BASE_PATH/add_admin_roles.js"
 
 touch "$WORK_PATH/baas_ready"
 
