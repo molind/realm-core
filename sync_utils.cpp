@@ -10,6 +10,7 @@
 #include <map>
 #include <set>
 #include <fstream>
+#include <iostream>
 
 extern "C" {
 namespace realm {
@@ -132,16 +133,83 @@ struct MakeServerHistory {
 
 } // unnamed namespace
 
-EXPORT void ExplainServerRealm(const std::string& path)
+EXPORT void ServerRealmContents(const std::string& path)
 {
     DBOptions options;
     options.logger = util::Logger::get_default_logger();
     // options.allow_file_format_upgrade = true;
     auto db = DB::create(MakeServerHistory::make_history(), path, options);
 
-    auto stream = std::ofstream("out.json");
-    db->start_read()->to_json(stream);
-    stream.close();
+    // size_t free_space, used_space;
+    // db->get_stats(free_space, used_space);
+    // printf("%zu %zu\n", free_space, used_space);
+
+    const auto& repl = db->get_replication();
+    // printf("%d\n", repl->get_history_type());
+
+    if (auto sh = dynamic_cast<_impl::ServerHistory *>(repl)) {
+
+        // sync::VersionInfo version_info;
+        // bool has_upstream_sync_status;
+        // sync::file_ident_type partial_file_ident;
+        // sync::version_type partial_progress_reference_version;
+
+        // sh->get_status(version_info, has_upstream_sync_status, partial_file_ident, partial_progress_reference_version);
+
+        // auto changesets = sh->get_parsed_changesets(1, version_info.realm_version);
+
+        // for (const auto& c : changesets) {
+        //     printf("%llu\t%llu\t%lu\n", c.version, c.origin_timestamp, c.original_changeset_size);
+        // }
+
+        const auto& hc = sh->get_history_contents();
+        printf("Client files:\n");
+        for (const auto& cf : hc.client_files) {
+            printf("%lld\t%llu\t%llu\n", cf.client_type, cf.client_version, cf.locked_server_version);
+        }
+
+        printf("Changesets:\n");
+        for (int i=0; i< hc.sync_history.size(); ++i) {
+            auto& changeset = hc.sync_history[i];
+            std::time_t seconds;
+            long nanos;
+            sync::map_changeset_timestamp(changeset.timestamp, seconds, nanos);
+
+            // std::time_t ct = std::time(reinterpret_cast<std::time_t *>(&changeset.timestamp));
+            // const auto timestamp = ctime(&ct);
+            const auto& stime = ctime(&seconds);
+
+            printf("%d\t%llu\t%llu\t%lu\t%s", i+1, changeset.client_file_ident, changeset.client_version, changeset.changeset.size(), stime);
+        }
+
+        printf("%lu\n", hc.sync_history.size());
+
+        // auto stream = std::ofstream("out.json");
+        // db->start_read()->to_json(stream);
+        // stream.close();
+
+        // не работает :(
+        // sh->verify();
+    }
+    // _impl::ChangesetInputStream in(*history, 0, 2);
+    // auto span = in.next_block();
+
+    // printf("%zu %zu\n", span.size(), span.size_bytes());
+}
+
+void ServerRealmChangeset(const std::string& path, int changeset_index) {
+    DBOptions options;
+    options.logger = util::Logger::get_default_logger();
+    auto db = DB::create(MakeServerHistory::make_history(), path, options);
+    const auto& repl = db->get_replication();
+
+    if (auto sh = dynamic_cast<_impl::ServerHistory *>(repl)) {
+        const auto& changesets = sh->get_parsed_changesets(changeset_index, changeset_index+1);
+        const auto& changeset = *changesets.begin();
+
+        printf("Changeset: %d\nLast integrated ver: %llu\nOrig size: %lu\n", changeset_index, changeset.last_integrated_remote_version, changeset.original_changeset_size);
+        std::cout << changeset;
+    }
 }
 
 } // namespace realm

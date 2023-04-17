@@ -3,7 +3,8 @@
 extern "C" {
 namespace realm {
 
-void ExplainServerRealm(const std::string& inPath);
+void ServerRealmContents(const std::string& inPath);
+void ServerRealmChangeset(const std::string& inPath, int changeset);
 
 } // namespace realm
 }
