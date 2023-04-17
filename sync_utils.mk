@@ -72,7 +72,9 @@ SRC = \
 	src/realm/sync/noinst/client_reset_operation.cpp \
 	src/realm/sync/noinst/client_reset_recovery.cpp \
 	src/realm/sync/noinst/client_reset.cpp \
+	src/realm/sync/noinst/compact_changesets.cpp \
 	src/realm/sync/noinst/migration_store.cpp \
+	src/realm/sync/noinst/server/server_history.cpp \
 	src/realm/sync/noinst/sync_metadata_schema.cpp \
 	src/realm/sync/object_id.cpp \
 	src/realm/sync/subscriptions.cpp \

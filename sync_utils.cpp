@@ -103,19 +103,45 @@ namespace realm {
 //     // stream.close();
 // }
 
+namespace {
+
+struct MakeServerHistory {
+    class HistoryContext : public _impl::ServerHistory::Context {
+    public:
+        std::mt19937_64& server_history_get_random() noexcept override final
+        {
+            return m_random;
+        }
+
+    private:
+        std::mt19937_64 m_random;
+    };
+    class WrapServerHistory : public HistoryContext, public _impl::ServerHistory {
+    public:
+        WrapServerHistory()
+            : _impl::ServerHistory{static_cast<ServerHistory::Context&>(*this)}
+        {
+        }
+    };
+
+    static std::unique_ptr<_impl::ServerHistory> make_history()
+    {
+        return std::make_unique<WrapServerHistory>();
+    }
+};
+
+} // unnamed namespace
+
 EXPORT void ExplainServerRealm(const std::string& path)
 {
-    // auto history = realm::make_in_realm_history(path);
-
-    realm::DBOptions options;
+    DBOptions options;
+    options.logger = util::Logger::get_default_logger();
     // options.allow_file_format_upgrade = true;
+    auto db = DB::create(MakeServerHistory::make_history(), path, options);
 
-    auto inDB = realm::DB::create(path, true, options);
-
-
-    // auto stream = std::ofstream("out.json");
-    // inDB->start_read()->to_json(stream);
-    // stream.close();
+    auto stream = std::ofstream("out.json");
+    db->start_read()->to_json(stream);
+    stream.close();
 }
 
 } // namespace realm
