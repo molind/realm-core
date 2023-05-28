@@ -86,7 +86,7 @@ struct TimedFutureState : public util::AtomicRefCountBase {
 };
 
 template <typename T>
-util::Future<T> wait_for_future(util::Future<T>&& input, std::chrono::milliseconds max_ms)
+util::Future<T> wait_for_future(util::Future<T>&& input, std::chrono::milliseconds max_ms = std::chrono::seconds(60))
 {
     auto pf = util::make_promise_future<T>();
     auto shared_state = util::make_bind<TimedFutureState<T>>(std::move(pf.promise));
@@ -216,6 +216,9 @@ std::unique_ptr<TestClientReset> make_baas_flx_client_reset(const Realm::Config&
 
 void wait_for_object_to_persist_to_atlas(std::shared_ptr<SyncUser> user, const AppSession& app_session,
                                          const std::string& schema_name, const bson::BsonDocument& filter_bson);
+
+void wait_for_num_objects_in_atlas(std::shared_ptr<SyncUser> user, const AppSession& app_session,
+                                   const std::string& schema_name, size_t expected_size);
 
 void trigger_client_reset(const AppSession& app_session);
 void trigger_client_reset(const AppSession& app_session, const SharedRealm& realm);

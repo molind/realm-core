@@ -1,5 +1,6 @@
 set(HEADERS
     ../util/crypt_key.hpp
+    ../util/spawned_process.hpp
     ../util/test_path.hpp
     util/event_loop.hpp
     util/index_helpers.hpp
@@ -32,11 +33,16 @@ set(SOURCES
     c_api/c_api.c
 
     ../util/crypt_key.cpp
+    ../util/spawned_process.cpp
     ../util/test_path.cpp
     util/event_loop.cpp
     util/test_file.cpp
     util/test_utils.cpp
 )
+
+if (REALM_ENABLE_GEOSPATIAL)
+    list(APPEND SOURCES geospatial.cpp)
+endif()
 
 file(GLOB RESOURCES RELATIVE ${CMAKE_CURRENT_BINARY_DIR}
      "*.realm")
@@ -59,6 +65,7 @@ if(REALM_ENABLE_SYNC)
         sync/flx_migration.cpp
         sync/flx_sync.cpp
         sync/metadata.cpp
+        sync/migration_store_test.cpp
         sync/remote_mongo_tests.cpp
         sync/session/connection_change_notifications.cpp
         sync/session/progress_notifications.cpp
@@ -91,7 +98,6 @@ add_bundled_test(ObjectStoreTests)
 if(REALM_ENABLE_SYNC)
     target_link_libraries(ObjectStoreTests SyncServer)
     option(REALM_ENABLE_AUTH_TESTS "" OFF)
-    option(REALM_SYNC_PROTOCOL_V8 "" OFF)
     if(REALM_ENABLE_AUTH_TESTS)
         if(NOT REALM_MONGODB_ENDPOINT)
             message(FATAL_ERROR "REALM_MONGODB_ENDPOINT must be set when specifying REALM_ENABLE_AUTH_TESTS.")
@@ -105,9 +111,6 @@ if(REALM_ENABLE_SYNC)
         find_package(CURL REQUIRED)
         target_link_libraries(ObjectStoreTests CURL::libcurl)
     endif()
-    if(REALM_SYNC_PROTOCOL_V8)
-        target_compile_definitions(ObjectStoreTests PRIVATE REALM_SYNC_PROTOCOL_V8=1)
-    endif()
 endif()
 
 if(REALM_TEST_LOGGING)
@@ -116,9 +119,12 @@ if(REALM_TEST_LOGGING)
     )
 
     if(REALM_TEST_LOGGING_LEVEL)
+        message(STATUS "Test logging level: ${REALM_TEST_LOGGING_LEVEL}")
         target_compile_definitions(ObjectStoreTests PRIVATE
             TEST_LOGGING_LEVEL=${REALM_TEST_LOGGING_LEVEL}
         )
+    else()
+        message(STATUS "Test logging enabled")
     endif()
 endif()
 
@@ -129,8 +135,9 @@ target_include_directories(ObjectStoreTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 # on Apple platforms we use the built-in CFRunLoop
+# on WebAssembly we use an Emscripten-specific Scheduler and runloop
 # everywhere else it's libuv, except UWP where it doesn't build
-if(NOT APPLE AND NOT WINDOWS_STORE)
+if(NOT APPLE AND NOT EMSCRIPTEN AND NOT WINDOWS_STORE)
     option(REALM_FETCH_MISSING_DEPENDENCIES "Download missing dependencies with CMake's FetchContent where possible" ON)
     if(REALM_FETCH_MISSING_DEPENDENCIES)
         find_package(LibUV)
