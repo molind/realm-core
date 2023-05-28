@@ -55,21 +55,38 @@ public:
     }
     void canonicalize() override
     {
-        std::vector<QueryNode*> newChildren;
+        std::vector<LogicalNode*> todo;
+        do_canonicalize(todo);
+        while (todo.size()) {
+            LogicalNode* cur = todo.back();
+            todo.pop_back();
+            cur->do_canonicalize(todo);
+        }
+    }
+
+    void do_canonicalize(std::vector<LogicalNode*>& todo)
+    {
         auto& my_type = typeid(*this);
-        for (auto& child : children) {
-            child->canonicalize();
-            if (typeid(*child) == my_type) {
+        size_t index = 0;
+        while (index < children.size()) {
+            QueryNode* child = *(children.begin() + index);
+            auto& child_type = typeid(*child);
+            if (child_type == my_type) {
                 auto logical_node = static_cast<LogicalNode*>(child);
-                for (auto c : logical_node->children) {
-                    newChildren.push_back(c);
-                }
+                REALM_ASSERT_EX(logical_node->children.size() == 2, logical_node->children.size());
+                children.push_back(logical_node->children[0]);
+                children.push_back(logical_node->children[1]);
+                children.erase(children.begin() + index);
+                continue; // do not ++index because of the delete
+            }
+            else if (auto ln = dynamic_cast<LogicalNode*>(child)) {
+                todo.push_back(ln);
             }
             else {
-                newChildren.push_back(child);
+                child->canonicalize();
             }
+            ++index;
         }
-        children = newChildren;
     }
 
 private:
@@ -148,7 +165,7 @@ public:
         NULL_VAL,
         TRUE,
         FALSE,
-        ARG
+        ARG,
     };
 
     Type type;
@@ -177,6 +194,47 @@ public:
     std::unique_ptr<Subexpr> visit(ParserDriver*, DataType) override;
     util::Optional<ExpressionComparisonType> m_comp_type;
     std::string target_table;
+};
+
+class GeospatialNode : public ValueNode {
+public:
+    struct Box {};
+    struct Polygon {};
+    struct Loop {};
+    struct Circle {};
+#if REALM_ENABLE_GEOSPATIAL
+    GeospatialNode(Box, GeoPoint& p1, GeoPoint& p2);
+    GeospatialNode(Circle, GeoPoint& p, double radius);
+    GeospatialNode(Polygon, GeoPoint& p);
+    GeospatialNode(Loop, GeoPoint& p);
+    void add_point_to_loop(GeoPoint& p);
+    void add_loop_to_polygon(GeospatialNode*);
+    bool is_constant() final
+    {
+        return true;
+    }
+    std::unique_ptr<Subexpr> visit(ParserDriver*, DataType) override;
+    std::vector<std::vector<GeoPoint>> m_points;
+    Geospatial m_geo;
+#else
+    template <typename... Ts>
+    GeospatialNode(Ts&&...)
+    {
+        throw realm::LogicError(ErrorCodes::NotSupported, "Support for Geospatial queries is not enabled");
+    }
+    template <typename Point>
+    void add_point_to_loop(Point&&)
+    {
+    }
+    template <typename Loop>
+    void add_loop_to_polygon(Loop&&)
+    {
+    }
+    std::unique_ptr<Subexpr> visit(ParserDriver*, DataType) override
+    {
+        return {};
+    }
+#endif
 };
 
 class ListNode : public ValueNode {
@@ -422,6 +480,36 @@ public:
     Query visit(ParserDriver*) override;
 };
 
+class GeoWithinNode : public CompareNode {
+public:
+#if REALM_ENABLE_GEOSPATIAL
+    PropertyNode* prop;
+    GeospatialNode* geo = nullptr;
+    std::string argument;
+    GeoWithinNode(PropertyNode* left, GeospatialNode* right)
+    {
+        prop = left;
+        geo = right;
+    }
+    GeoWithinNode(PropertyNode* left, std::string arg)
+    {
+        prop = left;
+        argument = arg;
+    }
+    Query visit(ParserDriver*) override;
+#else
+    template <typename... Ts>
+    GeoWithinNode(Ts&&...)
+    {
+        throw realm::LogicError(ErrorCodes::NotSupported, "Support for Geospatial queries is not enabled");
+    }
+    Query visit(ParserDriver*) override
+    {
+        return {};
+    }
+#endif
+};
+
 /******************************** Other Nodes ********************************/
 
 class PostOpNode : public ParserNode {
@@ -535,7 +623,8 @@ public:
         parse_error = true;
     }
 
-    Mixed get_arg_for_index(std::string);
+    Mixed get_arg_for_index(const std::string&);
+    double get_arg_for_coordinate(const std::string&);
 
     template <class T>
     Query simple_query(int op, ColKey col_key, T val, bool case_sensitive);

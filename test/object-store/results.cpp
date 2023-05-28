@@ -36,7 +36,6 @@
 
 #include <realm/db.hpp>
 #include <realm/group.hpp>
-#include <realm/query_engine.hpp>
 #include <realm/query_expression.hpp>
 
 #if REALM_ENABLE_SYNC
@@ -403,14 +402,47 @@ TEST_CASE("notifications: async delivery") {
 
         SECTION("Results which already has callbacks") {
             SECTION("notifier before active") {
-                token4 = results2.add_notification_callback([&](CollectionChangeSet) {});
+                token4 = results2.add_notification_callback([](CollectionChangeSet) {});
                 check(results3, results2);
             }
             SECTION("notifier after active") {
-                token4 = results2.add_notification_callback([&](CollectionChangeSet) {});
+                token4 = results2.add_notification_callback([](CollectionChangeSet) {});
                 check(results, results2);
             }
         }
+    }
+
+    SECTION("callbacks can be added from within callbacks triggered by beginning a write transaction") {
+        auto results2 = results;
+        auto results3 = results;
+
+        bool called = false;
+        NotificationToken token2, token3;
+        token2 = results2.add_notification_callback([&](CollectionChangeSet) {
+            token2 = {};
+            token3 = results3.add_notification_callback([&](CollectionChangeSet) {
+                called = true;
+            });
+        });
+        r->begin_transaction();
+        REQUIRE_FALSE(called);
+        r->cancel_transaction();
+        r->begin_transaction();
+        REQUIRE(called);
+        r->cancel_transaction();
+    }
+
+    SECTION("callbacks can be added inside write transactions but only before any changes have been made") {
+        auto results2 = results;
+        auto results3 = results;
+        r->begin_transaction();
+        REQUIRE_NOTHROW(results2.add_notification_callback([](CollectionChangeSet) {}));
+        table->begin()->remove();
+        // Works because it already has a notifier
+        REQUIRE_NOTHROW(results2.add_notification_callback([](CollectionChangeSet) {}));
+        // Fails because we're in a state where we can't create a notifier
+        REQUIRE_EXCEPTION(results3.add_notification_callback([](CollectionChangeSet) {}), WrongTransactionState,
+                          "Cannot create asynchronous query after making changes in a write transaction.");
     }
 
     SECTION("remote changes made before adding a callback from within a callback are not reported") {

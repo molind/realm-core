@@ -492,7 +492,23 @@ TEST_CASE("sync_manager: file actions", "[sync]") {
     const std::string realm_path_3 = file_manager.realm_file_path(uuid_3, local_uuid_3, realm_url, partition);
     const std::string realm_path_4 = file_manager.realm_file_path(uuid_4, local_uuid_4, realm_url, partition);
 
+    // On windows you can't delete a realm if the file is open elsewhere.
+#ifdef _WIN32
+    SECTION("Action::DeleteRealm - fails if locked") {
+        SharedRealm locked_realm;
+        create_dummy_realm(realm_path_1, &locked_realm);
+
+        REQUIRE(locked_realm);
+
+        TestSyncManager tsm(config);
+        manager.make_file_action_metadata(realm_path_1, realm_url, "user1", Action::DeleteRealm);
+
+        REQUIRE_FALSE(tsm.app()->sync_manager()->immediately_run_file_actions(realm_path_1));
+    }
+#endif
+
     SECTION("Action::DeleteRealm") {
+
         // Create some file actions
         manager.make_file_action_metadata(realm_path_1, realm_url, "user1", Action::DeleteRealm);
         manager.make_file_action_metadata(realm_path_2, realm_url, "user2", Action::DeleteRealm);
@@ -709,6 +725,42 @@ TEST_CASE("sync_manager: file actions", "[sync]") {
             CHECK(!File::exists(recovery_2));
             CHECK(!File::exists(recovery_3));
         }
+    }
+}
+
+TEST_CASE("sync_manager: set_session_multiplexing") {
+    TestSyncManager::Config tsm_config;
+    tsm_config.start_sync_client = false;
+    TestSyncManager tsm(std::move(tsm_config));
+    bool sync_multiplexing_allowed = GENERATE(true, false);
+    auto sync_manager = tsm.app()->sync_manager();
+    sync_manager->set_session_multiplexing(sync_multiplexing_allowed);
+
+    auto user_1 = sync_manager->get_user("user-name-1", ENCODE_FAKE_JWT("not_a_real_token"),
+                                         ENCODE_FAKE_JWT("samesies"), "https://realm.example.org", dummy_device_id);
+    auto user_2 = sync_manager->get_user("user-name-2", ENCODE_FAKE_JWT("not_a_real_token"),
+                                         ENCODE_FAKE_JWT("samesies"), "https://realm.example.org", dummy_device_id);
+
+    SyncTestFile file_1(user_1, "partition1", util::none);
+    SyncTestFile file_2(user_1, "partition2", util::none);
+    SyncTestFile file_3(user_2, "partition3", util::none);
+
+    auto realm_1 = Realm::get_shared_realm(file_1);
+    auto realm_2 = Realm::get_shared_realm(file_2);
+    auto realm_3 = Realm::get_shared_realm(file_3);
+
+    wait_for_download(*realm_1);
+    wait_for_download(*realm_2);
+    wait_for_download(*realm_3);
+
+    if (sync_multiplexing_allowed) {
+        REQUIRE(conn_id_for_realm(realm_1) == conn_id_for_realm(realm_2));
+        REQUIRE(conn_id_for_realm(realm_2) != conn_id_for_realm(realm_3));
+    }
+    else {
+        REQUIRE(conn_id_for_realm(realm_1) != conn_id_for_realm(realm_2));
+        REQUIRE(conn_id_for_realm(realm_2) != conn_id_for_realm(realm_3));
+        REQUIRE(conn_id_for_realm(realm_1) != conn_id_for_realm(realm_3));
     }
 }
 

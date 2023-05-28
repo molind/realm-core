@@ -40,6 +40,7 @@
 #include <realm/object-store/sync/async_open_task.hpp>
 #include <realm/object-store/sync/impl/sync_metadata.hpp>
 #include <realm/sync/noinst/client_history_impl.hpp>
+#include <realm/sync/subscriptions.hpp>
 #include "sync/flx_sync_harness.hpp"
 #endif
 
@@ -1894,6 +1895,7 @@ TEST_CASE("SharedRealm: async writes") {
                                   "an error");
         REQUIRE(realm->is_closed());
     }
+#endif
     SECTION("exception thrown from async commit completion callback with error handler") {
         Realm::AsyncHandle h;
         realm->set_async_error_handler([&](Realm::AsyncHandle handle, std::exception_ptr error) {
@@ -1911,6 +1913,7 @@ TEST_CASE("SharedRealm: async writes") {
         wait_for_done();
         verify_persisted_count(1);
     }
+#ifndef _WIN32
     SECTION("exception thrown from async commit completion callback without error handler") {
         realm->begin_transaction();
         table->create_object();
@@ -1923,6 +1926,7 @@ TEST_CASE("SharedRealm: async writes") {
                                   "an error");
         REQUIRE(table->size() == 1);
     }
+#endif
 
     if (_impl::SimulatedFailure::is_enabled()) {
         SECTION("error in the synchronous part of async commit") {
@@ -2339,15 +2343,38 @@ TEST_CASE("SharedRealm: async writes") {
         REQUIRE(table->size() == 6);
     }
 
+    SECTION("async writes which would run inside sync writes are deferred") {
+        realm->async_begin_transaction([&] {
+            done = true;
+        });
+
+        // Wait for the background thread to hold the write lock (without letting
+        // the event loop run so that the scheduled task isn't run)
+        DBOptions options;
+        options.encryption_key = config.encryption_key.data();
+        auto db = DB::create(make_in_realm_history(), config.path, options);
+        while (db->start_write(true))
+            millisleep(1);
+
+        realm->begin_transaction();
+
+        // Invoke the pending callback
+        util::EventLoop::main().run_pending();
+        // Should not have run the async write block
+        REQUIRE(done == false);
+
+        // Should run the async write block once the synchronous transaction is done
+        realm->cancel_transaction();
+        REQUIRE(done == false);
+        util::EventLoop::main().run_pending();
+        REQUIRE(done == true);
+    }
+
     util::EventLoop::main().run_until([&] {
         return !realm || !realm->has_pending_async_work();
     });
-#endif
 
-
-#ifdef _WIN32
     _impl::RealmCoordinator::clear_all_caches();
-#endif
 }
 // Our libuv scheduler currently does not support background threads, so we can
 // only run this on apple platforms
@@ -3034,19 +3061,22 @@ TEST_CASE("ShareRealm: realm closed in did_change callback") {
     table->create_object();
     r1->commit_transaction();
 
-    // Cannot be a member var of Context since Realm.close will free the context.
-    static SharedRealm* shared_realm;
-    shared_realm = &r1;
     struct Context : public BindingContext {
+        Context(std::shared_ptr<Realm>& realm)
+            : realm(&realm)
+        {
+        }
+        std::shared_ptr<Realm>* realm;
         void did_change(std::vector<ObserverState> const&, std::vector<void*> const&, bool) override
         {
-            (*shared_realm)->close();
-            (*shared_realm).reset();
+            auto realm = this->realm; // close() will delete `this`
+            (*realm)->close();
+            realm->reset();
         }
     };
 
     SECTION("did_change") {
-        r1->m_binding_context.reset(new Context());
+        r1->m_binding_context.reset(new Context(r1));
         r1->invalidate();
 
         auto r2 = Realm::get_shared_realm(config);
@@ -3059,7 +3089,7 @@ TEST_CASE("ShareRealm: realm closed in did_change callback") {
     }
 
     SECTION("did_change with async results") {
-        r1->m_binding_context.reset(new Context());
+        r1->m_binding_context.reset(new Context(r1));
         Results results(r1, table->where());
         auto token = results.add_notification_callback([&](CollectionChangeSet) {
             // Should not be called.
@@ -3079,7 +3109,7 @@ TEST_CASE("ShareRealm: realm closed in did_change callback") {
     }
 
     SECTION("refresh") {
-        r1->m_binding_context.reset(new Context());
+        r1->m_binding_context.reset(new Context(r1));
 
         auto r2 = Realm::get_shared_realm(config);
         r2->begin_transaction();
@@ -3089,8 +3119,6 @@ TEST_CASE("ShareRealm: realm closed in did_change callback") {
 
         REQUIRE_FALSE(r1->refresh());
     }
-
-    shared_realm = nullptr;
 }
 
 TEST_CASE("RealmCoordinator: schema cache") {

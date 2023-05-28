@@ -1,3 +1,233 @@
+# 13.13.0 Release notes
+
+### Enhancements
+* None.
+
+### Fixed
+* Allow numeric substitutions into a geospatial query. Example `location GEOWITHIN geoCircle([$0, $1], $2)`. ([#6662](https://github.com/realm/realm-core/issues/6662))
+* Access token refresh for websockets was not updating the location metadata ([#6630](https://github.com/realm/realm-core/issues/6630), since v13.9.3)
+* Fix several UBSan failures which did not appear to result in functional bugs ([#6649](https://github.com/realm/realm-core/pull/6649)).
+* Fix an out-of-bounds read in sectioned results when sectioned are removed by modifying all objects in that section to no longer appear in that section ([#6649](https://github.com/realm/realm-core/pull/6649), since v13.12.0)
+* Using both synchronous and asynchronous transactions on the same thread or scheduler could hit the assertion failure "!realm.is_in_transaction()" if one of the callbacks for an asynchronous transaction happened to be scheduled during a synchronous transaction ([#6659](https://github.com/realm/realm-core/issues/6659), since v11.8.0)
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* Simplify the implementation of query expression nodes which have a btree leaf cache.
+* Fix a lock order inversion hit by object store tests running on linux. The cycle required test-specific code and so is not applicable to non-tests.
+* Remove catch() clause to prevent truncating stack trace in AsyncOper::do_recycle_and_execute() ([PR #6667](https://github.com/realm/realm-core/pull/6667))
+
+----------------------------------------------
+
+# 13.12.0 Release notes
+
+### Enhancements
+* Improve performance of SectionedResults. With a single section it is now ~10% faster, and the runtime of sectioning no longer scales significantly with section count, giving >100% speedups when there are large numbers of sections ([PR #6606](https://github.com/realm/realm-core/pull/6606)).
+* Very slightly improve performance of runtime thread checking on the main thread on Apple platforms. ([PR #6606](https://github.com/realm/realm-core/pull/6606))
+
+### Fixed
+* We could crash when removing backlinks in cases where forward links did not have a corresponding backlink due to corruption. We now silently ignore this inconsistency in release builds, allowing the app to continue. ([#6585](https://github.com/realm/realm-core/issues/6585), v6.0.0)
+* If you freeze a Results based on a collection of objects, the result would be invalid if you delete the collection ([#6635](https://github.com/realm/realm-core/issues/6635), since V13.11.0)
+* Geospatial polygons now have built in normalization and validation in line with the MongoDB server side behaviour and the geoJSON standard. ([#6607](https://github.com/realm/realm-core/pull/6607), since v13.11.0)
+* Dictionary::get_any() would expose unresolved links rather than mapping them to null. In addition to allowing invalid objects to be read from Dictionaries, this resulted in queries on Dictionaries sometimes having incorrect results ([#6644](https://github.com/realm/realm-core/pull/6644)).
+
+### Breaking changes
+* `platform` and `cpu_arch` fields in the `device_info` structure in App::Config can no longer be provided by the SDK's, they are inferred by the library ([PR #6612](https://github.com/realm/realm-core/pull/6612))
+* `bundle_id` is now a required field in the `device_info` structure in App::Config ([PR #6612](https://github.com/realm/realm-core/pull/6612))
+* The API for sectioned results change notifications has changed. Changes are now reported in a vector rather than a sparse map.
+* Renamed `GeoCenterSphere` to `GeoCircle` and in RQL `geoSphere` to `geoCircle`. The GeoPoints of query shapes are now validated before use and an exception will be thrown if invalid. Geospatial queries are no longer allowed on top-level tables. Fixed query results using ANY/ALL/NONE and matching on lists ([PR #6645](https://github.com/realm/realm-core/issues/6645))
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* Upgraded to Catch from v3.0.1 to v3.3.2. ([#6623](https://github.com/realm/realm-core/issues/6623))
+* Added some geospatial benchmarks. ([#6622](https://github.com/realm/realm-core/issues/6622))
+
+----------------------------------------------
+
+# 13.11.0 Release notes
+
+### Enhancements
+* The query engine now supports `geowithin` queries on points. Points are embedded objects conforming to the geoJSON format, trying to use a geospatial query on data in the incorrect format produces a run time exception. Example RQL query: `location geoWithin geoPolygon({{-178.0, 10.0}, {178.0, 10.0}, {178.0, -10.0}, {-178.0, -10.0}, {-178.0, 10.0}})`. For SDKs who do not wish to add this yet, the feature can be compiled out by adding `-DREALM_ENABLE_GEOSPATIAL=OFF` to the cmake config. ([#6562](https://github.com/realm/realm-core/issues/6562))
+* Partition-Based to Flexible Sync Migration for migrating a client app that uses partition based sync to use flexible sync under the hood if the server has been migrated to flexible sync is officially supported with this release. Any clients using an older version of Realm (including the original support released in Core 13.10.0) will receive a "switch to flexible sync" error message when trying to sync with the app. ([#6554](https://github.com/realm/realm-core/issues/6554))
+
+### Fixed
+* Fixed a fatal error (reported to the sync error handler) during client reset (or automatic PBS to FLX migration) if the reset has been triggered during an async open and the schema being applied has added new classes. ([#6601](https://github.com/realm/realm-core/issues/6601), since automatic client resets were introduced in v11.5.0)
+* Full text search would sometimes find words where the word only matches the beginning of the search token ([#6591](https://github.com/realm/realm-core/issues/6591), since v13.0.0)
+* Added missing includes of `<cstdint>` surfaced by gcc13 ([#6616](https://github.com/realm/realm-core/pull/6616))
+* Prevent crashing on Results.freeze if underlying object or table were removed by making Results.is_valid correctly report its state. ([#6401](https://github.com/realm/realm-core/issues/6401))
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* Add initial support for targeting WebAssembly with Emscripten ([PR #6263](https://github.com/realm/realm-core/pull/6263)).
+* Sync session multiplexing is now enabled by default. The method `SyncManager::enable_session_multiplexing()` has been renamed `SyncManager::set_session_multiplexing()`. (PR [#6557](https://github.com/realm/realm-core/pull/6557))
+* Bump protocol to v9 to indicate client has fix for client reset error during async open ([#6609](https://github.com/realm/realm-core/issues/6609))
+* Fixed `Results::is_valid()` in order to return `false` if the results is bound to a deleted object or table. (PR [#6445](https://github.com/realm/realm-core/pull/6445))
+
+----------------------------------------------
+
+# 13.10.1 Release notes
+
+### Enhancements
+* New notifiers can now be registered in write transactions until changes have actually been made in the write transaction. This makes it so that new notifications can be registered inside change notifications triggered by beginning a write transaction (unless a previous callback performed writes). (PR [#6560](https://github.com/realm/realm-core/pull/6560))
+* Expose `Results::get_query()` in the C-API. (PR [#6568](https://github.com/realm/realm-core/pull/6568))
+* `get_shared_app` will now generate unique app instances for configurations with the same app ID but different base URLs. `get_cached_app` now accepts the base URL as an optional second parameter which should be provided to ensure the correct app instance is returned when there are multiple instances of the same app ID with different base URLs. The deprecated `realm_app_get_cached` and `realm_app_get` C api methods have been removed ([#6480](https://github.com/realm/realm-core/pull/6480))
+
+### Fixed
+* Exclusion of words in a full text search does not work ([#6512](https://github.com/realm/realm-core/issues/6512), since v13.0.0 );
+
+### Breaking changes
+* Add `service_name` parameter to `realm_app_call_function` (PR [#6394](https://github.com/realm/realm-core/pull/6394)).
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* Reduce the memory footprint of an automatic (discard or recover) client reset when there are large incoming changes from the server. ([#6567](https://github.com/realm/realm-core/issues/6567))
+* `get_committed_file_format_version()` safe access to mappings vector from multiple threads.
+* Add CI tests for Clang 16/Ubuntu 22.04 and update lint task ([PR #6563](https://github.com/realm/realm-core/pull/6563))
+
+----------------------------------------------
+
+# 13.10.0 Release notes
+
+### Enhancements
+* PBS to FLX Migration for migrating a client app that uses partition based sync to use flexible sync under the hood if the server has been migrated to flexible sync. ([#6554](https://github.com/realm/realm-core/issues/6554))
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* Bump the sync protocol version to v8 ([PR #6549](https://github.com/realm/realm-core/pull/6549))
+
+----------------------------------------------
+
+# 13.9.4 Release notes
+
+### Enhancements
+* Improve performance of rolling back write transactions after making changes. If no KVO observers are used this is now constant time rather than taking time proportional to the number of changes to be rolled back. Rollbacks with KVO observers are 10-20% faster. ([PR #6513](https://github.com/realm/realm-core/pull/6513))
+
+### Fixed
+* Performing a query like "{1, 2, 3, ...} IN list" where the array is longer than 8 and all elements are smaller than some values in list, the program would crash ([#1183](https://github.com/realm/realm-kotlin/issues/1183), v12.5.0)
+* Performing a large number of queries without ever performing a write resulted in steadily increasing memory usage, some of which was never fully freed due to an unbounded cache ([Swift #7978](https://github.com/realm/realm-swift/issues/7978), since v12.0.0)
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* Clear out SubscriptionStore and cancel pending notifications upon rollback to PBS after client migration to FLX. ([#6389](https://github.com/realm/realm-core/issues/6389))
+* Simplify the non-sync replication log by emitting the same instruction type for all three types of collections rather than different instructions per collection type. This has no functional effect but eliminates some duplicated code. ([PR #6513](https://github.com/realm/realm-core/pull/6513))
+* Remove TransactionChangeInfo::track_all, which was only ever used by the global notifier. ([PR #6513](https://github.com/realm/realm-core/pull/6513))
+* Delete util::InputStream and rename util::NoCopyInputStream to util::InputStream.
+
+----------------------------------------------
+
+# 13.9.3 Release notes
+
+### Fixed
+* If session multiplexing was enabled in the sync client and multiple realms for multiple users were being synchronized, a connection authenticated for the wrong user could have been used, reuslting in a UserMismatch error from the server. ([PR #6320](https://github.com/realm/realm-core/pull/6320), since v10.0.0).
+* If session multiplexing was enabled and an automatic client reset failed, it could cause all sessions to fail with a fatal ProtocolError rather than just the session that failed to client reset. This would mean that no other sync session would be able to be opened for up to an hour without restarting the app. ([PR #6320](https://github.com/realm/realm-core/pull/6320), since v11.5.0)
+* If a DOWNLOAD message was received after a sync session was de-activated but before the UNBOUND message was received by the client, a use-after-free error may have occurred when the sync session tried to process the download messaage. So far this has only been reproducible if session multiplexing was enabled. ([PR #6320](https://github.com/realm/realm-core/pull/6320), since v12.9.0)
+* HTTP and Websocket redirections are not properly updating URL locations if the network transport implementation handles redirect responses internally ([#6485](https://github.com/realm/realm-core/issues/6485), since v12.9.0)
+* Don't report non ssl related errors during ssl handshake as fatal in default socket provider. ([#6434](https://github.com/realm/realm-core/issues/6434), since v13.3.0)
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+----------------------------------------------
+
+# 13.9.2 Release notes
+
+### Enhancements
+* Improve performance of equality queries on a non-indexed mixed property by about 30%. ([#6506](https://github.com/realm/realm-core/issues/6506))
+
+### Fixed
+* Fix a build error due to an installed header depending on a non-installed on (since v13.9.1).
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* Allow to run multiprocess encryption tests outside building folder.
+
+----------------------------------------------
+
+# 13.9.1 Release notes
+
+### Enhancements
+* None.
+
+### Fixed
+* Fixed a crash or exception when doing a fulltext search for multiple keywords when the intersection of results is not equal. ([#6465](https://github.com/realm/realm-core/issues/6465) since v13.2.0).
+* Fixed issue where build would not succeed when consuming core as an installed dependancy due to missing install headers ([#6479](https://github.com/realm/realm-core/pull/6479) since v13.4.1).
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* Fix compiler warnings with MacOS Clang 14.0.3 ([PR #6467](https://github.com/realm/realm-core/pull/6467))
+* Perform a client reset to migrate a sync'd realm from PBS to FLX and vice versa ([#6393](https://github.com/realm/realm-core/issues/6393))
+* The following unused util headers have been deleted: call_with_tuple.hpp, get_file_size.hpp, inspect.hpp, substitute.hpp, type_list.hpp, and utf8.hpp.
+* Add migrated state information to flexible sync client BIND message for backfilling PBS partition value in objects once client has migrated to FLX. ([PR #6464](https://github.com/realm/realm-core/pull/6464))
+* Add unit test for MigrationStore ([PR #6495](https://github.com/realm/realm-core/pull/6495))
+
+----------------------------------------------
+
+# 13.9.0 Release notes
+
+### Enhancements
+* Enable multiple processes to operate on an encrypted Realm simultaneously. ([#1845](https://github.com/realm/realm-core/issues/1845))
+
+### Fixed
+* Fix a stack overflow crash when using the query parser with long chains of AND/OR conditions. ([#6428](https://github.com/realm/realm-core/pull/6428), since v11.7.0)
+* Changing the log level on the fly would not affect the core level log output ([#6440](https://github.com/realm/realm-core/issues/6440), since 13.7.0)
+* `SyncManager::immediately_run_file_actions()` no longer ignores the result of trying to remove a realm. This could have resulted in a client reset action being reported as successful when it actually failed on windows if the `Realm` was still open ([#6050](https://github.com/realm/realm-core/issues/6050)).
+* Fix a data race in `DB::VersionManager`. If one thread committed a write transaction which increased the number of live versions above the previous highest seen during the current session at the same time as another thread began a read, the reading thread could read from a no-longer-valid memory mapping ([PR #6411](https://github.com/realm/realm-core/pull/6411), since v13.0.0).
+* Performing count() on an undefined Query would crash. ([#6443](https://github.com/realm/realm-core/issues/6443), since v13.7.0)
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+* Lock file format: New format introduced for multiprocess encryption. All processes accessing the file must be upgraded to the new format.
+
+-----------
+
+### Internals
+* PrintChangeset sync CLI utility can now ingest trace-level log files and decode hex/base64-compressed changeset data within the logs ([#6375](https://github.com/realm/realm-core/pull/6375))
+
+----------------------------------------------
+
 # 13.8.0 Release notes
 
 ### Enhancements
@@ -187,7 +417,7 @@
 * Improve performance of interprocess mutexes on iOS which don't need to support reader-writer locking. The primary beneficiary of this is beginning and ending read transactions, which is now almost as fast as pre-v13.0.0 ([PR #6258](https://github.com/realm/realm-core/pull/6258)).
 
 ### Fixed
-* Sharing Realm files between a Catalyst app and Realm Studio did not properly synchronize access to the Realm file ([PR #6258](https://github.com/realm/realm-core/pull/6258), since v6.21.0).
+* Sharing Realm files between a Catalyst app and Realm Studio did not properly synchronize access to the Realm file ([PR #6258](https://github.com/realm/realm-core/pull/6258), since v6.0.21).
 * Fix websocket redirection after server migration if user is logged in ([#6056](https://github.com/realm/realm-core/issues/6056), since v12.9.0)
 * Freezing an immutable Realm would hit an assertion failure ([#6260]https://github.com/realm/realm-core/issues/6260), since v13.3.0).
 

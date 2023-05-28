@@ -123,7 +123,8 @@ Transaction::Transaction(DBRef _db, SlabAlloc* alloc, DB::ReadLockInfo& rli, DB:
     set_metrics(db->m_metrics);
     set_transact_stage(stage);
     m_alloc.note_reader_start(this);
-    attach_shared(m_read_lock.m_top_ref, m_read_lock.m_file_size, writable);
+    attach_shared(m_read_lock.m_top_ref, m_read_lock.m_file_size, writable,
+                  VersionID{rli.m_version, rli.m_reader_idx});
 }
 
 Transaction::~Transaction()
@@ -272,7 +273,7 @@ VersionID Transaction::commit_and_continue_as_read(bool commit_to_disk)
             }
         }
 
-        // Remap file if it has grown, and update refs in underlying node structure
+        // Remap file if it has grown, and update refs in underlying node structure.
         remap_and_update_refs(m_read_lock.m_top_ref, m_read_lock.m_file_size, false); // Throws
         return VersionID{version, new_read_lock.m_reader_idx};
     }
@@ -321,12 +322,20 @@ TransactionRef Transaction::freeze()
 TransactionRef Transaction::duplicate()
 {
     auto version = VersionID(m_read_lock.m_version, m_read_lock.m_reader_idx);
-    if (m_transact_stage == DB::transact_Reading)
-        return db->start_read(version);
-    if (m_transact_stage == DB::transact_Frozen)
-        return db->start_frozen(version);
-
-    throw WrongTransactionState("Can only duplicate a read/frozen transaction");
+    switch (m_transact_stage) {
+        case DB::transact_Ready:
+            throw WrongTransactionState("Cannot duplicate a transaction which does not have a read lock.");
+        case DB::transact_Reading:
+            return db->start_read(version);
+        case DB::transact_Frozen:
+            return db->start_frozen(version);
+        case DB::transact_Writing:
+            if (get_commit_size() != 0)
+                throw WrongTransactionState(
+                    "Can only duplicate a write transaction before any changes have been made.");
+            return db->start_read(version);
+    }
+    REALM_UNREACHABLE();
 }
 
 void Transaction::copy_to(TransactionRef dest) const
