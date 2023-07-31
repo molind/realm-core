@@ -506,9 +506,6 @@ void Results::evaluate_query_if_needed(bool wants_notifications)
 template <>
 size_t Results::index_of(Obj const& obj)
 {
-    util::CheckedUniqueLock lock(m_mutex);
-    validate_read();
-    ensure_up_to_date();
     if (!obj.is_valid()) {
         throw StaleAccessor{"Attempting to access an invalid object"};
     }
@@ -517,36 +514,46 @@ size_t Results::index_of(Obj const& obj)
                               util::format("Object of type '%1' does not match Results type '%2'",
                                            obj.get_table()->get_class_name(), m_table->get_class_name()));
     }
-
-    switch (m_mode) {
-        case Mode::Empty:
-        case Mode::Table:
-            return m_table->get_object_ndx(obj.get_key());
-        case Mode::Collection:
-            return m_collection->find_any(obj.get_key());
-        case Mode::Query:
-        case Mode::TableView:
-            return m_table_view.find_by_source_ndx(obj.get_key());
-    }
-    REALM_COMPILER_HINT_UNREACHABLE();
+    return index_of(Mixed(obj.get_key()));
 }
 
-template <typename T>
-size_t Results::index_of(T const& value)
+template <>
+size_t Results::index_of(Mixed const& value)
 {
     util::CheckedUniqueLock lock(m_mutex);
     validate_read();
     ensure_up_to_date();
-    if (m_mode != Mode::Collection)
-        return not_found; // Non-Collection results can only ever contain Objects
-    if (m_list_indices) {
-        for (size_t i = 0; i < m_list_indices->size(); ++i) {
-            if (value == get_unwraped<T>(*m_collection, (*m_list_indices)[i]))
-                return i;
+
+    if (value.is_type(type_TypedLink)) {
+        if (m_table && m_table->get_key() != value.get_link().get_table_key()) {
+            return realm::not_found;
         }
-        return not_found;
     }
-    return m_collection->find_any(value);
+
+    switch (m_mode) {
+        case Mode::Empty:
+        case Mode::Table:
+            if (value.is_type(type_Link, type_TypedLink)) {
+                return m_table->get_object_ndx(value.get<ObjKey>());
+            }
+            break;
+        case Mode::Collection:
+            if (m_list_indices) {
+                for (size_t i = 0; i < m_list_indices->size(); ++i) {
+                    if (value == m_collection->get_any(m_list_indices->at(i)))
+                        return i;
+                }
+                return not_found;
+            }
+            return m_collection->find_any(value);
+        case Mode::Query:
+        case Mode::TableView:
+            if (value.is_type(type_Link, type_TypedLink)) {
+                return m_table_view.find_by_source_ndx(value.get<ObjKey>());
+            }
+            break;
+    }
+    return realm::not_found;
 }
 
 size_t Results::index_of(Query&& q)
@@ -805,7 +812,8 @@ TableView Results::get_tableview()
     REALM_COMPILER_HINT_UNREACHABLE();
 }
 
-static std::vector<ColKey> parse_keypath(StringData keypath, Schema const& schema, const ObjectSchema* object_schema)
+static std::vector<ExtendedColumnKey> parse_keypath(StringData keypath, Schema const& schema,
+                                                    const ObjectSchema* object_schema)
 {
     auto check = [&](bool condition, const char* fmt, auto... args) {
         if (!condition) {
@@ -821,17 +829,30 @@ static std::vector<ColKey> parse_keypath(StringData keypath, Schema const& schem
     const char* end = keypath.data() + keypath.size();
     check(begin != end, "missing property name");
 
-    std::vector<ColKey> indices;
+    std::vector<ExtendedColumnKey> indices;
     while (begin != end) {
         auto sep = std::find(begin, end, '.');
         check(sep != begin && sep + 1 != end, "missing property name");
         StringData key(begin, sep - begin);
+        std::string index;
+        auto begin_key = std::find(begin, sep, '[');
+        if (begin_key != sep) {
+            auto end_key = std::find(begin_key, sep, ']');
+            check(end_key != sep, "missing ']'");
+            index = std::string(begin_key + 1, end_key);
+            key = StringData(begin, begin_key - begin);
+        }
         begin = sep + (sep != end);
 
         auto prop = object_schema->property_for_public_name(key);
         check(prop, "property '%1.%2' does not exist", object_schema->name, key);
-        check(is_sortable_type(prop->type), "property '%1.%2' is of unsupported type '%3'", object_schema->name, key,
-              string_for_property_type(prop->type));
+        if (is_dictionary(prop->type)) {
+            check(index.length(), "missing dictionary key");
+        }
+        else {
+            check(is_sortable_type(prop->type), "property '%1.%2' is of unsupported type '%3'", object_schema->name,
+                  key, string_for_property_type(prop->type));
+        }
         if (prop->type == PropertyType::Object)
             check(begin != end, "property '%1.%2' of type 'object' cannot be the final property in the key path",
                   object_schema->name, key);
@@ -839,7 +860,12 @@ static std::vector<ColKey> parse_keypath(StringData keypath, Schema const& schem
             check(begin == end, "property '%1.%2' of type '%3' may only be the final property in the key path",
                   object_schema->name, key, prop->type_string());
 
-        indices.push_back(ColKey(prop->column_key));
+        if (index.length()) {
+            indices.emplace_back(ColKey(prop->column_key), index);
+        }
+        else {
+            indices.emplace_back(ColKey(prop->column_key));
+        }
         if (prop->type == PropertyType::Object)
             object_schema = &*schema.find(prop->object_type);
     }
@@ -862,7 +888,7 @@ Results Results::sort(std::vector<std::pair<std::string, bool>> const& keypaths)
         return sort({{{}}, {keypaths[0].second}});
     }
 
-    std::vector<std::vector<ColKey>> column_keys;
+    std::vector<std::vector<ExtendedColumnKey>> column_keys;
     std::vector<bool> ascending;
     column_keys.reserve(keypaths.size());
     ascending.reserve(keypaths.size());
@@ -937,7 +963,7 @@ Results Results::distinct(std::vector<std::string> const& keypaths) const
         return distinct(DistinctDescriptor({{ColKey()}}));
     }
 
-    std::vector<std::vector<ColKey>> column_keys;
+    std::vector<std::vector<ExtendedColumnKey>> column_keys;
     column_keys.reserve(keypaths.size());
     for (auto& keypath : keypaths)
         column_keys.push_back(parse_keypath(keypath, m_realm->schema(), &get_object_schema()));
@@ -1055,12 +1081,7 @@ ColKey Results::key(StringData name) const
 #define REALM_RESULTS_TYPE(T)                                                                                        \
     template T Results::get<T>(size_t);                                                                              \
     template util::Optional<T> Results::first<T>();                                                                  \
-    template util::Optional<T> Results::last<T>();                                                                   \
-    template size_t Results::index_of<T>(T const&);
-
-template Obj Results::get<Obj>(size_t);
-template util::Optional<Obj> Results::first<Obj>();
-template util::Optional<Obj> Results::last<Obj>();
+    template util::Optional<T> Results::last<T>();
 
 REALM_RESULTS_TYPE(bool)
 REALM_RESULTS_TYPE(int64_t)
@@ -1073,6 +1094,7 @@ REALM_RESULTS_TYPE(ObjectId)
 REALM_RESULTS_TYPE(Decimal)
 REALM_RESULTS_TYPE(UUID)
 REALM_RESULTS_TYPE(Mixed)
+REALM_RESULTS_TYPE(Obj)
 REALM_RESULTS_TYPE(util::Optional<bool>)
 REALM_RESULTS_TYPE(util::Optional<int64_t>)
 REALM_RESULTS_TYPE(util::Optional<float>)

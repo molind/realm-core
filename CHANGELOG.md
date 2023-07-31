@@ -1,3 +1,178 @@
+# 13.17.1 Release notes
+
+### Enhancements
+* None.
+
+### Fixed
+* Rare corruption of files on streaming format (often following compact, convert or copying to a new file). ([#6807](https://github.com/realm/realm-core/pull/6807), since v12.12.0)
+* Trying to search a full-text indexes created as a result of an additive schema change (i.e. applying the differences between the local schema and a synchronized realm's schema) could have resulted in an IllegalOperation error with the error code `Column has no fulltext index`. ([PR #6823](https://github.com/realm/realm-core/pull/6823), since v13.2.0).
+* Sync progress for DOWNLOAD messages from server state was updated wrongly. This may have resulted in an extra round-trip to the server. ([#6827](https://github.com/realm/realm-core/issues/6827), since v12.9.0)
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* `wait_for_upload_completion`/`wait_for_download_completion` internal API was changed to use `Status`'s instead of `std::error_code`. The SDK-facing was already `Status` oriented, so this change should only result in better error messages. ([PR #6796](https://github.com/realm/realm-core/pull/6796))
+* Separate local and baas object store tests into separate evergreen tasks and allow custom test specification. ([PR #6805](https://github.com/realm/realm-core/pull/6805))
+* Consolidate object store sync util files into test/object-store/util/sync/ directory. ([PR #6789](https://github.com/realm/realm-core/pull/6789))
+
+----------------------------------------------
+
+# 13.17.0 Release notes
+
+### Enhancements
+* Sync connection and session reconnect timing/backoff logic has been unified into a single implementation and is now configurable. Previously some errors would cause an hour-long wait before attempting to reconnect, now - by default - the sync client will wait for 1 second before retrying and double the timeout after each subsequent attempt up to 5 minutes, after which a retry will be attempted every 5 minutes. If the cause of the error changes, the backoff will be reset. If the sync client voluntarily disconnects, no backoff will be used. (PR [#6526](https://github.com/realm/realm-core/pull/6526)).
+* Add support for the SDK initializing the schema inside a before-client-reset callback ([PR #6780](https://github.com/realm/realm-core/pull/6780)).
+
+### Fixed
+* Sync errors included the error message twice ([PR #6774](https://github.com/realm/realm-core/pull/6774), since v13.16.0).
+* Fix timestamp representation when serializing to json on different platforms. ([#5451](https://github.com/realm/realm-core/issues/5451)).
+
+### Breaking changes
+* Deprecate `Object::obj()` in favour of `Object::get_obj()` in order to provide better cache efficiency and keep `Obj` up to date when writes happened after then object instance is obtained.
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* Run baas on remote ubuntu host for evergreen object-store-tests. ([PR #6757](https://github.com/realm/realm-core/pull/6757))
+
+----------------------------------------------
+
+# 13.16.1 Release notes
+
+### Enhancements
+* None.
+
+### Fixed
+* Fix an error during async open and client reset if properties have been added to the schema. This fix applies to PBS to FLX migration if async open is used. ([#6707](https://github.com/realm/realm-core/issues/6707), since v12.3.0)
+* Fixed a double move (undefined behaviour) if an async open resulted in an error. ([#6768](https://github.com/realm/realm-core/pull/6768), since v13.16.0)
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* None.
+
+----------------------------------------------
+
+# 13.16.0 Release notes
+
+### Enhancements
+* Add visionOS binaries to the Cocoa release package ([PR #6746](https://github.com/realm/realm-core/pull/6746)).
+* Added support for running initial subscription callback when opening realm, both for synchronous and asynchronous flows. Sync Config contains `subscription_initializer` and `rerun_init_subscription_on_open` in order to setup the subscription callback, and select whether rerun this the first time the file is opened or not. ([#5962](https://github.com/realm/realm-core/issues/5962))
+
+### Fixed
+* None.
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* Prebuilt binaries for non-Apple platforms are no longer published as nothing was using them ([PR #6746](https://github.com/realm/realm-core/pull/6746)).
+* SystemError exceptions now have a more detailed error message. ([#6739](https://github.com/realm/realm-core/issues/6739))
+
+----------------------------------------------
+
+# 13.15.2 Release notes
+
+### Enhancements
+* None.
+
+### Fixed
+* A GeoBox is now just a shortcut for the equivilent GeoPolygon. This provides consistent query results and error checking. ([#6703](https://github.com/realm/realm-core/issues/6703), since v13.11.0) 
+* Fixed several corner cases (eg. around the poles) where invalid points matched a geoWithin query.
+* Disallow full text search index for primary key columns. ([#6657](https://github.com/realm/realm-core/issues/6657), since v13.2.0)
+* Searching for objects in Results would not always find the requested item. This is particularly the case when the C API is used. ([#6695](https://github.com/realm/realm-core/issues/6695), since v10.0.0)
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* Fixed Valgrind error ([#6643](https://github.com/realm/realm-core/issues/6643))
+
+----------------------------------------------
+
+# 13.15.1 Release notes
+
+### Fixed
+* Querying with object list arguments does not work. ([#6688](https://github.com/realm/realm-core/issues/6688), since v10.3.3)
+* Fix SessionWrapper use-after-free crash when tearing down sessions when using session multiplexing ([#6656](https://github.com/realm/realm-core/issues/6656), since v13.9.3)
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+----------------------------------------------
+
+# 13.15.0 Release notes
+
+### Enhancements
+* It is now allowed to open old frozen versions with a schema that contains additional classes, but not additional properties. ([PR 6693](https://github.com/realm/realm-core/issues/6693))
+
+### Fixed
+* Properties in the frozen _before_ Realm instance in the client reset callbacks may have had properties reordered which could lead to exceptions if accessed. ([PR 6693](https://github.com/realm/realm-core/issues/6693), since v13.11.0)
+
+### Breaking changes
+* A new provider called `IdentityProviderAPIKey` replaces both `IdentityProviderUserAPIKey` and `IdentityProviderServerAPIKey` since those two did the same thing. If SDKs wish to keep the old behaviour without requiring users to make code changes, they can adapt both their existing server and user API key providers to use the new core type. ([#5914](https://github.com/realm/realm-core/issues/5914))
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* Prebuilt libraries for Apple platforms are now built with Xcode 14.
+
+----------------------------------------------
+
+# 13.14.0 Release notes
+
+
+### Enhancements
+* Support sort/distinct based on values from a dictionary e.g. `TRUEPREDICATE SORT(meta['age'])` (PR [#5311](https://github.com/realm/realm-core/pull/5311))
+
+### Fixed
+* Querying with list of objects as argument will always return an empty result. ([#6674](https://github.com/realm/realm-core/pull/6674), since v12.5.0)
+* Fixed a potential crash when opening the realm after failing to download a fresh FLX realm during an automatic client reset ([#6494](https://github.com/realm/realm-core/issues/6494), since v12.3.0)
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* Added CMake toolchains for cross-targeting Linux x86_64, armv7, and aarch64. (PR [#6559](https://github.com/realm/realm-core/pull/6559))
+
+----------------------------------------------
+
 # 13.13.0 Release notes
 
 ### Enhancements

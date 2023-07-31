@@ -16,16 +16,17 @@
 //
 ////////////////////////////////////////////////////////////////////////////
 
-#include <catch2/catch_all.hpp>
-#include <catch2/matchers/catch_matchers_string.hpp>
+#include <util/event_loop.hpp>
+#include <util/test_file.hpp>
+#include <util/test_utils.hpp>
+#include <../util/semaphore.hpp>
 
-#include "util/event_loop.hpp"
-#include "util/test_file.hpp"
-#include "util/test_utils.hpp"
-#include "../util/semaphore.hpp"
+#include <realm/db.hpp>
+#include <realm/history.hpp>
+
+#include <realm/impl/simulated_failure.hpp>
 
 #include <realm/object-store/binding_context.hpp>
-#include <realm/object-store/impl/realm_coordinator.hpp>
 #include <realm/object-store/keypath_helpers.hpp>
 #include <realm/object-store/object_schema.hpp>
 #include <realm/object-store/object_store.hpp>
@@ -33,23 +34,26 @@
 #include <realm/object-store/results.hpp>
 #include <realm/object-store/schema.hpp>
 #include <realm/object-store/thread_safe_reference.hpp>
-#include <realm/object-store/util/scheduler.hpp>
+#include <realm/object-store/impl/realm_coordinator.hpp>
 #include <realm/object-store/util/event_loop_dispatcher.hpp>
+#include <realm/object-store/util/scheduler.hpp>
 
-#if REALM_ENABLE_SYNC
-#include <realm/object-store/sync/async_open_task.hpp>
-#include <realm/object-store/sync/impl/sync_metadata.hpp>
-#include <realm/sync/noinst/client_history_impl.hpp>
-#include <realm/sync/subscriptions.hpp>
-#include "sync/flx_sync_harness.hpp"
-#endif
-
-#include <realm/db.hpp>
-#include <realm/history.hpp>
-#include <realm/impl/simulated_failure.hpp>
 #include <realm/util/base64.hpp>
 #include <realm/util/fifo_helper.hpp>
 #include <realm/util/scope_exit.hpp>
+
+#if REALM_ENABLE_SYNC
+#include <util/sync/flx_sync_harness.hpp>
+
+#include <realm/object-store/sync/async_open_task.hpp>
+#include <realm/object-store/sync/impl/sync_metadata.hpp>
+
+#include <realm/sync/noinst/client_history_impl.hpp>
+#include <realm/sync/subscriptions.hpp>
+#endif
+
+#include <catch2/catch_all.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <external/json/json.hpp>
 
@@ -844,11 +848,19 @@ TEST_CASE("SharedRealm: schema_subset_mode") {
     SECTION("obtaining a frozen realm with an incompatible schema throws") {
         config.schema = Schema{{"object", {{"value", PropertyType::Int}}}};
         auto old_realm = Realm::get_shared_realm(config);
+        {
+            auto tr = db->start_write();
+            auto table = tr->get_table("class_object");
+            table->create_object();
+            tr->commit();
+        }
         old_realm->read_group();
 
         {
             auto tr = db->start_write();
-            tr->add_table("class_object 2")->add_column(type_Int, "value");
+            auto table = tr->add_table("class_object 2");
+            ColKey val_col = table->add_column(type_Int, "value");
+            table->create_object().set(val_col, 1);
             tr->commit();
         }
 
@@ -862,15 +874,51 @@ TEST_CASE("SharedRealm: schema_subset_mode") {
         REQUIRE(old_realm->freeze()->schema().size() == 1);
         REQUIRE(new_realm->freeze()->schema().size() == 2);
         REQUIRE(Realm::get_frozen_realm(config, new_realm->read_transaction_version())->schema().size() == 2);
-        // Fails because the requested version doesn't have the "object 2" table
-        // required by the config
+        // An additive change is allowed, the unknown table is empty
+        REQUIRE(Realm::get_frozen_realm(config, old_realm->read_transaction_version())->schema().size() == 2);
+
+        config.schema = Schema{{"object", {{"value", PropertyType::String}}}}; // int -> string
+        // Fails because the schema has an invalid breaking change
+        REQUIRE_THROWS_AS(Realm::get_frozen_realm(config, new_realm->read_transaction_version()),
+                          InvalidReadOnlySchemaChangeException);
         REQUIRE_THROWS_AS(Realm::get_frozen_realm(config, old_realm->read_transaction_version()),
-                          InvalidExternalSchemaChangeException);
+                          InvalidReadOnlySchemaChangeException);
+        config.schema = Schema{
+            {"object", {{"value", PropertyType::Int}}},
+            {"object 2", {{"value", PropertyType::String}}}, // int -> string
+        };
+        // fails due to invalid change on object 2 type
+        REQUIRE_THROWS_AS(Realm::get_frozen_realm(config, new_realm->read_transaction_version()),
+                          InvalidReadOnlySchemaChangeException);
+        // opening the old state does not fail because the schema is an additive change
+        auto frozen_old = Realm::get_frozen_realm(config, old_realm->read_transaction_version());
+        REQUIRE(frozen_old->schema().size() == 2);
+        {
+            TableRef table = frozen_old->read_group().get_table("class_object");
+            Results results(frozen_old, table);
+            REQUIRE(results.is_frozen());
+            REQUIRE(results.size() == 1);
+        }
+        {
+            TableRef table = frozen_old->read_group().get_table("class_object 2");
+            REQUIRE(!table);
+            Results results(frozen_old, table);
+            REQUIRE(results.is_frozen());
+            REQUIRE(results.size() == 0);
+        }
+        config.schema = Schema{
+            {"object", {{"value", PropertyType::Int}, {"value 2", PropertyType::String}}}, // add property
+        };
+        // fails due to additional property on object
+        REQUIRE_THROWS_AS(Realm::get_frozen_realm(config, old_realm->read_transaction_version()),
+                          InvalidReadOnlySchemaChangeException);
+        REQUIRE_THROWS_AS(Realm::get_frozen_realm(config, new_realm->read_transaction_version()),
+                          InvalidReadOnlySchemaChangeException);
     }
 }
 
 #if REALM_ENABLE_SYNC
-TEST_CASE("Get Realm using Async Open", "[asyncOpen]") {
+TEST_CASE("Get Realm using Async Open", "[sync][pbs][async open]") {
     if (!util::EventLoop::has_implementation())
         return;
 
@@ -1291,7 +1339,7 @@ TEST_CASE("Get Realm using Async Open", "[asyncOpen]") {
     }
 }
 
-TEST_CASE("SharedRealm: convert") {
+TEST_CASE("SharedRealm: convert", "[sync][pbs][convert]") {
     TestSyncManager tsm;
     ObjectSchema object_schema = {"object",
                                   {
@@ -1387,7 +1435,7 @@ TEST_CASE("SharedRealm: convert") {
     }
 }
 
-TEST_CASE("SharedRealm: convert - embedded objects") {
+TEST_CASE("SharedRealm: convert - embedded objects", "[sync][pbs][convert][embedded objects]") {
     TestSyncManager tsm;
     ObjectSchema object_schema = {"object",
                                   {
@@ -3690,7 +3738,7 @@ struct ModeHardResetFile {
     static constexpr bool should_call_init_on_version_bump = true;
 };
 
-TEMPLATE_TEST_CASE("SharedRealm: update_schema with initialization_function", "[init][update_schema]", ModeAutomatic,
+TEMPLATE_TEST_CASE("SharedRealm: update_schema with initialization_function", "[init][update schema]", ModeAutomatic,
                    ModeAdditive, ModeManual, ModeSoftResetFile, ModeHardResetFile)
 {
     TestFile config;

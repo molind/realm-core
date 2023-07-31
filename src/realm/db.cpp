@@ -1306,7 +1306,18 @@ void DB::open(const std::string& path, bool no_create_file, const DBOptions& opt
                 }
 
                 alloc.convert_from_streaming_form(top_ref);
-
+                try {
+                    bool file_changed_size = alloc.align_filesize_for_mmap(top_ref, cfg);
+                    if (file_changed_size) {
+                        // we need to re-establish proper mappings after file size change.
+                        // we do this simply by aborting and starting all over:
+                        continue;
+                    }
+                }
+                // something went wrong. Retry.
+                catch (SlabAlloc::Retry&) {
+                    continue;
+                }
                 if (options.encryption_key) {
 #ifdef _WIN32
                     uint64_t pid = GetCurrentProcessId();
@@ -2774,6 +2785,14 @@ DBRef DB::create(std::unique_ptr<Replication> repl, const DBOptions& options) NO
     retval->m_history = std::move(repl);
     retval->open(*retval->m_history, options);
     return retval;
+}
+
+DBRef DB::create_in_memory(std::unique_ptr<Replication> repl, const std::string& in_memory_path,
+                           const DBOptions& options) NO_THREAD_SAFETY_ANALYSIS
+{
+    DBRef db = create(std::move(repl), options);
+    db->m_db_path = in_memory_path;
+    return db;
 }
 
 DBRef DB::create(BinaryData buffer, bool take_ownership) NO_THREAD_SAFETY_ANALYSIS

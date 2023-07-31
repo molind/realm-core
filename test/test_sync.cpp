@@ -185,8 +185,8 @@ TEST(Sync_AsyncWaitForUploadCompletion)
 
     auto wait = [&] {
         BowlOfStonesSemaphore bowl;
-        auto handler = [&](std::error_code ec) {
-            if (CHECK_NOT(ec))
+        auto handler = [&](Status status) {
+            if (CHECK(status.is_ok()))
                 bowl.add_stone();
         };
         session.async_wait_for_upload_completion(handler);
@@ -228,8 +228,8 @@ TEST(Sync_AsyncWaitForUploadCompletionNoPendingLocalChanges)
 
     auto pf = util::make_promise_future<bool>();
     session.async_wait_for_upload_completion(
-        [promise = std::move(pf.promise), tr = db->start_read()](std::error_code ec) mutable {
-            REALM_ASSERT(!ec);
+        [promise = std::move(pf.promise), tr = db->start_read()](Status status) mutable {
+            REALM_ASSERT(status.is_ok());
             tr->advance_read();
             promise.emplace_value(tr->get_history()->no_pending_local_changes(tr->get_version()));
         });
@@ -247,8 +247,8 @@ TEST(Sync_AsyncWaitForDownloadCompletion)
 
     auto wait = [&](Session& session) {
         BowlOfStonesSemaphore bowl;
-        auto handler = [&](std::error_code ec) {
-            if (CHECK_NOT(ec))
+        auto handler = [&](Status status) {
+            if (CHECK(status.is_ok()))
                 bowl.add_stone();
         };
         session.async_wait_for_download_completion(handler);
@@ -309,8 +309,8 @@ TEST(Sync_AsyncWaitForSyncCompletion)
 
     auto wait = [&](Session& session) {
         BowlOfStonesSemaphore bowl;
-        auto handler = [&](std::error_code ec) {
-            if (CHECK_NOT(ec))
+        auto handler = [&](Status status) {
+            if (CHECK(status.is_ok()))
                 bowl.add_stone();
         };
         session.async_wait_for_sync_completion(handler);
@@ -355,23 +355,15 @@ TEST(Sync_AsyncWaitCancellation)
     ClientServerFixture fixture(dir, test_context);
 
     BowlOfStonesSemaphore bowl;
-    auto upload_completion_handler = [&](std::error_code ec) {
-        CHECK_EQUAL(util::error::operation_aborted, ec);
-        bowl.add_stone();
-    };
-    auto download_completion_handler = [&](std::error_code ec) {
-        CHECK_EQUAL(util::error::operation_aborted, ec);
-        bowl.add_stone();
-    };
-    auto sync_completion_handler = [&](std::error_code ec) {
-        CHECK_EQUAL(util::error::operation_aborted, ec);
+    auto completion_handler = [&](Status status) {
+        CHECK_EQUAL(status, ErrorCodes::OperationAborted);
         bowl.add_stone();
     };
     {
         Session session = fixture.make_bound_session(db, "/test");
-        session.async_wait_for_upload_completion(upload_completion_handler);
-        session.async_wait_for_download_completion(download_completion_handler);
-        session.async_wait_for_sync_completion(sync_completion_handler);
+        session.async_wait_for_upload_completion(completion_handler);
+        session.async_wait_for_download_completion(completion_handler);
+        session.async_wait_for_sync_completion(completion_handler);
         // Destruction of session cancels wait operations
     }
     fixture.start();
@@ -552,7 +544,7 @@ TEST(Sync_WaitForSessionTerminations)
     // Note: Atomicity would not be needed if
     // Session::async_wait_for_download_completion() was assumed to work.
     std::atomic<bool> called{false};
-    auto handler = [&](std::error_code) {
+    auto handler = [&](Status) {
         called = true;
     };
     session.async_wait_for_download_completion(std::move(handler));
@@ -1468,7 +1460,8 @@ TEST(Sync_Randomized)
     for (size_t i = 1; i < num_clients; ++i) {
         ReadTransaction rt(client_shared_groups[i]);
         rt.get_group().verify();
-        CHECK(compare_groups(rt_0, rt));
+        // Logger is guaranteed to be defined
+        CHECK(compare_groups(rt_0, rt, *test_context.logger));
     }
 }
 
@@ -3696,6 +3689,7 @@ TEST(Sync_UploadDownloadProgress_6)
     session_config.signed_user_token = g_signed_test_user_token;
 
     std::mutex mutex;
+    std::condition_variable session_cv;
     auto session = std::make_unique<Session>(client, db, nullptr, nullptr, std::move(session_config));
 
     auto progress_handler = [&](uint_fast64_t downloaded_bytes, uint_fast64_t downloadable_bytes,
@@ -3709,20 +3703,78 @@ TEST(Sync_UploadDownloadProgress_6)
         CHECK_EQUAL(snapshot_version, 1);
         std::lock_guard lock{mutex};
         session.reset();
+        session_cv.notify_one();
     };
 
     session->set_progress_handler(progress_handler);
 
     {
-        std::lock_guard lock{mutex};
+        std::unique_lock lock{mutex};
         session->bind();
+        // Wait until the progress handler is called on the session before tearing down the client
+        session_cv.wait_for(lock, std::chrono::seconds(30), [&session]() {
+            return !bool(session);
+        });
     }
 
     client.shutdown_and_wait();
     server.stop();
     server_thread.join();
 
-    // The check is that we reach this point without deadlocking.
+    // The check is that we reach this point without deadlocking or throwing an assert while tearing
+    // down the active session
+}
+
+// This test has a single client starting to connect to the server with one session.
+// The client is torn down immediately after bind is called on the session.
+// The session will still be active and has an unactualized session wrapper when the
+// client is torn down, which leads to both calls to finalize_before_actualization() and
+// and finalize().
+TEST(Sync_UploadDownloadProgress_7)
+{
+    TEST_DIR(server_dir);
+    TEST_CLIENT_DB(db);
+
+    Server::Config server_config;
+    server_config.logger = std::make_shared<util::PrefixLogger>("Server: ", test_context.logger);
+    server_config.listen_address = "localhost";
+    server_config.listen_port = "";
+    server_config.tcp_no_delay = true;
+
+    util::Optional<PKey> public_key = PKey::load_public(test_server_key_path());
+    Server server(server_dir, std::move(public_key), server_config);
+    server.start();
+
+    auto server_port = server.listen_endpoint().port();
+
+    ThreadWrapper server_thread;
+    server_thread.start([&] {
+        server.run();
+    });
+
+    Client::Config client_config;
+    client_config.logger = std::make_shared<util::PrefixLogger>("Client: ", test_context.logger);
+    auto socket_provider = std::make_shared<websocket::DefaultSocketProvider>(client_config.logger, "");
+    client_config.socket_provider = socket_provider;
+    client_config.reconnect_mode = ReconnectMode::testing;
+    client_config.one_connection_per_session = false;
+    Client client(client_config);
+
+    Session::Config session_config;
+    session_config.server_address = "localhost";
+    session_config.server_port = server_port;
+    session_config.realm_identifier = "/test";
+    session_config.signed_user_token = g_signed_test_user_token;
+
+    auto session = std::make_unique<Session>(client, db, nullptr, nullptr, std::move(session_config));
+    session->bind();
+
+    client.shutdown_and_wait();
+    server.stop();
+    server_thread.join();
+
+    // The check is that we reach this point without deadlocking or throwing an assert while tearing
+    // down the session that is in the process of being created.
 }
 
 // Commenting out test for now and will be fixed in a later PR
@@ -6598,7 +6650,7 @@ TEST(Sync_NonIncreasingServerVersions)
         return ++timestamp;
     });
 
-    auto latest_local_verson = [&] {
+    auto latest_local_version = [&] {
         auto tr = db->start_write();
         tr->add_table_with_primary_key("class_foo", type_String, "_id")->add_column(type_Int, "int_col");
         return tr->commit();
@@ -6608,7 +6660,7 @@ TEST(Sync_NonIncreasingServerVersions)
     auto prep_changeset = [&](auto pk_name, auto int_col_val) {
         Changeset changeset;
         changeset.version = 10;
-        changeset.last_integrated_remote_version = latest_local_verson - 1;
+        changeset.last_integrated_remote_version = latest_local_version - 1;
         changeset.origin_timestamp = ++timestamp;
         changeset.origin_file_ident = 1;
         instr::PrimaryKey pk{changeset.intern_string(pk_name)};
@@ -6648,7 +6700,7 @@ TEST(Sync_NonIncreasingServerVersions)
 
     SyncProgress progress = {};
     progress.download.server_version = server_changesets.back().version;
-    progress.download.last_integrated_client_version = latest_local_verson - 1;
+    progress.download.last_integrated_client_version = latest_local_version - 1;
     progress.latest_server_version.version = server_changesets.back().version;
     progress.latest_server_version.salt = 0x7876543217654321;
 
@@ -6749,7 +6801,7 @@ TEST(Sync_SetAndGetEmptyReciprocalChangeset)
         return ++timestamp;
     });
 
-    auto latest_local_verson = [&] {
+    auto latest_local_version = [&] {
         auto tr = db->start_write();
         // Create schema: single table with array of ints as property.
         tr->add_table_with_primary_key("class_table", type_Int, "_id")->add_column_list(type_Int, "ints");
@@ -6782,7 +6834,7 @@ TEST(Sync_SetAndGetEmptyReciprocalChangeset)
     instr.prior_size = 8;
     changeset.push_back(instr);
     changeset.version = 1;
-    changeset.last_integrated_remote_version = latest_local_verson - 1;
+    changeset.last_integrated_remote_version = latest_local_version - 1;
     changeset.origin_timestamp = timestamp;
     changeset.origin_file_ident = 2;
 
@@ -6795,7 +6847,7 @@ TEST(Sync_SetAndGetEmptyReciprocalChangeset)
 
     SyncProgress progress = {};
     progress.download.server_version = changeset.version;
-    progress.download.last_integrated_client_version = latest_local_verson - 1;
+    progress.download.last_integrated_client_version = latest_local_version - 1;
     progress.latest_server_version.version = changeset.version;
     progress.latest_server_version.salt = 0x7876543217654321;
 
@@ -6807,7 +6859,7 @@ TEST(Sync_SetAndGetEmptyReciprocalChangeset)
                                         DownloadBatchState::SteadyState, logger, transact);
 
     bool is_compressed = false;
-    auto data = history.get_reciprocal_transform(latest_local_verson, is_compressed);
+    auto data = history.get_reciprocal_transform(latest_local_version, is_compressed);
     Changeset reciprocal_changeset;
     ChunkedBinaryInputStream in{data};
     if (is_compressed) {
@@ -6905,6 +6957,67 @@ TEST(Sync_TransformAgainstEmptyReciprocalChangeset)
     group_1.verify();
     group_2.verify();
     CHECK(compare_groups(rt_1, rt_2));
+}
+
+TEST(Sync_ServerVersionsSkippedFromDownloadCursor)
+{
+    TEST_CLIENT_DB(db);
+
+    auto& history = get_history(db);
+    history.set_client_file_ident(SaltedFileIdent{2, 0x1234567812345678}, false);
+    timestamp_type timestamp{1};
+    history.set_local_origin_timestamp_source([&] {
+        return ++timestamp;
+    });
+
+    auto latest_local_version = [&] {
+        auto tr = db->start_write();
+        tr->add_table_with_primary_key("class_foo", type_String, "_id")->add_column(type_Int, "int_col");
+        return tr->commit();
+    }();
+
+    Changeset server_changeset;
+    server_changeset.version = 10;
+    server_changeset.last_integrated_remote_version = latest_local_version - 1;
+    server_changeset.origin_timestamp = ++timestamp;
+    server_changeset.origin_file_ident = 1;
+
+    std::vector<ChangesetEncoder::Buffer> encoded;
+    std::vector<Transformer::RemoteChangeset> server_changesets_encoded;
+    encoded.emplace_back();
+    encode_changeset(server_changeset, encoded.back());
+    server_changesets_encoded.emplace_back(server_changeset.version, server_changeset.last_integrated_remote_version,
+                                           BinaryData(encoded.back().data(), encoded.back().size()),
+                                           server_changeset.origin_timestamp, server_changeset.origin_file_ident);
+
+    SyncProgress progress = {};
+    // The server skips 10 server versions.
+    progress.download.server_version = server_changeset.version + 10;
+    progress.download.last_integrated_client_version = latest_local_version - 1;
+    progress.latest_server_version.version = server_changeset.version + 15;
+    progress.latest_server_version.salt = 0x7876543217654321;
+
+    uint_fast64_t downloadable_bytes = 0;
+    VersionInfo version_info;
+    util::StderrLogger logger;
+    auto transact = db->start_read();
+    history.integrate_server_changesets(progress, &downloadable_bytes, server_changesets_encoded, version_info,
+                                        DownloadBatchState::SteadyState, logger, transact);
+
+    version_type current_version;
+    SaltedFileIdent file_ident;
+    SyncProgress expected_progress;
+    history.get_status(current_version, file_ident, expected_progress);
+
+    // Check progress is reported correctly.
+    CHECK_EQUAL(progress.latest_server_version.salt, expected_progress.latest_server_version.salt);
+    CHECK_EQUAL(progress.latest_server_version.version, expected_progress.latest_server_version.version);
+    CHECK_EQUAL(progress.download.last_integrated_client_version,
+                expected_progress.download.last_integrated_client_version);
+    CHECK_EQUAL(progress.download.server_version, expected_progress.download.server_version);
+    CHECK_EQUAL(progress.upload.client_version, expected_progress.upload.client_version);
+    CHECK_EQUAL(progress.upload.last_integrated_server_version,
+                expected_progress.upload.last_integrated_server_version);
 }
 
 } // unnamed namespace
