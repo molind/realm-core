@@ -152,12 +152,12 @@ void SyncSession::become_dying(util::CheckedUniqueLock lock)
     m_state_mutex.unlock(lock);
 }
 
-void SyncSession::become_inactive(util::CheckedUniqueLock lock, Status status)
+void SyncSession::become_inactive(util::CheckedUniqueLock lock, Status status, bool cancel_subscription_notifications)
 {
     REALM_ASSERT(m_state != State::Inactive);
     m_state = State::Inactive;
 
-    do_become_inactive(std::move(lock), status);
+    do_become_inactive(std::move(lock), status, cancel_subscription_notifications);
 }
 
 void SyncSession::become_paused(util::CheckedUniqueLock lock)
@@ -172,7 +172,7 @@ void SyncSession::become_paused(util::CheckedUniqueLock lock)
         return;
     }
 
-    do_become_inactive(std::move(lock), Status::OK());
+    do_become_inactive(std::move(lock), Status::OK(), true);
 }
 
 void SyncSession::do_restart_session(util::CheckedUniqueLock)
@@ -198,7 +198,8 @@ void SyncSession::do_restart_session(util::CheckedUniqueLock)
     become_active();
 }
 
-void SyncSession::do_become_inactive(util::CheckedUniqueLock lock, Status status)
+void SyncSession::do_become_inactive(util::CheckedUniqueLock lock, Status status,
+                                     bool cancel_subscription_notifications)
 {
     // Manually set the disconnected state. Sync would also do this, but
     // since the underlying SyncSession object already have been destroyed,
@@ -216,6 +217,7 @@ void SyncSession::do_become_inactive(util::CheckedUniqueLock lock, Status status
         m_sync_manager->unregister_session(m_db->get_path());
     }
 
+    auto subscription_store = m_flx_subscription_store;
     m_state_mutex.unlock(lock);
 
     // Send notifications after releasing the lock to prevent deadlocks in the callback.
@@ -225,6 +227,10 @@ void SyncSession::do_become_inactive(util::CheckedUniqueLock lock, Status status
 
     if (status.is_ok())
         status = Status(ErrorCodes::OperationAborted, "Sync session became inactive");
+
+    if (subscription_store && cancel_subscription_notifications) {
+        subscription_store->notify_all_state_change_notifications(status);
+    }
 
     // Inform any queued-up completion handlers that they were cancelled.
     for (auto& [id, callback] : waits)
@@ -610,7 +616,9 @@ void SyncSession::handle_fresh_realm_downloaded(DBRef db, Status status,
             else
                 m_completion_callbacks.merge(std::move(callbacks));
         });
-        become_inactive(std::move(lock)); // unlocks the lock
+        // Do not cancel the notifications on subscriptions.
+        bool cancel_subscription_notifications = false;
+        become_inactive(std::move(lock), Status::OK(), cancel_subscription_notifications); // unlocks the lock
 
         // Once the session is inactive, update sync config and subscription store after migration.
         if (server_requests_action == sync::ProtocolErrorInfo::Action::MigrateToFLX ||
@@ -651,7 +659,6 @@ void SyncSession::handle_error(sync::SessionErrorInfo error)
             case sync::ProtocolErrorInfo::Action::ApplicationBug:
                 [[fallthrough]];
             case sync::ProtocolErrorInfo::Action::ProtocolViolation:
-                next_state = NextStateAfterError::inactive;
                 break;
             case sync::ProtocolErrorInfo::Action::Warning:
                 break; // not fatal, but should be bubbled up to the user below.
@@ -740,7 +747,7 @@ void SyncSession::handle_error(sync::SessionErrorInfo error)
         return;
     }
 
-    // Dont't bother invoking m_config.error_handler if the sync is inactive.
+    // Don't bother invoking m_config.error_handler if the sync is inactive.
     // It does not make sense to call the handler when the session is closed.
     if (m_state == State::Inactive || m_state == State::Paused) {
         return;
@@ -772,17 +779,16 @@ void SyncSession::handle_error(sync::SessionErrorInfo error)
     }
 }
 
-void SyncSession::cancel_pending_waits(util::CheckedUniqueLock lock, Status error,
-                                       std::optional<Status> subs_notify_error)
+void SyncSession::cancel_pending_waits(util::CheckedUniqueLock lock, Status error)
 {
     CompletionCallbacks callbacks;
     std::swap(callbacks, m_completion_callbacks);
 
     // Inform any waiters on pending subscription states that they were cancelled
-    if (subs_notify_error && m_flx_subscription_store) {
+    if (m_flx_subscription_store) {
         auto subscription_store = m_flx_subscription_store;
         m_state_mutex.unlock(lock);
-        subscription_store->notify_all_state_change_notifications(*subs_notify_error);
+        subscription_store->notify_all_state_change_notifications(error);
     }
     else {
         m_state_mutex.unlock(lock);
@@ -914,19 +920,6 @@ void SyncSession::create_sync_session()
 
     std::weak_ptr<SyncSession> weak_self = weak_from_this();
 
-    // Configure the sync transaction callback.
-    auto wrapped_callback = [weak_self](VersionID old_version, VersionID new_version) {
-        std::function<TransactionCallback> callback;
-        if (auto self = weak_self.lock()) {
-            util::CheckedLockGuard l(self->m_state_mutex);
-            callback = self->m_sync_transact_callback;
-        }
-        if (callback) {
-            callback(old_version, new_version);
-        }
-    };
-    m_session->set_sync_transact_callback(std::move(wrapped_callback));
-
     // Set up the wrapped progress handler callback
     m_session->set_progress_handler([weak_self](uint_fast64_t downloaded, uint_fast64_t downloadable,
                                                 uint_fast64_t uploaded, uint_fast64_t uploadable,
@@ -972,12 +965,6 @@ void SyncSession::create_sync_session()
                 self->handle_error(std::move(*error));
             }
         });
-}
-
-void SyncSession::set_sync_transact_callback(std::function<sync::Session::SyncTransactCallback>&& callback)
-{
-    util::CheckedLockGuard l(m_state_mutex);
-    m_sync_transact_callback = std::move(callback);
 }
 
 void SyncSession::nonsync_transact_notify(sync::version_type version)
@@ -1383,16 +1370,7 @@ void SyncSession::create_subscription_store()
     // remain valid afterwards for the life of the SyncSession, but m_flx_subscription_store
     // will be reset when rolling back to PBS after a client FLX migration
     if (!m_subscription_store_base) {
-        m_subscription_store_base = sync::SubscriptionStore::create(m_db, [this](int64_t new_version) {
-            util::CheckedLockGuard lk(m_state_mutex);
-            if (m_state != State::Active && m_state != State::WaitingForAccessToken) {
-                return;
-            }
-            // There may be no session yet (i.e., waiting to refresh the access token).
-            if (m_session) {
-                m_session->on_new_flx_sync_subscription(new_version);
-            }
-        });
+        m_subscription_store_base = sync::SubscriptionStore::create(m_db);
     }
 
     // m_subscription_store_base is always around for the life of SyncSession, but the

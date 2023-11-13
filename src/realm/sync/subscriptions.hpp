@@ -249,6 +249,9 @@ public:
     bool erase(StringData name);
     bool erase(const Query& query);
 
+    bool erase_by_class_name(StringData object_class_name);
+    bool erase_by_id(ObjectId id);
+
     // Updates the state of the transaction and optionally updates its error information.
     //
     // You may only set an error_str when the State is State::Error.
@@ -298,7 +301,7 @@ using SubscriptionStoreRef = std::shared_ptr<SubscriptionStore>;
 // A SubscriptionStore manages the FLX metadata tables, SubscriptionSets and Subscriptions.
 class SubscriptionStore : public std::enable_shared_from_this<SubscriptionStore> {
 public:
-    static SubscriptionStoreRef create(DBRef db, util::UniqueFunction<void(int64_t)> on_new_subscription_set);
+    static SubscriptionStoreRef create(DBRef db);
 
     SubscriptionStore(const SubscriptionStore&) = delete;
     SubscriptionStore& operator=(const SubscriptionStore&) = delete;
@@ -341,8 +344,7 @@ public:
         DB::version_type snapshot_version;
     };
 
-    util::Optional<PendingSubscription> get_next_pending_version(int64_t last_query_version,
-                                                                 DB::version_type after_client_version) const;
+    util::Optional<PendingSubscription> get_next_pending_version(int64_t last_query_version) const;
     std::vector<SubscriptionSet> get_pending_subscriptions() const;
 
     // Notify all subscription state change notification handlers on this subscription store with the
@@ -360,7 +362,7 @@ private:
     DBRef m_db;
 
 protected:
-    explicit SubscriptionStore(DBRef db, util::UniqueFunction<void(int64_t)> on_new_subscription_set);
+    explicit SubscriptionStore(DBRef db);
 
     struct NotificationRequest {
         NotificationRequest(int64_t version, util::Promise<SubscriptionSet::State> promise,
@@ -403,8 +405,6 @@ protected:
     ColKey m_sub_set_state;
     ColKey m_sub_set_error_str;
     ColKey m_sub_set_subscriptions;
-
-    util::UniqueFunction<void(int64_t)> m_on_new_subscription_set;
 
     mutable std::mutex m_pending_notifications_mutex;
     mutable std::condition_variable m_pending_notifications_cv;
