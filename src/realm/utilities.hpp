@@ -193,7 +193,7 @@ inline int ctz(size_t x)
 #ifdef REALM_PTR_64
     return __builtin_ctzll(x); // returns int
 #else
-    return __builtin_ctz(x); // returns int
+    return __builtin_ctz(x);      // returns int
 #endif
 #elif defined(_WIN32)
     unsigned long index = 0;
@@ -361,6 +361,14 @@ constexpr inline size_t round_down(size_t p, size_t align)
     return r & (~(align - 1));
 }
 
+// return pointer to found character or to terminating NUL
+static inline const char* find_chr(const char* p, char c)
+{
+    while (*p && *p != c) {
+        ++p;
+    }
+    return p;
+}
 
 #ifdef _WIN32
 typedef HANDLE FileDesc;

@@ -7,6 +7,7 @@
 #   * Add the `allowed_requesters: [ "ad_hoc", "patch" ]` entry to the nightly task to only run for periodic tests
 # * Commit Builds:
 #   * All other tasks will be included in the set run when a PR is merged to master
+# * To prevent a task from running at all, add the `"disabled"` tag so it will be skipped by the any of the test runs.
 
 # Some tests take up to 4 hours to run, so give a very generous timeout project-wide, but generally try to complete tasks within 30 minutes.
 exec_timeout_secs: 14400
@@ -75,8 +76,12 @@ functions:
           fi
 
           if [ -z "${disable_tests_against_baas|}" ]; then
+              scheme="http"
               set_cmake_var baas_vars REALM_ENABLE_AUTH_TESTS BOOL On
-              set_cmake_var baas_vars REALM_MONGODB_ENDPOINT STRING "http://localhost:9090"
+              set_cmake_var baas_vars REALM_MONGODB_ENDPOINT STRING "$scheme://localhost:9090"
+              if [ -n "${baas_admin_port|}" ]; then
+                set_cmake_var baas_vars REALM_ADMIN_ENDPOINT STRING "$scheme://localhost:${baas_admin_port}"
+              fi
           fi
 
           if [ -n "${enable_asan|}" ]; then
@@ -132,7 +137,11 @@ functions:
           fi
 
           set_cmake_var realm_vars REALM_TEST_LOGGING BOOL On
-          set_cmake_var realm_vars REALM_TEST_LOGGING_LEVEL STRING "debug"
+          set_cmake_var realm_vars REALM_TEST_LOGGING_LEVEL STRING "${test_logging_level|debug}"
+
+          if [[ -n "${test_timeout_extra|}" ]]; then
+              set_cmake_var realm_vars REALM_TEST_TIMEOUT_EXTRA STRING ${test_timeout_extra}
+          fi
 
           GENERATOR="${cmake_generator}"
           if [ -z "${cmake_generator|}" ]; then
@@ -140,10 +149,17 @@ functions:
               set_cmake_var generator_vars CMAKE_MAKE_PROGRAM PATH "${ninja|ninja}"
           fi
 
-          if [ -n "${curl_base|}" ]; then
-              set_cmake_var curl_vars CURL_LIBRARY PATH "$(./evergreen/abspath.sh ${curl_base}/lib/curl.lib)"
-              set_cmake_var curl_vars CURL_INCLUDE_DIR PATH "$(./evergreen/abspath.sh ${curl_base}/include)"
+          if [ -n "${cmake_generator_platform|}" ]; then
+            set_cmake_var realm_vars CMAKE_GENERATOR_PLATFORM STRING "${cmake_generator_platform}"
           fi
+
+          if [ -n "${curl_base|}" ]; then
+              set_cmake_var curl_vars CURL_LIBRARY PATH "$(./evergreen/abspath.sh ${curl_base}/lib/libcurl.dll.a)"
+              set_cmake_var curl_vars CURL_INCLUDE_DIR PATH "$(./evergreen/abspath.sh ${curl_base}/include)"
+              set_cmake_var baas_vars REALM_CURL_CACERTS PATH "$(./evergreen/abspath.sh "${curl_base}/bin/cacert.pem")"
+          fi
+
+          set_cmake_var realm_vars REALM_NO_TESTS BOOL ${no_tests|Off}
 
           echo "Running cmake with these vars:"
           cat cmake_vars/*.txt | tee cmake_vars.txt
@@ -205,6 +221,10 @@ functions:
               export DEVELOPER_DIR="${xcode_developer_dir}"
           fi
 
+          if [[ -n "${curl_base}" ]]; then
+              export PATH="${curl_base}/bin":$PATH
+          fi
+
           # NOTE: These two values will be ANDed together for matching tests
           TEST_FLAGS=
           if [[ -n "${test_label}" ]]; then
@@ -216,6 +236,8 @@ functions:
 
           if [[ -n "${verbose_test_output}" ]]; then
               TEST_FLAGS="$TEST_FLAGS -VV"
+              export UNITTEST_THREADS=1
+              export UNITTEST_LOG_LEVEL="${test_logging_level|debug}"
           else
               TEST_FLAGS="$TEST_FLAGS -V"
           fi
@@ -250,14 +272,12 @@ functions:
               rm "$UNITTEST_EVERGREEN_TEST_RESULTS"
           fi
           export UNITTEST_PROGRESS=1
-          if [[ -n "${report_test_progress|}" ]]; then
-              export UNITTEST_PROGRESS="${report_test_progress|}"
-          fi
 
           if [[ -n "${run_with_encryption}" ]]; then
               export UNITTEST_ENCRYPT_ALL=1
           fi
-          export TSAN_OPTIONS="suppressions=$(pwd)/test/tsan.suppress"
+          export TSAN_OPTIONS="suppressions=$(pwd)/test/tsan.suppress history_size=4"
+          export UBSAN_OPTIONS="print_stacktrace=1"
 
           cd build
           if ! $CTEST -C ${cmake_build_type|Debug} $TEST_FLAGS; then
@@ -274,6 +294,8 @@ functions:
   - command: attach.results
     params:
       file_location: realm-core/${task_name}_results.json
+
+  "upload baas artifacts":
   - command: shell.exec
     params:
       working_dir: realm-core
@@ -289,7 +311,7 @@ functions:
 
         # Copy the baas_server log from the remote baas host if it exists
         if [[ ! -f baas_host.yml || ! -f .baas_ssh_key ]]; then
-          echo "No remote baas host or remote baas host definitions not found"
+          echo "Skipping - no remote baas host or remote baas host definitions not found"
           exit 0
         fi
 
@@ -299,14 +321,22 @@ functions:
         ssh_user="$(printf "ubuntu@%s" "$BAAS_HOST_NAME")"
         ssh_options="-o ForwardAgent=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o ConnectTimeout=60 -i .baas_ssh_key"
 
-        # Copy the baas_server.log and mongod.log files from the remote baas host
-        REMOTE_PATH=/data/baas-remote/baas-work-dir
-        LOCAL_PATH=./baas-work-dir
+        # Copy the baas_server.log, mongod.log and (optionally) baas_proxy.log files from the remote baas host
+        REMOTE_PATH=/data/baas-remote
+        REMOTE_BAAS_PATH="$REMOTE_PATH/baas-work-dir"
+        REMOTE_BAAS_DB_PATH="$REMOTE_BAAS_PATH/mongodb-dbpath"
+        REMOTE_PROXY_PATH="$REMOTE_PATH/baas-proxy-dir"
 
-        mkdir -p "$LOCAL_PATH/"
-        mkdir -p "$LOCAL_PATH/mongodb-dbpath/"
-        scp $ssh_options $ssh_user:"$REMOTE_PATH/baas_server.log" "$LOCAL_PATH/baas_server.log" || true
-        scp $ssh_options $ssh_user:"$REMOTE_PATH/mongodb-dbpath/mongod.log" "$LOCAL_PATH/mongodb-dbpath/mongod.log" || true
+        LOCAL_BAAS_PATH=./baas-work-dir
+        LOCAL_BAAS_DB_PATH="$LOCAL_BAAS_PATH/mongodb-dbpath"
+        LOCAL_PROXY_PATH=./baas-proxy-dir
+
+        mkdir -p "$LOCAL_BAAS_PATH/"
+        mkdir -p "$LOCAL_BAAS_DB_PATH/"
+        mkdir -p "$LOCAL_PROXY_PATH/"
+        scp $ssh_options $ssh_user:"$REMOTE_BAAS_PATH/baas_server.log" "$LOCAL_BAAS_PATH/baas_server.log" || true
+        scp $ssh_options $ssh_user:"$REMOTE_BAAS_DB_PATH/mongod.log" "$LOCAL_BAAS_DB_PATH/mongod.log" || true
+        scp $ssh_options $ssh_user:"$REMOTE_PROXY_PATH/baas_proxy.log" "$LOCAL_PROXY_PATH/baas_proxy.log" || true
 
   - command: s3.put
     params:
@@ -316,7 +346,7 @@ functions:
       remote_file: 'realm-core-stable/${branch_name}/${task_id}/${execution}/baas_server.log'
       bucket: mciuploads
       permissions: public-read
-      content_type: text/text
+      content_type: text/plain
       display_name: baas server logs
       optional: true
   - command: s3.put
@@ -327,7 +357,7 @@ functions:
       remote_file: 'realm-core-stable/${branch_name}/${task_id}/${execution}/install_baas_output.log'
       bucket: mciuploads
       permissions: public-read
-      content_type: text/text
+      content_type: text/plain
       display_name: install baas output
       optional: true
   - command: s3.put
@@ -338,8 +368,19 @@ functions:
       remote_file: 'realm-core-stable/${branch_name}/${task_id}/${execution}/mongod.log'
       bucket: mciuploads
       permissions: public-read
-      content_type: text/text
+      content_type: text/plain
       display_name: mongod logs
+      optional: true
+  - command: s3.put
+    params:
+      aws_key: '${artifacts_aws_access_key}'
+      aws_secret: '${artifacts_aws_secret_key}'
+      local_file: 'realm-core/baas-proxy-dir/baas_proxy.log'
+      remote_file: 'realm-core-stable/${branch_name}/${task_id}/${execution}/baas_proxy.log'
+      bucket: mciuploads
+      permissions: public-read
+      content_type: text/plain
+      display_name: baas proxy logs
       optional: true
 
   "upload fuzzer results":
@@ -361,7 +402,7 @@ functions:
       remote_file: '${project}/${branch_name}/${task_id}/${execution}/realm-fuzzer-crash.txt'
       bucket: mciuploads
       permissions: public-read
-      content_type: text/text
+      content_type: text/plain
       display_name: Fuzzer crash report
       optional: true
 
@@ -533,13 +574,23 @@ functions:
         BAAS_USER=ubuntu
 
         OPT_BAAS_BRANCH=
+        OPT_BAAS_PROXY=
+        OPT_BAAS_DIRECT=
+
         if [ -n "${baas_branch}" ]; then
             OPT_BAAS_BRANCH="-b ${baas_branch}"
+        fi
+        if [ -n "${baas_proxy}" ]; then
+            OPT_BAAS_PROXY="-t"
+            if [ -n "${baas_admin_port}" ]; then
+                OPT_BAAS_DIRECT="-d ${baas_admin_port}"
+            fi
         fi
 
         # Run the setup_baas_host_local.sh script to configure and run baas on the remote host
         # Add -v to this command for verbose script logging
-        ./evergreen/setup_baas_host_local.sh -w ./baas-work-dir -u $BAAS_USER $OPT_BAAS_BRANCH ./baas_host_vars.sh ./.baas_ssh_key 2>&1 | tee install_baas_output.log
+        ./evergreen/setup_baas_host_local.sh -w ./baas-work-dir -u $BAAS_USER $OPT_BAAS_BRANCH $OPT_BAAS_PROXY \
+            $OPT_BAAS_DIRECT -i ./.baas_ssh_key ./baas_host_vars.sh 2>&1 | tee install_baas_output.log
 
   "wait for baas to start":
   - command: shell.exec
@@ -558,6 +609,53 @@ functions:
         ./evergreen/wait_for_baas.sh -s -w ./baas-work-dir -l ""
 
         echo "Baas is started!"
+
+  "wait for remote baas to start":
+  - command: shell.exec
+    params:
+      working_dir: realm-core
+      shell: bash
+      script: |-
+        set -o errexit
+        set -o verbose
+
+        if [[ -n "${disable_tests_against_baas|}" ]]; then
+          exit 0
+        fi
+
+        # Don't print out the tail of the log file
+        ./evergreen/wait_for_remote_baas.sh -i ./.baas_ssh_key ./baas_host_vars.sh  ./.baas_ssh_key
+
+        echo "Baas is started!"
+
+  "setup proxy parameters":
+  - command: shell.exec
+    params:
+      working_dir: realm-core
+      shell: bash
+      script: |-
+        set -o errexit
+        set -o pipefail
+        set -o verbose
+
+        if [[ -n "${disable_tests_against_baas|}" ]]; then
+          echo "Error: Baas is disabled for network tests"
+          exit 1
+        fi
+
+        if [[ -z "${proxy_toxics_file|}" ]]; then
+          echo "Error: Baas proxy toxics config file was not provided"
+          exit 1
+        fi
+
+        if [[ -n "${proxy_toxics_randoms|}" ]]; then
+          PROXY_RANDOMS="-r ${proxy_toxics_randoms}"
+        fi
+
+        # Configure the toxics for the baas proxy
+        evergreen/configure_baas_proxy.sh $PROXY_RANDOMS "${proxy_toxics_file}"
+        # Display the list of configured toxics
+        curl --silent http://localhost:8474/proxies/baas_proxy/toxics
 
   "check branch state":
   - command: shell.exec
@@ -630,6 +728,7 @@ tasks:
 
 - name: swift-build-and-test
   exec_timeout_secs: 1800
+  tags: [ "for_pull_requests" ]
   commands:
   - func: "fetch source"
   - func: "fetch binaries"
@@ -652,6 +751,7 @@ tasks:
 
 - name: validate-installed-headers
   exec_timeout_secs: 1800
+  tags: [ "for_pull_requests" ]
   commands:
   - func: "fetch source"
   - func: "fetch binaries"
@@ -701,7 +801,7 @@ tasks:
       script: |-
         export UNITTEST_PROGRESS=1
         export UNITTEST_THREADS=1
-        valgrind --tool=memcheck --leak-check=full --undef-value-errors=yes --track-origins=yes --child-silent-after-fork=no --trace-children=yes --suppressions=$(pwd)/../../test/valgrind.suppress --error-exitcode=1 ./RelWithDebInfo/realm-tests
+        valgrind --tool=memcheck --leak-check=full --undef-value-errors=yes --track-origins=yes --child-silent-after-fork=no --trace-children=yes --suppressions=$(pwd)/../../test/valgrind.suppress --error-exitcode=1 --max-threads=5000 ./RelWithDebInfo/realm-tests
 
 - name: bloaty
   exec_timeout_secs: 1800
@@ -791,7 +891,7 @@ tasks:
       remote_file: '${project}/${branch_name}/${task_id}/${execution}/bloaty-results-'
       bucket: mciuploads
       permissions: public-read
-      content_type: text/text
+      content_type: text/plain
       display_name: bloaty-results
   - command: s3.put
     params:
@@ -808,14 +908,13 @@ tasks:
 - name: long-running-core-tests
   tags: [ "for_nightly_tests" ]
   allowed_requesters: [ "ad_hoc", "patch" ]
+  # The long-running tests can take a really long time on Windows, so we give the test up to 4
+  # hours to complete
+  exec_timeout_secs: 14400
   commands:
   - func: "run tests"
-    # The long-running tests can take a really long time on Windows, so we give the test up to 4
-    # hours to complete
-    timeout_secs: 14400
     vars:
       test_filter: CoreTests
-      report_test_progress: On
 
 - name: core-tests
   tags: [ "test_suite", "for_pull_requests" ]
@@ -867,7 +966,7 @@ tasks:
 
 # These are local object store tests; baas is not started, however some use the sync server
 - name: object-store-tests
-  tags: [ "test_suite_remote_baas", "for_pull_requests" ]
+  tags: [ "for_pull_requests", "test_suite" ]
   exec_timeout_secs: 3600
   commands:
   - func: "compile"
@@ -882,16 +981,39 @@ tasks:
 
 # These are baas object store tests that run against baas running on a remote host
 - name: baas-integration-tests
-  tags: [ "test_suite_remote_baas", "for_pull_requests" ]
+  tags: [ "test_suite", "for_pull_requests", "requires_baas" ]
   exec_timeout_secs: 3600
   commands:
   - func: "launch remote baas"
+  - func: "compile"
     vars:
-      baas_branch: 3f31617aacfe5d31b9057fc298b735b60acd6424
+      target_to_build: ObjectStoreTests
+  - func: "wait for remote baas to start"
+  - func: "run tests"
+    vars:
+      test_label: objstore-baas
+      test_executable_name: "realm-object-store-tests"
+      verbose_test_output: true
+  - func: "check branch state"
+
+- name: baas-network-tests
+  # Uncomment once tests are passing
+  tags: [ "disabled" ]
+  # tags: [ "for_nightly_tests" ]
+  # These tests can be manually requested for patches and pull requests
+  allowed_requesters: [ "ad_hoc", "patch", "github_pr" ]
+  # The network tests can take a really long time, so we give the test up to 4
+  # hours to complete
+  exec_timeout_secs: 14400
+  commands:
+  - func: "launch remote baas"
+    vars:
+      baas_proxy: On
   - func: "compile"
     vars:
       target_to_build: ObjectStoreTests
   - func: "wait for baas to start"
+  - func: "setup proxy parameters"
   - func: "run tests"
     vars:
       test_label: objstore-baas
@@ -1074,13 +1196,28 @@ task_groups:
   - func: "fetch binaries"
   teardown_task:
   - func: "upload test results"
+  - func: "upload baas artifacts"
   timeout:
   - func: "run hang analyzer"
   tasks:
   - compile
   - .test_suite
-  - .test_suite_remote_baas
   - package
+
+# Runs core/sync/local object store tests
+- name: compile_local_tests
+  max_hosts: 1
+  setup_group_can_fail_task: true
+  setup_group:
+  - func: "fetch source"
+  - func: "fetch binaries"
+  teardown_task:
+  - func: "upload test results"
+  timeout:
+  - func: "run hang analyzer"
+  tasks:
+  - compile
+  - ".test_suite !.requires_baas"
 
 # Runs object-store-tests against baas running on remote host
 - name: compile_test
@@ -1091,12 +1228,28 @@ task_groups:
   - func: "fetch binaries"
   teardown_task:
   - func: "upload test results"
+  - func: "upload baas artifacts"
   timeout:
   - func: "run hang analyzer"
   tasks:
   - compile
   - .test_suite
-  - .test_suite_remote_baas
+
+# Runs object-store-tests against baas running on remote host and runs
+# the network simulation tests as a separate task for nightly builds
+- name: network_tests
+  max_hosts: 1
+  setup_group_can_fail_task: true
+  setup_group:
+  - func: "fetch source"
+  - func: "fetch binaries"
+  teardown_task:
+  - func: "upload test results"
+  - func: "upload baas artifacts"
+  timeout:
+  - func: "run hang analyzer"
+  tasks:
+  - baas-network-tests
 
 # Runs object-store-tests against baas running on remote host
 - name: compile_test_coverage
@@ -1107,12 +1260,12 @@ task_groups:
   - func: "fetch binaries"
   teardown_task:
   - func: "upload test results"
+  - func: "upload baas artifacts"
   timeout:
   - func: "run hang analyzer"
   tasks:
   - compile
   - .test_suite
-  - .test_suite_remote_baas
   - process_coverage_data
 
 - name: benchmarks
@@ -1163,7 +1316,7 @@ buildvariants:
   run_on: ubuntu2004-large
   expansions:
     clang_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/clang%2Bllvm-11.0.0-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-linux-x86_64.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-linux-x86_64.tar.gz"
     cmake_bindir: "./cmake_binaries/bin"
     fetch_missing_dependencies: On
     c_compiler: "./clang_binaries/bin/clang"
@@ -1194,7 +1347,7 @@ buildvariants:
   run_on: ubuntu2004-large
   expansions:
     clang_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/clang%2Bllvm-11.0.0-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-linux-x86_64.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-linux-x86_64.tar.gz"
     cmake_bindir: "./cmake_binaries/bin"
     fetch_missing_dependencies: On
     c_compiler: "./clang_binaries/bin/clang"
@@ -1208,7 +1361,7 @@ buildvariants:
   run_on: ubuntu2004-small
   expansions:
     clang_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/clang%2Bllvm-11.0.0-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-linux-x86_64.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-linux-x86_64.tar.gz"
     cmake_bindir: "./cmake_binaries/bin"
     fetch_missing_dependencies: On
     c_compiler: "./clang_binaries/bin/clang"
@@ -1226,7 +1379,7 @@ buildvariants:
   run_on: ubuntu2004-small
   expansions:
     clang_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/clang%2Bllvm-11.0.0-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-linux-x86_64.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-linux-x86_64.tar.gz"
     cmake_bindir: "./cmake_binaries/bin"
     fetch_missing_dependencies: On
     c_compiler: "./clang_binaries/bin/clang"
@@ -1245,7 +1398,7 @@ buildvariants:
   run_on: ubuntu2004-small
   expansions:
     clang_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/clang%2Bllvm-11.0.0-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-linux-x86_64.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-linux-x86_64.tar.gz"
     bloaty_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/bloaty-v1.1-39-gefc1c61-ubuntu2004-x86_64.tar.gz"
     cmake_bindir: "./cmake_binaries/bin"
     cmake_build_type: RelWithDebInfo
@@ -1268,7 +1421,7 @@ buildvariants:
   run_on: ubuntu2004-large
   expansions:
     clang_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/clang%2Bllvm-11.0.0-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-linux-x86_64.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-linux-x86_64.tar.gz"
     cmake_bindir: "./cmake_binaries/bin"
     fetch_missing_dependencies: On
     enable_asan: On
@@ -1287,7 +1440,7 @@ buildvariants:
   run_on: ubuntu2004-large
   expansions:
     clang_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/clang%2Bllvm-11.0.0-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-linux-x86_64.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-linux-x86_64.tar.gz"
     cmake_bindir: "./cmake_binaries/bin"
     fetch_missing_dependencies: On
     enable_tsan: On
@@ -1302,7 +1455,7 @@ buildvariants:
   run_on: ubuntu2004-small
   expansions:
     clang_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/clang%2Bllvm-11.0.0-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-linux-x86_64.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-linux-x86_64.tar.gz"
     cmake_bindir: "./cmake_binaries/bin"
     fetch_missing_dependencies: On
     enable_ubsan: On
@@ -1319,7 +1472,7 @@ buildvariants:
   run_on: ubuntu2004-large
   expansions:
     clang_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/clang%2Bllvm-11.0.0-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-linux-x86_64.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-linux-x86_64.tar.gz"
     cmake_bindir: "./cmake_binaries/bin"
     fetch_missing_dependencies: On
     enable_ubsan: On
@@ -1331,13 +1484,59 @@ buildvariants:
   tasks:
   - name: fuzzer-tests
 
+# disable these builders since there are constantly failing and not yet ready for nightly builds
+# - name: ubuntu2004-network-nonideal
+#   display_name: "Ubuntu 20.04 x86_64 (Utunbu2004 - nonideal transfer)"
+#   run_on: ubuntu2004-large
+#   expansions:
+#     clang_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/clang%2Bllvm-11.0.0-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
+#     cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-linux-x86_64.tar.gz"
+#     cmake_bindir: "./cmake_binaries/bin"
+#     fetch_missing_dependencies: On
+#     c_compiler: "./clang_binaries/bin/clang"
+#     cxx_compiler: "./clang_binaries/bin/clang++"
+#     cmake_build_type: RelWithDebInfo
+#     run_with_encryption: On
+#     baas_admin_port: 9098
+#     test_logging_level: debug
+#     test_timeout_extra: 60
+#     proxy_toxics_file: evergreen/proxy-nonideal-transfer.toxics
+#     # RANDOM1: bandwidth-upstream limited to between 10-50 KB/s from the client to the server
+#     # RANDOM2: bandwidth-downstream limited to between 10-50 KB/s from the server to the client
+#     proxy_toxics_randoms: "10:50|10:50"
+#   tasks:
+#   - name: network_tests
+#
+# - name: ubuntu2004-network-faulty
+#   display_name: "Ubuntu 20.04 x86_64 (Utunbu2004 - network faults)"
+#   run_on: ubuntu2004-large
+#   expansions:
+#     clang_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/clang%2Bllvm-11.0.0-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
+#     cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-linux-x86_64.tar.gz"
+#     cmake_bindir: "./cmake_binaries/bin"
+#     fetch_missing_dependencies: On
+#     c_compiler: "./clang_binaries/bin/clang"
+#     cxx_compiler: "./clang_binaries/bin/clang++"
+#     cmake_build_type: RelWithDebInfo
+#     run_with_encryption: On
+#     baas_admin_port: 9098
+#     test_logging_level: debug
+#     proxy_toxics_file: evergreen/proxy-network-faults.toxics
+#     # RANDOM1: limit-data-upstream to close connection after between 1000-3000 bytes have been sent
+#     # RANDOM2: limit-data-downstream to close connection after between 1000-3000 bytes have been received
+#     # RANDOM3: slow-close-upstream to keep connection to server open after 1000-1500 milliseconds after being closed
+#     # RANDOM4: reset-peer-upstream after 50-200 seconds to force close the connection to the server
+#     proxy_toxics_randoms: "1000:3000|1000:3000|1000:1500|50:200"
+#   tasks:
+#   - name: network_tests
+
 - name: rhel70
   display_name: "RHEL 7 x86_64"
   run_on: rhel70-large
   expansions:
     c_compiler: /opt/mongodbtoolchain/v3/bin/gcc
     cxx_compiler: /opt/mongodbtoolchain/v3/bin/g++
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-linux-x86_64.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-linux-x86_64.tar.gz"
     cmake_bindir: "./cmake_binaries/bin"
     fetch_missing_dependencies: On
     curl: "/opt/mongodbtoolchain/v3/bin/curl"
@@ -1350,7 +1549,7 @@ buildvariants:
   display_name: "Ubuntu 22.04 x86_64 (Valgrind)"
   run_on: ubuntu2204-large
   expansions:
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-linux-x86_64.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-linux-x86_64.tar.gz"
     cmake_bindir: "./cmake_binaries/bin"
     fetch_missing_dependencies: On
     enable_valgrind: On
@@ -1362,20 +1561,49 @@ buildvariants:
   display_name: "Ubuntu 20.04 ARM64"
   run_on: ubuntu2004-arm64-large
   expansions:
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-linux-aarch64.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-linux-aarch64.tar.gz"
     cmake_bindir: "./cmake_binaries/bin"
     python3: "/opt/mongodbtoolchain/v3/bin/python3"
     use_system_openssl: On
     fetch_missing_dependencies: On
+    cmake_build_type: RelWithDebInfo
   tasks:
   - name: compile_test_and_package
   - name: benchmarks
+
+# use a small runner to exercise timing sensitive bugs
+- name: ubuntu2204-arm64-small
+  display_name: "Ubuntu 22.04 ARM64 Small"
+  run_on: ubuntu2204-arm64-small
+  expansions:
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-linux-aarch64.tar.gz"
+    cmake_bindir: "./cmake_binaries/bin"
+    python3: "/opt/mongodbtoolchain/v3/bin/python3"
+    use_system_openssl: On
+    fetch_missing_dependencies: On
+    cmake_build_type: RelWithDebInfo
+  tasks:
+  - name: compile_test_and_package
+
+- name: ubuntu2204-arm64-asan
+  display_name: "Ubuntu 22.04 ARM64 (ASAN)"
+  run_on: ubuntu2204-arm64-large
+  expansions:
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-linux-aarch64.tar.gz"
+    cmake_bindir: "./cmake_binaries/bin"
+    python3: "/opt/mongodbtoolchain/v3/bin/python3"
+    use_system_openssl: On
+    fetch_missing_dependencies: On
+    cmake_build_type: Debug
+    enable_asan: On
+  tasks:
+  - name: compile_test
 
 - name: macos
   display_name: "MacOS 11.0 x86_64"
   run_on: macos-1100
   expansions:
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-macos-universal.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-macos-universal.tar.gz"
     cmake_bindir: "./cmake_binaries/CMake.app/Contents/bin"
     cmake_toolchain_file: "./tools/cmake/xcode.toolchain.cmake"
     cmake_generator: Xcode
@@ -1391,7 +1619,7 @@ buildvariants:
   display_name: "MacOS 11.0 x86_64 (Encryption enabled)"
   run_on: macos-1100
   expansions:
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-macos-universal.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-macos-universal.tar.gz"
     cmake_bindir: "./cmake_binaries/CMake.app/Contents/bin"
     cmake_toolchain_file: "./tools/cmake/xcode.toolchain.cmake"
     cmake_generator: Xcode
@@ -1406,7 +1634,7 @@ buildvariants:
   display_name: "MacOS 11.0 x86_64 (Release build)"
   run_on: macos-1100
   expansions:
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-macos-universal.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-macos-universal.tar.gz"
     cmake_bindir: "./cmake_binaries/CMake.app/Contents/bin"
     cmake_toolchain_file: "./tools/cmake/xcode.toolchain.cmake"
     cmake_generator: Xcode
@@ -1425,7 +1653,7 @@ buildvariants:
   display_name: "MacOS 11 arm64"
   run_on: macos-1100-arm64
   expansions:
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-macos-universal.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-macos-universal.tar.gz"
     cmake_bindir: "./cmake_binaries/CMake.app/Contents/bin"
     cmake_toolchain_file: "./tools/cmake/xcode.toolchain.cmake"
     cmake_generator: Xcode
@@ -1440,7 +1668,7 @@ buildvariants:
   display_name: "MacOS 11 arm64 (Release build)"
   run_on: macos-1100-arm64
   expansions:
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-macos-universal.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-macos-universal.tar.gz"
     cmake_bindir: "./cmake_binaries/CMake.app/Contents/bin"
     cmake_toolchain_file: "./tools/cmake/xcode.toolchain.cmake"
     cmake_generator: Xcode
@@ -1458,7 +1686,7 @@ buildvariants:
   display_name: "MacOS 11.0 x86_64 (ASAN)"
   run_on: macos-1100
   expansions:
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-macos-universal.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-macos-universal.tar.gz"
     cmake_bindir: "./cmake_binaries/CMake.app/Contents/bin"
     cmake_toolchain_file: "./tools/cmake/xcode.toolchain.cmake"
     cmake_generator: Xcode
@@ -1474,7 +1702,7 @@ buildvariants:
   display_name: "MacOS 11.0 x86_64 (TSAN)"
   run_on: macos-1100
   expansions:
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-macos-universal.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-macos-universal.tar.gz"
     cmake_bindir: "./cmake_binaries/CMake.app/Contents/bin"
     cmake_toolchain_file: "./tools/cmake/xcode.toolchain.cmake"
     cmake_generator: Xcode
@@ -1490,7 +1718,7 @@ buildvariants:
   display_name: "MacOS 11 arm64 (ASAN)"
   run_on: macos-1100-arm64
   expansions:
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-macos-universal.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-macos-universal.tar.gz"
     cmake_bindir: "./cmake_binaries/CMake.app/Contents/bin"
     cmake_toolchain_file: "./tools/cmake/xcode.toolchain.cmake"
     cmake_generator: Xcode
@@ -1506,7 +1734,7 @@ buildvariants:
   display_name: "MacOS 11 arm64 (TSAN)"
   run_on: macos-1100-arm64
   expansions:
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-macos-universal.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-macos-universal.tar.gz"
     cmake_bindir: "./cmake_binaries/CMake.app/Contents/bin"
     cmake_toolchain_file: "./tools/cmake/xcode.toolchain.cmake"
     cmake_generator: Xcode
@@ -1516,13 +1744,15 @@ buildvariants:
     cmake_build_type: RelWithDebInfo
     enable_tsan: On
   tasks:
+  # FIXME: tsan is not stable on arm64, fails often with internal errors
+  # - name: compile_test
   - name: compile_test
 
 - name: macos-coverage
   display_name: "MacOS 11 arm64 (Code Coverage)"
   run_on: macos-1100-arm64
   expansions:
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-macos-universal.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-macos-universal.tar.gz"
     cmake_bindir: "./cmake_binaries/CMake.app/Contents/bin"
     cmake_toolchain_file: "./tools/cmake/xcode.toolchain.cmake"
     cmake_generator: Xcode
@@ -1540,7 +1770,7 @@ buildvariants:
   run_on: ubuntu2004-large
   expansions:
     clang_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/clang%2Bllvm-11.0.0-x86_64-linux-gnu-ubuntu-20.04.tar.xz"
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-linux-x86_64.tar.gz"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-linux-x86_64.tar.gz"
     cmake_bindir: "./cmake_binaries/bin"
     fetch_missing_dependencies: On
     c_compiler: "./clang_binaries/bin/clang"
@@ -1556,8 +1786,8 @@ buildvariants:
   display_name: "Windows x86_64 (VS 2019)"
   run_on: windows-vsCurrent-large
   expansions:
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-windows-x86_64.zip"
-    cmake_bindir: "./cmake-3.20.3-windows-x86_64/bin"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-windows-x86_64.zip"
+    cmake_bindir: "./cmake-3.26.3-windows-x86_64/bin"
     cmake_generator: "Visual Studio 16 2019"
     extra_flags: "-A x64"
     max_jobs: $(($(grep -c proc /proc/cpuinfo) / 2))
@@ -1565,15 +1795,14 @@ buildvariants:
     curl_base: "/cygdrive/c/curl"
     python3: "/cygdrive/c/python/python37/python.exe"
   tasks:
-  - name: compile_test_and_package
-  - name: long-running-tests
+  - name: compile_test
 
 - name: windows-64-encryption
   display_name: "Windows x86_64 (Encryption enabled)"
   run_on: windows-vsCurrent-large
   expansions:
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-windows-x86_64.zip"
-    cmake_bindir: "./cmake-3.20.3-windows-x86_64/bin"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-windows-x86_64.zip"
+    cmake_bindir: "./cmake-3.26.3-windows-x86_64/bin"
     cmake_generator: "Visual Studio 16 2019"
     extra_flags: "-A x64"
     max_jobs: $(($(grep -c proc /proc/cpuinfo) / 2))
@@ -1588,8 +1817,8 @@ buildvariants:
   display_name: "Windows x86_64 (VS 2019 Release build)"
   run_on: windows-vsCurrent-large
   expansions:
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-windows-x86_64.zip"
-    cmake_bindir: "./cmake-3.20.3-windows-x86_64/bin"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-windows-x86_64.zip"
+    cmake_bindir: "./cmake-3.26.3-windows-x86_64/bin"
     cmake_generator: "Visual Studio 16 2019"
     extra_flags: "-A x64"
     cmake_build_type: "Release"
@@ -1598,14 +1827,15 @@ buildvariants:
     curl_base: "/cygdrive/c/curl"
     python3: "/cygdrive/c/python/python37/python.exe"
   tasks:
-  - name: compile_test
+  - name: compile_test_and_package
+  - name: long-running-tests
 
 - name: windows-64-vs2019-asan
   display_name: "Windows x86_64 (VS 2019 ASAN)"
   run_on: windows-vsCurrent-large
   expansions:
-    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.20.3-windows-x86_64.zip"
-    cmake_bindir: "./cmake-3.20.3-windows-x86_64/bin"
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-windows-x86_64.zip"
+    cmake_bindir: "./cmake-3.26.3-windows-x86_64/bin"
     cmake_generator: "Visual Studio 16 2019"
     extra_flags: "-A x64"
     cmake_build_type: "Debug"
@@ -1616,3 +1846,20 @@ buildvariants:
     python3: "/cygdrive/c/python/python37/python.exe"
   tasks:
   - name: compile_test
+
+- name: windows-x86-release
+  display_name: "Windows X86 (Release)"
+  run_on: windows-vsCurrent-large
+  expansions:
+    cmake_url: "https://s3.amazonaws.com/static.realm.io/evergreen-assets/cmake-3.26.3-windows-x86_64.zip"
+    cmake_bindir: "./cmake-3.26.3-windows-x86_64/bin"
+    cmake_generator: "Visual Studio 16 2019"
+    cmake_generator_platform: "Win32"
+    cmake_build_type: "Release"
+    max_jobs: $(($(grep -c proc /proc/cpuinfo) / 2))
+    fetch_missing_dependencies: On
+    python3: "/cygdrive/c/python/python37/python.exe"
+    disable_tests_against_baas: On
+  tasks:
+  - name: compile_local_tests
+

@@ -28,8 +28,8 @@ jobWrapper {
             getSourceArchive()
             stash includes: '**', name: 'core-source', useDefaultExcludes: false
 
-            dependencies = readProperties file: 'dependencies.list'
-            echo "Version in dependencies.list: ${dependencies.VERSION}"
+            dependencies = readYaml file: 'dependencies.yml'
+            echo "Version in dependencies.yml: ${dependencies.VERSION}"
             gitTag = readGitTag()
             gitSha = sh(returnStdout: true, script: 'git rev-parse HEAD').trim().take(8)
             gitDescribeVersion = sh(returnStdout: true, script: 'git describe --tags').trim()
@@ -201,7 +201,7 @@ jobWrapper {
             ]
             if (releaseTesting) {
                 extendedChecks = [
-                    checkMacOsDebug               : doBuildMacOs(buildOptions + [buildType: "Release"]),
+                    checkMacOsDebug               : doBuildMacOs(buildOptions + [buildType: "Debug"]),
                     checkAndroidarmeabiDebug      : doAndroidBuildInDocker('armeabi-v7a', 'Debug', TestAction.Run),
                     // FIXME: https://github.com/realm/realm-core/issues/4159
                     //checkAndroidx86Release        : doAndroidBuildInDocker('x86', 'Release', TestAction.Run),
@@ -222,12 +222,6 @@ def doCheckInDocker(Map options = [:]) {
         REALM_ENABLE_ENCRYPTION: options.enableEncryption ? 'ON' : 'OFF',
         REALM_ENABLE_SYNC: options.enableSync ? 'ON' : 'OFF',
     ]
-    if (options.enableSync) {
-        cmakeOptions << [
-            REALM_ENABLE_AUTH_TESTS: 'ON',
-            REALM_MONGODB_ENDPOINT: 'http://mongodb-realm:9090',
-        ]
-    }
     if (longRunningTests) {
         cmakeOptions << [
             CMAKE_CXX_FLAGS: '"-DTEST_DURATION=1"',
@@ -275,38 +269,28 @@ def doCheckInDocker(Map options = [:]) {
                 }
             }
 
-            if (options.enableSync) {
-                // stitch images are auto-published every day to our CI
-                // see https://github.com/realm/ci/tree/master/realm/docker/mongodb-realm
-                // we refrain from using "latest" here to optimise docker pull cost due to a new image being built every day
-                // if there's really a new feature you need from the latest stitch, upgrade this manually
-                withRealmCloud(version: dependencies.MDBREALM_TEST_SERVER_TAG) { networkName ->
-                    buildSteps("--network=${networkName}")
-                }
+            buildSteps()
 
-                if (options.dumpChangesetTransform) {
-                    buildEnv.inside {
-                        dir('build-dir/test') {
-                            withEnv([
-                                'UNITTEST_PROGRESS=1',
-                                'UNITTEST_FILTER=Array_Example Transform_* EmbeddedObjects_*',
-                                'UNITTEST_DUMP_TRANSFORM=changeset_dump',
-                            ]) {
-                                sh '''
-                                    ./realm-sync-tests
-                                    tar -zcvf changeset_dump.tgz changeset_dump
-                                '''
-                            }
-                            withAWS(credentials: 'stitch-sync-s3', region: 'us-east-1') {
-                                retry(20) {
-                                    s3Upload file: 'changeset_dump.tgz', bucket: 'realm-test-artifacts', acl: 'PublicRead', path: "sync-transform-corpuses/${gitSha}/"
-                                }
+            if (options.dumpChangesetTransform) {
+                buildEnv.inside {
+                    dir('build-dir/test') {
+                        withEnv([
+                            'UNITTEST_PROGRESS=1',
+                            'UNITTEST_FILTER=Array_Example Transform_* EmbeddedObjects_*',
+                            'UNITTEST_DUMP_TRANSFORM=changeset_dump',
+                        ]) {
+                            sh '''
+                                ./realm-sync-tests
+                                tar -zcvf changeset_dump.tgz changeset_dump
+                            '''
+                        }
+                        withAWS(credentials: 'stitch-sync-s3', region: 'us-east-1') {
+                            retry(20) {
+                                s3Upload file: 'changeset_dump.tgz', bucket: 'realm-test-artifacts', acl: 'PublicRead', path: "sync-transform-corpuses/${gitSha}/"
                             }
                         }
                     }
                 }
-            } else {
-                buildSteps()
             }
         }
     }
@@ -606,8 +590,11 @@ def doBuildMacOs(Map options = [:]) {
 
             dir('build-macosx') {
                 withEnv(['DEVELOPER_DIR=/Applications/Xcode-14.app/Contents/Developer/']) {
-                    sh "cmake ${cmakeDefinitions} -G Xcode .."
-
+                     try {
+                        sh "cmake ${cmakeDefinitions} -G Xcode .."
+                    } catch(Exception e) {
+                        archiveArtifacts '**/*'
+                    }                
                     runAndCollectWarnings(
                         parser: 'clang',
                         script: "cmake --build . --config ${buildType} --target package -- ONLY_ACTIVE_ARCH=NO -destination generic/name=macOS -sdk macosx",
@@ -665,32 +652,19 @@ def doBuildApplePlatform(String platform, String buildType, boolean test = false
                 if (test) {
                     dir('build-xcode-platforms') {
                         if (platform != 'iphonesimulator') error 'Testing is only available for iOS Simulator'
-                        sh "xcodebuild -scheme CoreTests -configuration ${buildType} -sdk iphonesimulator -arch x86_64"
-                        // sh "xcodebuild -scheme SyncTests -configuration ${buildType} -sdk iphonesimulator -arch x86_64 IPHONEOS_DEPLOYMENT_TARGET=13"
-                        sh "xcodebuild -scheme ObjectStoreTests -configuration ${buildType} -sdk iphonesimulator -arch x86_64 IPHONEOS_DEPLOYMENT_TARGET=13"
+                        sh "xcodebuild -scheme CombinedTests -configuration ${buildType} -sdk iphonesimulator -arch x86_64"
 
                         def env = environment().collect { v -> "SIMCTL_CHILD_${v}" }
-                        def resultFile = "${WORKSPACE}/core-test-report.xml"
+                        def resultFile = "${WORKSPACE}/combined-test-report.xml"
                         withEnv(env + ["SIMCTL_CHILD_UNITTEST_XML=${resultFile}", "SIMCTL_CHILD_UNITTEST_SUITE_NAME=iOS-${buildType}-Core"]) {
-                            sh "$WORKSPACE/tools/run-in-simulator.sh 'test/${buildType}-${platform}/realm-tests.app' 'io.realm.CoreTests' '${resultFile}'"
-                        }
-                        // Sync tests currently don't work on iOS because they require an unimplemented server feature
-                        // resultFile = "${WORKSPACE}/sync-test-report.xml"
-                        // withEnv(env + ["SIMCTL_CHILD_UNITTEST_XML=${resultFile}", "SIMCTL_CHILD_UNITTEST_SUITE_NAME=iOS-${buildType}-Sync"]) {
-                        //     sh "$WORKSPACE/tools/run-in-simulator.sh 'test/${buildType}-${platform}/realm-sync-tests.app' 'io.realm.SyncTests' '${resultFile}'"
-                        // }
-                        resultFile = "${WORKSPACE}/object-store-test-report.xml"
-                        withEnv(env + ["SIMCTL_CHILD_UNITTEST_XML=${resultFile}", "SIMCTL_CHILD_UNITTEST_SUITE_NAME=iOS-${buildType}-Object-Store"]) {
-                            sh "$WORKSPACE/tools/run-in-simulator.sh 'test/object-store/${buildType}-${platform}/realm-object-store-tests.app' 'io.realm.ObjectStoreTests' '${resultFile}'"
+                            sh "$WORKSPACE/tools/run-in-simulator.sh 'test/${buildType}-${platform}/realm-combined-tests.app' 'io.realm.CombinedTests' '${resultFile}'"
                         }
                     }
                 }
             }
 
             if (test) {
-                junit testResults: 'core-test-report.xml'
-                // junit testResults: 'sync-test-report.xml'
-                junit testResults: 'object-store-test-report.xml'
+                junit testResults: 'combined-test-report.xml'
             }
 
             String tarball = "realm-${buildType}-${gitDescribeVersion}-${platform}-devel.tar.gz";

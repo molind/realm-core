@@ -65,7 +65,7 @@ std::shared_ptr<RealmCoordinator> RealmCoordinator::get_coordinator(StringData p
         return coordinator;
     }
 
-    auto coordinator = std::make_shared<RealmCoordinator>();
+    auto coordinator = std::make_shared<RealmCoordinator>(Private());
     weak_coordinator = coordinator;
     return coordinator;
 }
@@ -389,8 +389,10 @@ void RealmCoordinator::do_get_realm(RealmConfig&& config, std::shared_ptr<Realm>
         if (!first_time_open)
             first_time_open = db_created;
         if (subscription_version == 0 || (first_time_open && rerun_on_open)) {
-            // if the tasks is cancelled, the subscription may or may not be run.
+            bool was_in_read = realm->is_in_read_transaction();
             subscription_function(realm);
+            if (!was_in_read)
+                realm->invalidate();
         }
     }
 #endif
@@ -418,7 +420,8 @@ std::shared_ptr<AsyncOpenTask> RealmCoordinator::get_synchronized_realm(Realm::C
     util::CheckedLockGuard lock(m_realm_mutex);
     set_config(config);
     const auto db_open_first_time = open_db();
-    return std::make_shared<AsyncOpenTask>(shared_from_this(), m_sync_session, db_open_first_time);
+    return std::make_shared<AsyncOpenTask>(AsyncOpenTask::Private(), shared_from_this(), m_sync_session,
+                                           db_open_first_time);
 }
 
 #endif
@@ -624,7 +627,7 @@ void RealmCoordinator::advance_schema_cache(uint64_t previous, uint64_t next)
     m_schema_transaction_version_max = std::max(next, m_schema_transaction_version_max);
 }
 
-RealmCoordinator::RealmCoordinator() = default;
+RealmCoordinator::RealmCoordinator(Private) {}
 
 RealmCoordinator::~RealmCoordinator()
 {
@@ -991,7 +994,7 @@ void RealmCoordinator::run_async_notifiers()
         // first collection with the same id. It is O(N^2), but typically the
         // number of collections observed will be very small.
         auto id = [](auto const& c) {
-            return std::tie(c.table_key, c.col_key, c.obj_key);
+            return std::tie(c.table_key, c.path, c.obj_key);
         };
         auto& collections = change_info.collections;
         for (size_t i = collections.size(); i > 0; --i) {

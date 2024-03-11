@@ -1,3 +1,351 @@
+# NEXT RELEASE
+
+### Enhancements
+* <New feature description> (PR [#????](https://github.com/realm/realm-core/pull/????))
+* None.
+
+### Fixed
+* <How do the end-user experience this issue? what was the impact?> ([#????](https://github.com/realm/realm-core/issues/????), since v?.?.?)
+* None.
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v24. Reads and automatically upgrade from fileformat v10. If you want to upgrade from an earlier file format version you will have to use RealmCore v13.x.y or earlier.
+
+-----------
+
+### Internals
+* None.
+
+----------------------------------------------
+
+# 14.2.0 Release notes
+
+### Enhancements
+* Added ability to get current log level via C API (PR [#7419](https://github.com/realm/realm-core/pull/7419))
+* Improve performance of object notifiers with complex schemas and very simple changes to process by as much as 20% ([PR #7424](https://github.com/realm/realm-core/pull/7424)).
+* Improve performance with very large number of notifiers as much as 75% ([PR #7424](https://github.com/realm/realm-core/pull/7424)).
+
+### Fixed
+* Fixed an issue when removing items from a LnkLst that could result in invalidated links becoming visable which could cause crashes or exceptions when accessing those list items later on. This affects sync Realms where another client had previously removed a link in a linklist that has over 1000 links in it, and then further local removals from the same list caused the list to have fewer than 1000 items. ([#7414](https://github.com/realm/realm-core/pull/7414), since v10.0.0)
+* Query lists vs lists if the property to check is a path with wildcards would not give correct result. This has for a long time also been a problem for queries with linklist properties in the path ([#7393](https://github.com/realm/realm-core/issues/7393), since v14.0.0)
+
+### Breaking changes
+* The fix of querying involving multiple lists may cause tests that depended on the broken beharior to fail.
+
+### Compatibility
+* Fileformat: Generates files with format v24. Reads and automatically upgrade from fileformat v10. If you want to upgrade from an earlier file format version you will have to use RealmCore v13.x.y or earlier.
+
+-----------
+
+### Internals
+* Fix several crashes when running the object store benchmarks ([#7403](https://github.com/realm/realm-core/pull/7403)).
+* The `dependencies.list` file that defines the realm core library version and the versions of its dependencies is now a YAML file called `dependencies.yml` ([PR #7394](https://github.com/realm/realm-core/pull/7394)).
+* Remove SetElementEquals and SetElementLessThan, as Mixed now uses the same comparisons as Set did.
+
+----------------------------------------------
+
+# 14.1.0 Release notes
+
+### Enhancements
+* Add support for using aggregate operations on Mixed properties in queries  ([PR #7398](https://github.com/realm/realm-core/pull/7398))
+
+### Fixed
+* Fix a performance regression when reading values from Bson containers and revert some breaking changes to the Bson API ([PR #7377](https://github.com/realm/realm-core/pull/7377), since v14.0.0)
+* List KVO information was being populated for non-list collections ([PR #7378](https://github.com/realm/realm-core/pull/7378), since v14.0.0)
+* Setting a Mixed property to an ObjLink equal to its existing value would remove the existing backlinks and then exit before re-adding them, resulting in later assertion failures due to the backlink state being invalid ([PR #7384](https://github.com/realm/realm-core/pull/7384), since v14.0.0).
+* Passing a double as argument for a Query on Decimal128 did not work ([#7386](https://github.com/realm/realm-core/issues/7386), since v14.0.0)
+* Opening file with file format 23 in read-only mode will crash ([#7388](https://github.com/realm/realm-core/issues/7388), since v14.0.0)
+* Querying a dictionary over a link would sometimes result in out-of-bounds memory reads ([PR #7382](https://github.com/realm/realm-core/pull/7382), since v14.0.0).
+* Restore the pre-14.0.0 behavior of missing keys in dictionaries in queries ([PR #7391](https://github.com/realm/realm-core/pull/7391))
+* Fix a ~10% performance regression for bulk insertion when using a log level which does not include debug/trace ([PR #7400](https://github.com/realm/realm-core/pull/7400), since v14.0.0)
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v24. Reads and automatically upgrade from fileformat v10. If you want to upgrade from an earlier file format version you will have to use RealmCore v13.x.y or earlier.
+  You cannot open files with an file format older than v24 in read-only mode.
+
+-----------
+
+### Internals
+* The Linux-armv7 cross-compiling toolchain file prefers the bfd linker over gold because of issues linking against OpenSSL 3.2.0.
+
+----------------------------------------------
+
+# 14.0.1 Release notes
+
+### Enhancements
+* None.
+
+### Fixed
+* Fixed building issues when RealmCore is used as submodule ([#7370](https://github.com/realm/realm-core/pull/7379))
+* None.
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v24. Reads and automatically upgrade from fileformat v10. If you want to upgrade from an earlier file format version you will have to use RealmCore v13.x.y or earlier.
+
+----------------------------------------------
+
+# 14.0.0 Release notes
+
+### Enhancements
+* Property keypath in RQL can be substituted with value given as argument. Use '$P<i>' in query string. (Issue [#7033](https://github.com/realm/realm-core/issues/7033))
+* You can now use query substitution for the @type argument ([#7289](https://github.com/realm/realm-core/issues/7289))
+
+### Fixed
+* Fixed crash when adding a collection to an indexed Mixed property ([#7246](https://github.com/realm/realm-core/issues/7246), since 14.0.0-beta.0)
+* \[C-API] Fixed the return type of `realm_set_list` and `realm_set_dictionary` to be the newly inserted collection, similarly to the behavior of `list/dictionary_insert_collection` (PR [#7247](https://github.com/realm/realm-core/pull/7247), since 14.0.0-beta.0)
+* Throw an exception when trying to insert an embedded object into a list of Mixed ([#7254](https://github.com/realm/realm-core/issues/7254), since 14.0.0-beta.0)
+* Queries on dictionaries in Mixed with @keys did not return correct result ([#7255](https://github.com/realm/realm-core/issues/7255), since 14.0.0-beta.0)
+* Changes to inner collections will not be reported by notifier on owning collection ([#7270](https://github.com/realm/realm-core/issues/7270), since 14.0.0-beta.0)
+* @count/@size not supported for mixed properties ([#7280](https://github.com/realm/realm-core/issues/7280), since v10.0.0)
+* Query with @type does not support filtering on collections ([#7281](https://github.com/realm/realm-core/issues/7281), since 14.0.0-beta.0)
+* Query involving string operations on nested collections would not work ([#7282](https://github.com/realm/realm-core/issues/7282), since 14.0.0-beta.0)
+* Using ANY, ALL or NONE in a query on nested collections would throw an exception ([#7283](https://github.com/realm/realm-core/issues/7283), since 14.0.0-beta.0)
+* Results notifications does not report changes to inner collections ([#7335](https://github.com/realm/realm-core/issues/7335), since 14.0.0-beta.0)
+
+### Breaking changes
+* If you want to query using @type operation, you must use 'objectlink' to match links to objects. 'object' is reserved for dictionary types.
+
+### Compatibility
+* Fileformat: Generates files with format v24. Reads and automatically upgrade from fileformat v10 and onwards. If you want to upgrade from an earlier file format version you will have to use RealmCore v13.x.y or earlier.
+
+-----------
+
+### Internals
+* to_json API changed according to https://docs.google.com/document/d/1YtJN0sC89LMb4UVcPKFIfwC0Hsi9Vj7sIEP2vHQzVcY/edit?usp=sharing. Links to non-embedded objects will never be followed.
+
+----------------------------------------------
+
+# 14.0.0-beta.0 Release notes
+
+### Enhancements
+* Storage of Decimal128 properties has been optimised so that the individual values will take up 0 bits (if all nulls), 32 bits, 64 bits or 128 bits depending on what is needed. (PR [#6111](https://github.com/realm/realm-core/pull/6111))
+* You can have a collection embedded in any Mixed property (except Set<Mixed>).
+* Querying a specific entry in a collection (in particular 'first and 'last') is supported. (PR [#4269](https://github.com/realm/realm-core/issues/4269))
+* Index on list of strings property now supported (PR [#7142](https://github.com/realm/realm-core/pull/7142))
+* You can set the threshold levels for trace output on individual categories. (PR [#7004](https://github.com/realm/realm-core/pull/7004))
+
+### Fixed
+* Align dictionaries to Lists and Sets when they get cleared. ([#6205](https://github.com/realm/realm-core/issues/6205), since v10.4.0)
+* Fixed equality queries on a Mixed property with an index possibly returning the wrong result if values of different types happened to have the same StringIndex hash. ([6407](https://github.com/realm/realm-core/issues/6407) since v11.0.0-beta.5).
+* If you have more than 8388606 links pointing to one specific object, the program will crash. ([#6577](https://github.com/realm/realm-core/issues/6577), since v6.0.0)
+* Query for NULL value in Dictionary<Mixed> would give wrong results ([6748])(https://github.com/realm/realm-core/issues/6748), since v10.0.0)
+* A Realm generated on a non-apple ARM 64 device and copied to another platform (and vice-versa) were non-portable due to a sorting order difference. This impacts strings or binaries that have their first difference at a non-ascii character. These items may not be found in a set, or in an indexed column if the strings had a long common prefix (> 200 characters). ([PR #6670](https://github.com/realm/realm-core/pull/6670), since 2.0.0-rc7 for indexes, and since since the introduction of sets in v10.2.0)
+
+### Breaking changes
+* Support for upgrading from Realm files produced by RealmCore v5.23.9 or earlier is no longer supported.
+* Remove `set_string_compare_method`, only one sort method is now supported which was previously called `STRING_COMPARE_CORE`.
+* BinaryData and StringData are now strongly typed for comparisons and queries. This change is especially relevant when querying for a string constant on a Mixed property, as now only strings will be returned. If searching for BinaryData is desired, then that type must be specified by the constant. In RQL the new way to specify a binary constant is to use `mixed = bin('xyz')` or `mixed = binary('xyz')`. ([6407](https://github.com/realm/realm-core/issues/6407)).
+* In the C API, `realm_collection_changes_get_num_changes` and `realm_dictionary_get_changes` have got an extra parameter to receive information on the deletion of the entire collection.
+* Sorting order of strings has changed to use standard unicode codepoint order instead of grouping similar english letters together. A noticeable change will be from "aAbBzZ" to "ABZabz". ([2573](https://github.com/realm/realm-core/issues/2573))
+
+### Compatibility
+* Fileformat: Generates files with format v24. Reads and automatically upgrade from fileformat v10. If you want to upgrade from an earlier file format version you will have to use RealmCore v13.x.y or earlier.
+
+-----------
+
+### Internals
+* Refactoring of the StringIndex interface.
+
+----------------------------------------------
+
+# 13.27.0 Release notes
+
+### Enhancements
+* Add support in the C API for receiving a notification when sync user state changes. ([#7302](https://github.com/realm/realm-core/pull/7302))
+* Allow the query builder to construct >, >=, <, <= queries for string constants. This is a case sensitive lexicographical comparison. Improved performance of RQL (parsed) queries on a non-linked string property using: >, >=, <, <=, operators and fixed behaviour that a null string should be evaulated as less than everything, previously nulls were not matched. ([#3939](https://github.com/realm/realm-core/issues/3939), this is a prerequisite for https://github.com/realm/realm-swift/issues/8008).
+* Updated bundled OpenSSL version to 3.2.0 (PR [#7303](https://github.com/realm/realm-core/pull/7303))
+* Added `SyncSession::get_file_ident()` so you can trigger a client reset via the BAAS admin API ([PR #7203](https://github.com/realm/realm-core/pull/7203)).
+* Audit event scopes containing zero events to save no longer open the audit realm unneccesarily ([PR #7332](https://github.com/realm/realm-core/pull/7332)).
+* Added a method to check if a file needs upgrade. ([#7140](https://github.com/realm/realm-core/issues/7140))
+* Use `clonefile()` when possible in `File::copy()` on Apple platforms for faster copying. ([PR #7341](https://github.com/realm/realm-core/pull/7341)).
+
+### Fixed
+* Fixed queries like `indexed_property == NONE {x}` which mistakenly matched on only x instead of not x. This only applies when an indexed property with equality (==, or IN) matches with `NONE` on a list of one item. If the constant list contained more than one value then it was working correctly. ([realm-js #7862](https://github.com/realm/realm-java/issues/7862), since v12.5.0) 
+* Uploading the changesets recovered during an automatic client reset recovery may lead to 'Bad server version' errors and a new client reset. ([#7279](https://github.com/realm/realm-core/issues/7279), since v13.24.1)
+* Fixed invalid data in error reason string when registering a subscription change notification after the subscription has already failed. ([#6839](https://github.com/realm/realm-core/issues/6839), since v11.8.0)
+* Fixed crash in fulltext index using prefix search with no matches ([#7309](https://github.com/realm/realm-core/issues/7309), since v13.18.0)
+* Fix compilation and some warnings when building with Xcode 15.3 ([PR #7297](https://github.com/realm/realm-core/pull/7297)).
+* util::make_dir_recursive() attempted to create a directory named "\0" if the path did not have a trailing slash ([PR #7329](https://github.com/realm/realm-core/pull/7329)).
+* Fixed a crash with `Assertion failed: m_initiated` during sync session startup ([#7074](https://github.com/realm/realm-core/issues/7074), since v10.0.0).
+* Fixed a TSAN violation where the user thread could race to read `m_finalized` with the sync event loop ([#6844](https://github.com/realm/realm-core/issues/6844), since v13.15.1)
+* Fix a minor race condition when backing up Realm files before a client reset which could have lead to overwriting an existing file. ([PR #7341](https://github.com/realm/realm-core/pull/7341)).
+ 
+### Breaking changes
+* SyncManager no longer supports reconfiguring after calling reset_for_testing(). SyncManager::configure() has been folded into the constructor, and reset_for_testing() has been renamed to tear_down_for_testing(). ([PR #7351](https://github.com/realm/realm-core/pull/7351))
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* Expressions in `CHECK()` macros are printed to better; strings are quoted and null strings are printed as NULL instead of no output.
+* Refactored version resolution for the `build-apple-device.sh` script. ([#7263](https://github.com/realm/realm-core/pull/7263))
+* Remove SyncUser::binding_context() and related things, which were not actually used by any SDKs.
+* (bindgen) Upgrade `eslint-config-prettier` & `eslint-plugin-prettier` and add a missing peer dependency on `prettier`.
+* The minimum CMake version has changed from 3.15 to 3.22.1. ([#6537](https://github.com/realm/realm-core/issues/6537))
+* Update Catch2 to v3.5.2 ([PR #7297](https://github.com/realm/realm-core/pull/7297)).
+* The unused `partition` and `user_local_uuid()` fields have been removed from `FileActionMetadata`. ([PR #7341](https://github.com/realm/realm-core/pull/7341)).
+
+----------------------------------------------
+
+# 13.26.0 Release notes
+
+### Enhancements
+* Added change_base_url() function to update the App base URL at runtime. (PR [#7173](https://github.com/realm/realm-core/pull/7173))
+* Sync Client should use the base_url value provided in App::Config instead of always using stored info after first connection to server. ([#7201](https://github.com/realm/realm-core/issues/7201))
+
+### Fixed
+* Handle `EOPNOTSUPP` when using `posix_fallocate()` and fallback to manually consume space. This should enable android users to open a Realm on restrictive filesystems. ([realm-js #6349](https://github.com/realm/realm-js/issues/6349), more prevalent since v13.23.3 with the change to `REALM_HAVE_POSIX_FALLOCATE` but it was also an issue in some platforms before this)
+* Application may crash with `incoming_changesets.size() != 0` when a download message is mistaken for a bootstrap message. This can happen if the synchronization session is paused and resumed at a specific time. (PR [#7238](https://github.com/realm/realm-core/pull/7238), since v11.8.0)
+* Fixed errors complaining about missing symbols such as `__atomic_is_lock_free` on ARMv7 Linux. (PR [#7257](https://github.com/realm/realm-core/pull/7257))
+
+### Breaking changes
+* `App::get_uncached_app(...)` and `App::get_shared_app(...)` have been replaced by `App::get_app(App::CacheMode, ...)`. The App constructor is now enforced to be unusable, use `App::get_app()` instead. ([#7237](https://github.com/realm/realm-core/issues/7237))
+* The schema version field in the Realm config had no use for the flexible sync Realms previously. It is now being used for the upcoming Sync Schema Migrations feature. If it was set to a value other than zero, the application will start receiving an error from the server. Data synchronization will be stopped until the Realm is opened with schema version zero. (PR [#7239](https://github.com/realm/realm-core/pull/7239))
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* Add support for chunked transfer encoding when using `HTTPParser`.
+* Bump the sync protocol to v11. The new protocol version comes with the following changes:
+  - JSON_ERROR server message contains the previous schema version
+  - Flexible sync BIND client message contains the current schema version
+* Add BAAS admin API to create new schema versions (drafts can be used to deploy all changes at once)
+
+----------------------------------------------
+
+# 13.25.1 Release notes
+
+### Fixed
+* Bad performance of initial Sync download involving many backlinks ([#7217](https://github.com/realm/realm-core/issues/7217), since v10.0.0)
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+----------------------------------------------
+
+# 13.25.0 Release notes
+
+### Enhancements
+* Exceptions thrown during bootstrap application will now be surfaced to the user via the sync error handler rather than terminating the program with an unhandled exception. ([PR #7197](https://github.com/realm/realm-core/pull/7197)).
+
+### Fixed
+* Exceptions thrown during bootstrap application could crash the sync client with an `!m_sess` assertion if the bootstrap was being applied during sync::Session activation. ([#7196](https://github.com/realm/realm-core/issues/7196), since v12.0.0).
+* If a SyncSession was explicitly resumed via `handle_reconnect()` while it was waiting to auto-resume after a non-fatal error and then another non-fatal error was received, the sync client could crash with a `!m_try_again_activation_timer` assertion. ([#6961](https://github.com/realm/realm-core/issues/6961), since always)
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* Dangling links in a Mixed property will now appear as NULL ([#6980](https://github.com/realm/realm-core/issues/6980))
+
+----------------------------------------------
+
+# 13.24.1 Release notes
+
+### Enhancements
+* Automatic client reset recovery now preserves the original division of changesets, rather than combining all unsynchronized changes into a single changeset ([PR #7161](https://github.com/realm/realm-core/pull/7161)).
+* Automatic client reset recovery now does a better job of recovering changes when changesets were downloaded from the server after the unuploaded local changes were committed. If the local Realm happened to be fully up to date with the server prior to the client reset, automatic recovery should now always produce exactly the same state as if no client reset was involved ([PR #7161](https://github.com/realm/realm-core/pull/7161)).
+* [C API] Exposed `realm_app_create_cached` and `realm_app_get_cached` in the C API. (Issue [#7181](https://github.com/realm/realm-core/issues/7181))
+
+### Fixed
+* Fixed several causes of "decryption failed" exceptions that could happen when opening multiple encrypted Realm files in the same process while using Apple/linux and storing the Realms on an exFAT file system. ([#7156](https://github.com/realm/realm-core/issues/7156), since the beginning)
+* Fixed deadlock which occurred when accessing the current user from the `App` from within a callback from the `User` listener ([#7183](https://github.com/realm/realm-core/issues/7183), since v13.21.0)
+* Update existing std exceptions thrown by the Sync Client to use Realm exceptions. ([#6255](https://github.com/realm/realm-core/issues/6255), since v10.2.0)
+* Having a class name of length 57 would make client reset crash as a limit of 56 was wrongly enforced (57 is the correct limit) ([#7176](https://github.com/realm/realm-core/issues/7176), since v10.0.0)
+* Automatic client reset recovery on flexible sync Realms would apply recovered changes in multiple write transactions, releasing the write lock in between. This had several observable negative effects:
+  - Other threads reading from the Realm while a client reset was in progress could observe invalid mid-reset state.
+  - Other threads could potentially write in the middle of a client reset, resulting in history diverging from the server.
+  - The change notifications produced by client resets were not minimal and would report that some things changed which actually didn't.
+  - All pending subscriptions were marked as Superseded and then recreating, resulting in anything waiting for subscriptions to complete firing early.
+  ([PR #7161](https://github.com/realm/realm-core/pull/7161), since v12.3.0).
+* If the very first open of a flexible sync Realm triggered a client reset, the configuration had an initial subscriptions callback, both before and after reset callbacks, and the initial subscription callback began a read transaction without ending it (which is normally going to be the case), opening the frozen Realm for the after reset callback would trigger a BadVersion exception ([PR #7161](https://github.com/realm/realm-core/pull/7161), since v12.3.0).
+* Changesets have wrong timestamps if the local clock lags behind 2015-01-01T00:00:00Z. The sync client now throws an exception if that happens. ([PR #7180](https://github.com/realm/realm-core/pull/7180))
+* Allow propagation of user code exceptions happening during client reset callbacks, retrievable via `realm_sync_error_t` in `realm_sync_config_set_error_handler` in the C-API. ([#7098](https://github.com/realm/realm-core/issues/7098), since v11.16.0)
+
+### Breaking changes
+* Update existing std exceptions thrown by the Sync Client to use Realm exceptions. ([PR #7141](https://github.com/realm/realm-core/pull/7141/files))
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* Added a CombinedTests target that runs tests from object-store, sync, and core together. ([PR #6964](https://github.com/realm/realm-core/pull/6964))
+* The version of mongod we test against in evergreen was updated to 7.0.3 ([PR #7187](https://github.com/realm/realm-core/pull/7187)).
+
+----------------------------------------------
+
+# 13.24.0 Release notes
+
+### Enhancements
+* Refactored how KeyPathArrays are created in the C-API by adding `realm_create_key_path_array` which allows a SDK to pass in the string representation of the keypath and then let Core calculate the correct TableKey/ColKey pairs instead of doing this on the SDK side. (PR [#7087](https://github.com/realm/realm-core/pull/7087))
+* KeyPathArrays can be constructed with a wildcard notation. (Issue [#7125](https://github.com/realm/realm-core/issues/7125))
+
+### Fixed
+* `Set::assign_intersection()` on `Set<StringData>`, `Set<BinaryData>`, and `Set<Mixed>` containing string or binary would cause a use-after-free if a set was intersected with itself ([PR #7144](https://github.com/realm/realm-core/pull/7144), since v10.0.0).
+* Set algebra on `Set<StringData>` and `Set<BinaryData>` gave incorrect results when used on platforms where `char` is signed ([#7135](https://github.com/realm/realm-core/issues/7135), since v13.23.3).
+* Errors encountered while reapplying local changes for client reset recovery on partition-based sync Realms would result in the client reset attempt not being recorded, possibly resulting in an endless loop of attempting and failing to automatically recover the client reset. Flexible sync and errors from the server after completing the local recovery were handled correctly ([PR #7149](https://github.com/realm/realm-core/pull/7149), since v10.2.0).
+* During a client reset with recovery when recovering a move or set operation on a `LnkLst` or `Lst<Mixed>` that operated on indices that were not also added in the recovery, links to an object which had been deleted by another client while offline would be recreated by the recovering client. But the objects of these links would only have the primary key populated and all other fields would be default values. Now, instead of creating these zombie objects, the lists being recovered skip such deleted links. ([#7112](https://github.com/realm/realm-core/issues/7112) since the beginning of client reset with recovery in v11.16.0)
+* During a client reset recovery a Set of links could be missing items, or an exception could be thrown that prevents recovery ex: "Requested index 1 calling get() on set 'source.collection' when max is 0" ([#7112](https://github.com/realm/realm-core/issues/7112), since the beginning of client reset with recovery in v11.16.0)
+* Calling `sort()` or `distinct()` on a `LnkSet` that had unresolved links in it would produce duplicate indices.
+* Some fields in `realm_error_t` were uninitialized and contained invalid values when being converted from sync errors - now they should properly be nullptr ([PR #7154](https://github.com/realm/realm-core/pull/7154), since v13.18.0)
+* Automatic client reset recovery would duplicate insertions in a list when recovering a write which made an unrecoverable change to a list (i.e. modifying or deleting a pre-existing entry), followed by a subscription change, followed by a write which added an entry to the list ([PR #7155](https://github.com/realm/realm-core/pull/7155), since v12.3.0).
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* None.
+
+----------------------------------------------
+
+# 13.23.4 Release notes
+
+### Enhancements
+* None.
+
+### Fixed
+* A crash at a very specific time during a DiscardLocal client reset on a FLX Realm could leave subscriptions in an invalid state ([#7110](https://github.com/realm/realm-core/pull/7110), since v12.3.0).
+* Fixed an error "Invalid schema change (UPLOAD): cannot process AddColumn instruction for non-existent table" when using automatic client reset with recovery in dev mode to recover schema changes made locally while offline. ([#7042](https://github.com/realm/realm-core/pull/7042) since the server introduced the feature that allows client to redefine the server's schema if the server is in dev mode - fall 2023)
+* Fix missing symbol linker error for `Set<ObjKey>` when building with Clang and LTO enabled ([#7121](https://github.com/realm/realm-core/pull/7121), since v12.23.3).
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
+
+-----------
+
+### Internals
+* Add baas-network-tests nightly task for testing sync client operation with non-ideal network conditions. ([PR #6852](https://github.com/realm/realm-core/pull/6852))
+* Added non-ideal network conditions and network fault tests to the evergreen nightly test runs. ([PR #7063](https://github.com/realm/realm-core/pull/7063))
+* Updated baas tests to run with dev mode disabled by default. ([PR #6852](https://github.com/realm/realm-core/pull/6852))
+
+----------------------------------------------
+
 # 13.23.3 Release notes
 
 ### Enhancements
@@ -153,7 +501,7 @@
 
 ### Compatibility
 * Fileformat: Generates files with format v23. Reads and automatically upgrade from fileformat v5.
-* The metadata Realm used to store sync users has had its schema version bumped. It is automatically migrated to the new version on first open. Downgrading to older version of Realm after upgrading will discard stored user tokens and require logging back in.
+* The metadata Realm used to store sync users has had its schema version bumped. It is automatically migrated to the new version on first open. Downgrading will require manually deletion of the metadata Realm and require logging back in.
 
 -----------
 

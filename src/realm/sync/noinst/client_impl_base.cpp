@@ -1,27 +1,30 @@
-#include <system_error>
-#include <sstream>
+#include <realm/sync/noinst/client_impl_base.hpp>
 
-#include <realm/util/assert.hpp>
-#include <realm/util/safe_int_ops.hpp>
-#include <realm/util/random.hpp>
-#include <realm/util/memory_stream.hpp>
-#include <realm/util/basic_system_errors.hpp>
-#include <realm/util/scope_exit.hpp>
-#include <realm/util/to_string.hpp>
-#include <realm/util/uri.hpp>
-#include <realm/util/platform_info.hpp>
-#include <realm/sync/impl/clock.hpp>
 #include <realm/impl/simulated_failure.hpp>
+#include <realm/sync/changeset_parser.hpp>
+#include <realm/sync/impl/clock.hpp>
 #include <realm/sync/network/http.hpp>
 #include <realm/sync/network/websocket.hpp>
 #include <realm/sync/noinst/client_history_impl.hpp>
-#include <realm/sync/noinst/client_impl_base.hpp>
 #include <realm/sync/noinst/compact_changesets.hpp>
+#include <realm/sync/noinst/client_reset_operation.hpp>
+#include <realm/sync/noinst/sync_schema_migration.hpp>
 #include <realm/sync/protocol.hpp>
+#include <realm/util/assert.hpp>
+#include <realm/util/basic_system_errors.hpp>
+#include <realm/util/memory_stream.hpp>
+#include <realm/util/platform_info.hpp>
+#include <realm/util/random.hpp>
+#include <realm/util/safe_int_ops.hpp>
+#include <realm/util/scope_exit.hpp>
+#include <realm/util/to_string.hpp>
+#include <realm/util/uri.hpp>
 #include <realm/version.hpp>
-#include <realm/sync/changeset_parser.hpp>
 
 #include <realm/sync/network/websocket.hpp> // Only for websocket::Error TODO remove
+
+#include <system_error>
+#include <sstream>
 
 // NOTE: The protocol specification is in `/doc/protocol.md`
 
@@ -134,9 +137,8 @@ bool ClientImpl::decompose_server_url(const std::string& url, ProtocolEnvelope& 
     return true;
 }
 
-
 ClientImpl::ClientImpl(ClientConfig config)
-    : logger_ptr{config.logger ? std::move(config.logger) : util::Logger::get_default_logger()}
+    : logger_ptr{std::make_shared<util::CategoryLogger>(util::LogCategory::session, std::move(config.logger))}
     , logger{*logger_ptr}
     , m_reconnect_mode{config.reconnect_mode}
     , m_connect_timeout{config.connect_timeout}
@@ -204,10 +206,8 @@ ClientImpl::ClientImpl(ClientConfig config)
     REALM_ASSERT_EX(m_socket_provider, "Must provide socket provider in sync Client config");
 
     if (m_one_connection_per_session) {
-        // FIXME: Re-enable this warning when the load balancer is able to handle
-        // multiplexing.
-        //        logger.warn("Testing/debugging feature 'one connection per session' enabled - "
-        //            "never do this in production");
+        logger.warn("Testing/debugging feature 'one connection per session' enabled - "
+                    "never do this in production");
     }
 
     if (config.disable_upload_activation_delay) {
@@ -1424,11 +1424,12 @@ void Connection::receive_server_log_message(session_ident_type session_ident, ut
 
     if (session_ident != 0) {
         if (auto sess = get_session(session_ident)) {
-            sess->logger.log(level, "%1 log: %2", prefix, message);
+            sess->logger.log(LogCategory::session, level, "%1 log: %2", prefix, message);
             return;
         }
 
-        logger.log(level, "%1 log for unknown session %2: %3", prefix, session_ident, message);
+        logger.log(util::LogCategory::session, level, "%1 log for unknown session %2: %3", prefix, session_ident,
+                   message);
         return;
     }
 
@@ -1441,7 +1442,8 @@ void Connection::receive_appservices_request_id(std::string_view coid)
     // Only set once per connection
     if (!coid.empty() && m_appservices_coid.empty()) {
         m_appservices_coid = coid;
-        logger.info("Connected to app services with request id: \"%1\"", m_appservices_coid);
+        logger.log(util::LogCategory::session, util::LogCategory::Level::info,
+                   "Connected to app services with request id: \"%1\"", m_appservices_coid);
     }
 }
 
@@ -1489,6 +1491,9 @@ void Session::cancel_resumption_delay()
         initiate_rebind(); // Throws
 
     m_conn.one_more_active_unsuspended_session(); // Throws
+    if (m_try_again_activation_timer) {
+        m_try_again_activation_timer.reset();
+    }
 
     on_resumed(); // Throws
 }
@@ -1522,12 +1527,11 @@ void Session::gather_pending_compensating_writes(util::Span<Changeset> changeset
 }
 
 
-void Session::integrate_changesets(ClientReplication& repl, const SyncProgress& progress,
-                                   std::uint_fast64_t downloadable_bytes,
+void Session::integrate_changesets(const SyncProgress& progress, std::uint_fast64_t downloadable_bytes,
                                    const ReceivedChangesets& received_changesets, VersionInfo& version_info,
                                    DownloadBatchState download_batch_state)
 {
-    auto& history = repl.get_history();
+    auto& history = get_history();
     if (received_changesets.empty()) {
         if (download_batch_state == DownloadBatchState::MoreToCome) {
             throw IntegrationException(ErrorCodes::SyncProtocolInvariantFailed,
@@ -1580,9 +1584,10 @@ void Session::on_integration_failure(const IntegrationException& error)
 
     m_client_error = util::make_optional<IntegrationException>(error);
     m_error_to_send = true;
-
+    SessionErrorInfo error_info{error.to_status(), IsFatal{false}};
+    error_info.server_requests_action = ProtocolErrorInfo::Action::Warning;
     // Surface the error to the user otherwise is lost.
-    on_connection_state_changed(m_conn.get_state(), SessionErrorInfo{error.to_status(), IsFatal{false}});
+    on_connection_state_changed(m_conn.get_state(), std::move(error_info));
 
     // Since the deactivation process has not been initiated, the UNBIND
     // message cannot have been sent unless an ERROR message was received.
@@ -1650,34 +1655,13 @@ void Session::activate()
 
     bool has_pending_client_reset = false;
     if (REALM_LIKELY(!get_client().is_dry_run())) {
-        // The reason we need a mutable reference from get_client_reset_config() is because we
-        // don't want the session to keep a strong reference to the client_reset_config->fresh_copy
-        // DB. If it did, then the fresh DB would stay alive for the duration of this sync session
-        // and we want to clean it up once the reset is finished. Additionally, the fresh copy will
-        // be set to a new copy on every reset so there is no reason to keep a reference to it.
-        // The modification to the client reset config happens via std::move(client_reset_config->fresh_copy).
-        // If the client reset config were a `const &` then this std::move would create another strong
-        // reference which we don't want to happen.
-        util::Optional<ClientReset>& client_reset_config = get_client_reset_config();
-
         bool file_exists = util::File::exists(get_realm_path());
+        m_performing_client_reset = get_client_reset_config().has_value();
 
-        logger.info("client_reset_config = %1, Realm exists = %2, "
-                    "client reset = %3",
-                    client_reset_config ? "true" : "false", file_exists ? "true" : "false",
-                    (client_reset_config && file_exists) ? "true" : "false"); // Throws
-        if (client_reset_config && !m_client_reset_operation) {
-            m_client_reset_operation = std::make_unique<_impl::ClientResetOperation>(
-                logger, get_db(), std::move(client_reset_config->fresh_copy), client_reset_config->mode,
-                std::move(client_reset_config->notify_before_client_reset),
-                std::move(client_reset_config->notify_after_client_reset),
-                client_reset_config->recovery_is_allowed); // Throws
-        }
-
-        if (!m_client_reset_operation) {
-            const ClientReplication& repl = access_realm(); // Throws
-            repl.get_history().get_status(m_last_version_available, m_client_file_ident, m_progress,
-                                          &has_pending_client_reset); // Throws
+        logger.info("client_reset_config = %1, Realm exists = %2 ", m_performing_client_reset, file_exists);
+        if (!m_performing_client_reset) {
+            get_history().get_status(m_last_version_available, m_client_file_ident, m_progress,
+                                     &has_pending_client_reset); // Throws
         }
     }
     logger.debug("client_file_ident = %1, client_file_ident_salt = %2", m_client_file_ident.ident,
@@ -1687,7 +1671,7 @@ void Session::activate()
     m_download_progress = m_progress.download;
     REALM_ASSERT_3(m_last_version_available, >=, m_progress.upload.client_version);
 
-    logger.debug("last_version_available  = %1", m_last_version_available);           // Throws
+    logger.debug("last_version_available  = %1", m_last_version_available);                    // Throws
     logger.debug("progress_download_server_version = %1", m_progress.download.server_version); // Throws
     logger.debug("progress_download_client_version = %1",
                  m_progress.download.last_integrated_client_version);                                      // Throws
@@ -1697,6 +1681,9 @@ void Session::activate()
     reset_protocol_state();
     m_state = Active;
 
+    call_debug_hook(SyncClientHookEvent::SessionActivating, m_progress, m_last_sent_flx_query_version,
+                    DownloadBatchState::SteadyState, 0);
+
     REALM_ASSERT(!m_suspended);
     m_conn.one_more_active_unsuspended_session(); // Throws
 
@@ -1704,10 +1691,10 @@ void Session::activate()
         process_pending_flx_bootstrap();
     }
     catch (const IntegrationException& error) {
-        logger.error("Error integrating bootstrap changesets: %1", error.what());
-        m_suspended = true;
-        m_conn.one_less_active_unsuspended_session(); // Throws
-        on_suspended(SessionErrorInfo{Status{error.code(), error.what()}, IsFatal{true}});
+        on_integration_failure(error);
+    }
+    catch (...) {
+        on_integration_failure(IntegrationException(exception_to_status()));
     }
 
     if (has_pending_client_reset) {
@@ -1889,6 +1876,9 @@ void Session::send_bind_message()
             bind_json_data["migratedPartition"] = *migrated_partition;
         }
         bind_json_data["sessionReason"] = static_cast<uint64_t>(get_session_reason());
+        auto schema_version = get_schema_version();
+        // Send 0 if schema is not versioned.
+        bind_json_data["schemaVersion"] = schema_version != uint64_t(-1) ? schema_version : 0;
         if (logger.would_log(util::Logger::Level::debug)) {
             std::string json_data_dump;
             if (!bind_json_data.empty()) {
@@ -1911,6 +1901,8 @@ void Session::send_bind_message()
     m_conn.initiate_write_message(out, this); // Throws
 
     m_bind_message_sent = true;
+    call_debug_hook(SyncClientHookEvent::BindMessageSent, m_progress, m_last_sent_flx_query_version,
+                    DownloadBatchState::SteadyState, 0);
 
     // Ready to send the IDENT message if the file identifier pair is already
     // available.
@@ -2006,12 +1998,10 @@ void Session::send_upload_message()
         target_upload_version = m_pending_flx_sub_set->snapshot_version;
     }
 
-    const ClientReplication& repl = access_realm(); // Throws
-
     std::vector<UploadChangeset> uploadable_changesets;
     version_type locked_server_version = 0;
-    repl.get_history().find_uploadable_changesets(m_upload_progress, target_upload_version, uploadable_changesets,
-                                                  locked_server_version); // Throws
+    get_history().find_uploadable_changesets(m_upload_progress, target_upload_version, uploadable_changesets,
+                                             locked_server_version); // Throws
 
     if (uploadable_changesets.empty()) {
         // Nothing more to upload right now
@@ -2046,18 +2036,19 @@ void Session::send_upload_message()
     ClientProtocol::UploadMessageBuilder upload_message_builder = protocol.make_upload_message_builder(); // Throws
 
     for (const UploadChangeset& uc : uploadable_changesets) {
-        logger.debug("Fetching changeset for upload (client_version=%1, server_version=%2, "
+        logger.debug(util::LogCategory::changeset,
+                     "Fetching changeset for upload (client_version=%1, server_version=%2, "
                      "changeset_size=%3, origin_timestamp=%4, origin_file_ident=%5)",
                      uc.progress.client_version, uc.progress.last_integrated_server_version, uc.changeset.size(),
                      uc.origin_timestamp, uc.origin_file_ident); // Throws
         if (logger.would_log(util::Logger::Level::trace)) {
             BinaryData changeset_data = uc.changeset.get_first_chunk();
             if (changeset_data.size() < 1024) {
-                logger.trace("Changeset: %1",
+                logger.trace(util::LogCategory::changeset, "Changeset: %1",
                              _impl::clamped_hex_dump(changeset_data)); // Throws
             }
             else {
-                logger.trace("Changeset(comp): %1 %2", changeset_data.size(),
+                logger.trace(util::LogCategory::changeset, "Changeset(comp): %1 %2", changeset_data.size(),
                              protocol.compressed_hex_dump(changeset_data));
             }
 
@@ -2068,10 +2059,10 @@ void Session::send_upload_message()
                 parse_changeset(in, log);
                 std::stringstream ss;
                 log.print(ss);
-                logger.trace("Changeset (parsed):\n%1", ss.str());
+                logger.trace(util::LogCategory::changeset, "Changeset (parsed):\n%1", ss.str());
             }
             catch (const BadChangesetError& err) {
-                logger.error("Unable to parse changeset: %1", err.what());
+                logger.error(util::LogCategory::changeset, "Unable to parse changeset: %1", err.what());
             }
 #endif
         }
@@ -2095,7 +2086,7 @@ void Session::send_upload_message()
                 compact_changesets(&changeset, 1);
                 encode_changeset(changeset, encode_buffer);
 
-                logger.debug("Upload compaction: original size = %1, compacted size = %2", uc.changeset.size(),
+                logger.debug(util::LogCategory::changeset, "Upload compaction: original size = %1, compacted size = %2", uc.changeset.size(),
                              encode_buffer.size()); // Throws
             }
 
@@ -2218,6 +2209,66 @@ void Session::send_test_command_message()
     enlist_to_send();
 }
 
+bool Session::client_reset_if_needed()
+{
+    // Regardless of what happens, once we return from this function we will
+    // no longer be in the middle of a client reset
+    m_performing_client_reset = false;
+
+    // Even if we end up not actually performing a client reset, consume the
+    // config to ensure that the resources it holds are released
+    auto client_reset_config = std::exchange(get_client_reset_config(), std::nullopt);
+    if (!client_reset_config) {
+        return false;
+    }
+
+    auto on_flx_version_complete = [this](int64_t version) {
+        this->on_flx_sync_version_complete(version);
+    };
+    bool did_reset = client_reset::perform_client_reset(
+        logger, *get_db(), *client_reset_config->fresh_copy, client_reset_config->mode,
+        std::move(client_reset_config->notify_before_client_reset),
+        std::move(client_reset_config->notify_after_client_reset), m_client_file_ident, get_flx_subscription_store(),
+        on_flx_version_complete, client_reset_config->recovery_is_allowed);
+    if (!did_reset) {
+        return false;
+    }
+
+    // The fresh Realm has been used to reset the state
+    logger.debug("Client reset is completed, path=%1", get_realm_path()); // Throws
+
+    SaltedFileIdent client_file_ident;
+    bool has_pending_client_reset = false;
+    get_history().get_status(m_last_version_available, client_file_ident, m_progress,
+                             &has_pending_client_reset); // Throws
+    REALM_ASSERT_3(m_client_file_ident.ident, ==, client_file_ident.ident);
+    REALM_ASSERT_3(m_client_file_ident.salt, ==, client_file_ident.salt);
+    REALM_ASSERT_EX(m_progress.download.last_integrated_client_version == 0,
+                    m_progress.download.last_integrated_client_version);
+    REALM_ASSERT_EX(m_progress.upload.client_version == 0, m_progress.upload.client_version);
+    logger.trace("last_version_available  = %1", m_last_version_available); // Throws
+
+    m_upload_progress = m_progress.upload;
+    m_download_progress = m_progress.download;
+    // In recovery mode, there may be new changesets to upload and nothing left to download.
+    // In FLX DiscardLocal mode, there may be new commits due to subscription handling.
+    // For both, we want to allow uploads again without needing external changes to download first.
+    m_allow_upload = true;
+    REALM_ASSERT_EX(m_last_version_selected_for_upload == 0, m_last_version_selected_for_upload);
+
+    if (has_pending_client_reset) {
+        handle_pending_client_reset_acknowledgement();
+    }
+
+    update_subscription_version_info();
+
+    // If a migration or rollback is in progress, mark it complete when client reset is completed.
+    if (auto migration_store = get_migration_store()) {
+        migration_store->complete_migration_or_rollback();
+    }
+
+    return true;
+}
 
 Status Session::receive_ident_message(SaltedFileIdent client_file_ident)
 {
@@ -2250,67 +2301,6 @@ Status Session::receive_ident_message(SaltedFileIdent client_file_ident)
         return Status::OK();       // Success
     }
 
-    // access before the client reset (if applicable) because
-    // the reset can take a while and the sync session might have died
-    // by the time the reset finishes.
-    ClientReplication& repl = access_realm(); // Throws
-
-    auto client_reset_if_needed = [&]() -> bool {
-        if (!m_client_reset_operation) {
-            return false;
-        }
-
-        // ClientResetOperation::finalize() will return true only if the operation actually did
-        // a client reset. It may choose not to do a reset if the local Realm does not exist
-        // at this point (in that case there is nothing to reset). But in any case, we must
-        // clean up m_client_reset_operation at this point as sync should be able to continue from
-        // this point forward.
-        auto client_reset_operation = std::move(m_client_reset_operation);
-        util::UniqueFunction<void(int64_t)> on_flx_subscription_complete = [this](int64_t version) {
-            this->on_flx_sync_version_complete(version);
-        };
-        if (!client_reset_operation->finalize(client_file_ident, get_flx_subscription_store(),
-                                              std::move(on_flx_subscription_complete))) {
-            return false;
-        }
-
-        // The fresh Realm has been used to reset the state
-        logger.debug("Client reset is completed, path=%1", get_realm_path()); // Throws
-
-        SaltedFileIdent client_file_ident;
-        bool has_pending_client_reset = false;
-        repl.get_history().get_status(m_last_version_available, client_file_ident, m_progress,
-                                      &has_pending_client_reset); // Throws
-        REALM_ASSERT_3(m_client_file_ident.ident, ==, client_file_ident.ident);
-        REALM_ASSERT_3(m_client_file_ident.salt, ==, client_file_ident.salt);
-        REALM_ASSERT_EX(m_progress.download.last_integrated_client_version == 0,
-                        m_progress.download.last_integrated_client_version);
-        REALM_ASSERT_EX(m_progress.upload.client_version == 0, m_progress.upload.client_version);
-        REALM_ASSERT_EX(m_progress.upload.last_integrated_server_version == 0,
-                        m_progress.upload.last_integrated_server_version);
-        logger.trace("last_version_available  = %1", m_last_version_available); // Throws
-
-        m_upload_progress = m_progress.upload;
-        m_download_progress = m_progress.download;
-        // In recovery mode, there may be new changesets to upload and nothing left to download.
-        // In FLX DiscardLocal mode, there may be new commits due to subscription handling.
-        // For both, we want to allow uploads again without needing external changes to download first.
-        m_allow_upload = true;
-        REALM_ASSERT_EX(m_last_version_selected_for_upload == 0, m_last_version_selected_for_upload);
-
-        if (has_pending_client_reset) {
-            handle_pending_client_reset_acknowledgement();
-        }
-
-        update_subscription_version_info();
-
-        // If a migration or rollback is in progress, mark it complete when client reset is completed.
-        if (auto migration_store = get_migration_store()) {
-            migration_store->complete_migration_or_rollback();
-        }
-
-        return true;
-    };
     // if a client reset happens, it will take care of setting the file ident
     // and if not, we do it here
     bool did_client_reset = false;
@@ -2325,8 +2315,8 @@ Status Session::receive_ident_message(SaltedFileIdent client_file_ident)
         return Status::OK();
     }
     if (!did_client_reset) {
-        repl.get_history().set_client_file_ident(client_file_ident,
-                                                 m_fix_up_object_ids); // Throws
+        get_history().set_client_file_ident(client_file_ident,
+                                            m_fix_up_object_ids); // Throws
         m_progress.download.last_integrated_client_version = 0;
         m_progress.upload.client_version = 0;
         m_last_version_selected_for_upload = 0;
@@ -2559,6 +2549,19 @@ Status Session::receive_error_message(const ProtocolErrorInfo& info)
         return Status::OK();
     }
 
+    if (protocol_error == ProtocolError::schema_version_changed) {
+        // Enable upload immediately if the session is still active.
+        if (m_state == Active) {
+            auto wt = get_db()->start_write();
+            _impl::sync_schema_migration::track_sync_schema_migration(*wt, *info.previous_schema_version);
+            wt->commit();
+            // Notify SyncSession a schema migration is required.
+            on_connection_state_changed(m_conn.get_state(), SessionErrorInfo{info});
+        }
+        // Keep the session active to upload any unsynced changes.
+        return Status::OK();
+    }
+
     m_error_message_received = true;
     suspend(SessionErrorInfo{info, std::move(status)});
     return Status::OK();
@@ -2588,6 +2591,7 @@ void Session::suspend(const SessionErrorInfo& info)
     // Notify the application of the suspension of the session if the session is
     // still in the Active state
     if (m_state == Active) {
+        call_debug_hook(SyncClientHookEvent::SessionSuspended, info);
         m_conn.one_less_active_unsuspended_session(); // Throws
         on_suspended(info);                           // Throws
     }
@@ -2716,7 +2720,7 @@ void Session::check_for_upload_completion()
     }
 
     // during an ongoing client reset operation, we never upload anything
-    if (m_client_reset_operation)
+    if (m_performing_client_reset)
         return;
 
     // Upload process must have reached end of history

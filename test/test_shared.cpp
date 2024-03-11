@@ -634,9 +634,14 @@ TEST(Shared_EncryptedRemap)
 TEST(Shared_Initial)
 {
     SHARED_GROUP_TEST_PATH(path);
+    std::vector<char> key;
+
+    CHECK_NOT(DB::needs_file_format_upgrade(path, key)); // File not created yet
+
+    auto key_str = crypt_key();
     {
         // Create a new shared db
-        DBRef sg = DB::create(path, false, DBOptions(crypt_key()));
+        DBRef sg = DB::create(path, false, DBOptions(key_str));
 
         // Verify that new group is empty
         {
@@ -644,6 +649,10 @@ TEST(Shared_Initial)
             CHECK(rt.get_group().is_empty());
         }
     }
+    if (key_str) {
+        key.insert(key.end(), key_str, key_str + strlen(key_str));
+    }
+    CHECK_NOT(DB::needs_file_format_upgrade(path, key));
 }
 
 
@@ -1087,7 +1096,7 @@ TEST(Shared_Writes)
 }
 
 #if !REALM_ANDROID // FIXME
-TEST_IF(Shared_ManyReaders, TEST_DURATION > 0)
+TEST(Shared_ManyReaders)
 {
     // This test was written primarily to expose a former bug in
     // SharedGroup::end_read(), where the lock-file was not remapped
@@ -1105,6 +1114,8 @@ TEST_IF(Shared_ManyReaders, TEST_DURATION > 0)
 #if TEST_DURATION < 1
     // Mac OS X 10.8 cannot handle more than 15 due to its default ulimit settings.
     int rounds[] = {3, 5, 7, 9, 11, 13};
+#elif REALM_DEBUG // this test is disproportionately slower in debug
+    int rounds[] = {3, 5, 7, 9, 11, 13, 15, 17, 23};
 #else
     int rounds[] = {3, 5, 11, 15, 17, 23, 27, 31, 47, 59};
 #endif
@@ -4188,6 +4199,10 @@ TEST(Shared_WriteTo)
         baas->add_column(type_Mixed, "any", true);
         baas->add_column(*foos, "link");
 
+        // collections in mixed
+        baas->add_column(type_Mixed, "mixed_nested_list", true);
+        baas->add_column(type_Mixed, "mixed_nested_dictionary", true);
+
         auto col_str = foos->add_column(type_String, "str");
         foos->add_search_index(col_str);
         foos->add_column_list(*embedded, "list_of_embedded");
@@ -4225,6 +4240,35 @@ TEST(Shared_WriteTo)
         dict.insert("key7", 7);
         dict.insert("key8", 8);
         dict.insert("key9", 9);
+
+        // nested collections
+        // nested list
+        auto col_key_mixed_list = baas->get_column_key("mixed_nested_list");
+        baa.set_collection(col_key_mixed_list, CollectionType::List);
+        auto any_nested_list = baa.get_collection_ptr(col_key_mixed_list);
+        any_nested_list->insert_collection(0, CollectionType::List);
+        any_nested_list->insert_collection(1, CollectionType::Dictionary);
+        auto nested_list1 = any_nested_list->get_list(0);
+        nested_list1->add(1);
+        nested_list1->add(2);
+        nested_list1->add(3);
+        auto nested_dict1 = any_nested_list->get_dictionary(1);
+        nested_dict1->insert("test", 10);
+        nested_dict1->insert("test", "test");
+
+        // nested dictionary
+        auto col_key_mixed_dict = baas->get_column_key("mixed_nested_dictionary");
+        baa.set_collection(col_key_mixed_dict, CollectionType::Dictionary);
+        auto any_nested_dict = baa.get_collection_ptr(col_key_mixed_dict);
+        any_nested_dict->insert_collection("List", CollectionType::List);
+        any_nested_dict->insert_collection("Dict", CollectionType::Dictionary);
+        auto nested_list2 = any_nested_dict->get_list("List");
+        nested_list2->add(1);
+        nested_list2->add(2);
+        nested_list2->add(3);
+        auto nested_dict2 = any_nested_dict->get_dictionary("Dict");
+        nested_dict2->insert("test", 10);
+        nested_dict2->insert("test", "test");
 
         auto baa1 = baas->create_object_with_primary_key(666).set("link", foo.get_key());
         obj = baa1.create_and_set_linked_object(baas->get_column_key("embedded"));

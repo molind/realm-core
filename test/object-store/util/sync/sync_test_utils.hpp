@@ -18,9 +18,9 @@
 
 #pragma once
 
-#include <util/event_loop.hpp>
-#include <util/test_file.hpp>
-#include <util/test_utils.hpp>
+#include "util/event_loop.hpp"
+#include "util/test_file.hpp"
+#include "util/test_utils.hpp"
 
 #include <realm/object-store/sync/app.hpp>
 #include <realm/object-store/sync/generic_network_transport.hpp>
@@ -92,6 +92,8 @@ util::Future<T> wait_for_future(util::Future<T>&& input, std::chrono::millisecon
 {
     auto pf = util::make_promise_future<T>();
     auto shared_state = util::make_bind<TimedFutureState<T>>(std::move(pf.promise));
+    const auto delay = TEST_TIMEOUT_EXTRA > 0 ? max_ms + std::chrono::seconds(TEST_TIMEOUT_EXTRA) : max_ms;
+
     std::move(input).get_async([shared_state](StatusOrStatusWith<T> value) {
         std::unique_lock lk(shared_state->mutex);
         // If the state has already expired, then just return without doing anything.
@@ -105,12 +107,12 @@ util::Future<T> wait_for_future(util::Future<T>&& input, std::chrono::millisecon
     });
 
     std::unique_lock lk(shared_state->mutex);
-    if (!shared_state->cv.wait_for(lk, max_ms, [&] {
+    if (!shared_state->cv.wait_for(lk, delay, [&] {
             return shared_state->finished;
         })) {
         shared_state->finished = true;
         shared_state->promise.set_error(
-            {ErrorCodes::RuntimeError, util::format("timed_future wait exceeded %1 ms", max_ms.count())});
+            {ErrorCodes::RuntimeError, util::format("wait_for_future exceeded %1 ms", delay.count())});
     }
 
     return std::move(pf.future);
@@ -133,21 +135,16 @@ const std::shared_ptr<app::GenericNetworkTransport> instance_of = std::make_shar
 
 std::ostream& operator<<(std::ostream& os, util::Optional<app::AppError> error);
 
-template <typename Transport>
-TestSyncManager::Config get_config(Transport&& transport)
-{
-    TestSyncManager::Config config;
-    config.transport = transport;
-    return config;
-}
-
 void subscribe_to_all_and_bootstrap(Realm& realm);
 
 #if REALM_ENABLE_AUTH_TESTS
+void wait_for_sessions_to_close(const TestAppSession& test_app_session);
 
 #ifdef REALM_MONGODB_ENDPOINT
 std::string get_base_url();
+std::string get_admin_url();
 #endif
+#endif // REALM_ENABLE_AUTH_TESTS
 
 struct AutoVerifiedEmailCredentials : app::AppCredentials {
     AutoVerifiedEmailCredentials();
@@ -161,8 +158,6 @@ void wait_for_advance(Realm& realm);
 
 void async_open_realm(const Realm::Config& config,
                       util::UniqueFunction<void(ThreadSafeReference&& ref, std::exception_ptr e)> finish);
-
-#endif // REALM_ENABLE_AUTH_TESTS
 
 #endif // REALM_ENABLE_SYNC
 
@@ -193,6 +188,7 @@ struct TestClientReset {
     ObjectId get_pk_of_object_driving_reset() const;
     void disable_wait_for_reset_completion();
 
+    virtual TestClientReset* set_development_mode(bool enable = true);
     virtual void run() = 0;
 
 protected:
@@ -227,7 +223,7 @@ void wait_for_object_to_persist_to_atlas(std::shared_ptr<SyncUser> user, const A
 void wait_for_num_objects_in_atlas(std::shared_ptr<SyncUser> user, const AppSession& app_session,
                                    const std::string& schema_name, size_t expected_size);
 
-void trigger_client_reset(const AppSession& app_session);
+void trigger_client_reset(const AppSession& app_session, const SyncSession& sync_session);
 void trigger_client_reset(const AppSession& app_session, const SharedRealm& realm);
 #endif // REALM_ENABLE_AUTH_TESTS
 

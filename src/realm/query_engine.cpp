@@ -207,6 +207,15 @@ void MixedNode<EqualIns>::init(bool will_query_ranges)
             m_index_matches.clear();
             constexpr bool case_insensitive = true;
             index->find_all(m_index_matches, val_as_string, case_insensitive);
+            // It is unfortunate but necessary to check the type due to Binary and String
+            // having the same StringIndex hash values
+            m_index_matches.erase(std::remove_if(m_index_matches.begin(), m_index_matches.end(),
+                                                 [this](const ObjKey& obj_key) {
+                                                     Mixed to_check =
+                                                         m_table->get_object(obj_key).get_any(m_condition_column_key);
+                                                     return (!Mixed::types_are_comparable(to_check, m_value));
+                                                 }),
+                                  m_index_matches.end());
             m_index_evaluator->init(&m_index_matches);
         }
         else {
@@ -236,18 +245,14 @@ size_t MixedNode<EqualIns>::find_first_local(size_t start, size_t end)
     REALM_ASSERT(m_table);
 
     EqualIns cond;
-    if (m_value.is_type(type_String)) {
+    if (m_value.is_type(type_String, type_Binary)) {
         for (size_t i = start; i < end; i++) {
             QueryValue val(m_leaf->get(i));
-            StringData val_as_str;
-            if (val.is_type(type_String)) {
-                val_as_str = val.get<StringData>();
+            if (!Mixed::types_are_comparable(m_value, val)) {
+                continue;
             }
-            else if (val.is_type(type_Binary)) {
-                val_as_str = StringData(val.get<BinaryData>().data(), val.get<BinaryData>().size());
-            }
-            if (!val_as_str.is_null() &&
-                cond(m_value.get<StringData>(), m_ucase.c_str(), m_lcase.c_str(), val_as_str))
+            StringData val_as_str = val.export_to_type<StringData>();
+            if (cond(m_value.export_to_type<StringData>(), m_ucase.c_str(), m_lcase.c_str(), val_as_str))
                 return i;
         }
     }
@@ -294,7 +299,7 @@ size_t StringNodeEqualBase::find_first_local(size_t start, size_t end)
 }
 
 
-void IndexEvaluator::init(StringIndex* index, Mixed value)
+void IndexEvaluator::init(SearchIndex* index, Mixed value)
 {
     REALM_ASSERT(index);
     m_matching_keys = nullptr;
@@ -379,7 +384,7 @@ void StringNode<Equal>::_search_index_init()
 {
     REALM_ASSERT(bool(m_index_evaluator));
     auto index = ParentNode::m_table.unchecked_ptr()->get_search_index(ParentNode::m_condition_column_key);
-    m_index_evaluator->init(index, StringData(StringNodeBase::m_value));
+    m_index_evaluator->init(index, StringNodeBase::m_string_value);
 }
 
 bool StringNode<Equal>::do_consume_condition(ParentNode& node)
@@ -392,7 +397,7 @@ bool StringNode<Equal>::do_consume_condition(ParentNode& node)
     REALM_ASSERT(m_condition_column_key == other.m_condition_column_key);
     REALM_ASSERT(other.m_needles.empty());
     if (m_needles.empty()) {
-        m_needles.insert(m_value ? StringData(*m_value) : StringData());
+        m_needles.insert(m_string_value);
     }
     if (auto& str = other.m_value) {
         m_needle_storage.push_back(std::make_unique<char[]>(str->size()));
@@ -408,7 +413,7 @@ bool StringNode<Equal>::do_consume_condition(ParentNode& node)
 size_t StringNode<Equal>::_find_first_local(size_t start, size_t end)
 {
     if (m_needles.empty()) {
-        return m_leaf->find_first(m_value, start, end);
+        return m_leaf->find_first(m_string_value, start, end);
     }
     else {
         if (end == npos)
@@ -442,7 +447,7 @@ void StringNode<EqualIns>::_search_index_init()
     auto index = ParentNode::m_table->get_search_index(ParentNode::m_condition_column_key);
     m_index_matches.clear();
     constexpr bool case_insensitive = true;
-    index->find_all(m_index_matches, StringData(StringNodeBase::m_value), case_insensitive);
+    index->find_all(m_index_matches, StringNodeBase::m_string_value, case_insensitive);
     m_index_evaluator->init(&m_index_matches);
 }
 
@@ -452,7 +457,7 @@ size_t StringNode<EqualIns>::_find_first_local(size_t start, size_t end)
     for (size_t s = start; s < end; ++s) {
         StringData t = get_string(s);
 
-        if (cond(StringData(m_value), m_ucase.c_str(), m_lcase.c_str(), t))
+        if (cond(m_string_value, m_ucase.c_str(), m_lcase.c_str(), t))
             return s;
     }
 
@@ -481,17 +486,17 @@ StringNodeFulltext::StringNodeFulltext(const StringNodeFulltext& other)
 
 void StringNodeFulltext::_search_index_init()
 {
-    auto index = m_link_map->get_target_table()->get_search_index(ParentNode::m_condition_column_key);
+    StringIndex* index = m_link_map->get_target_table()->get_string_index(ParentNode::m_condition_column_key);
     REALM_ASSERT(index && index->is_fulltext_index());
     m_index_matches.clear();
-    index->find_all_fulltext(m_index_matches, StringData(StringNodeBase::m_value));
+    index->find_all_fulltext(m_index_matches, StringNodeBase::m_string_value);
 
     // If links exists, use backlinks to find the original objects
     if (m_link_map->links_exist()) {
         std::set<ObjKey> tmp;
         for (auto k : m_index_matches) {
-            auto ndxs = m_link_map->get_origin_ndxs(k);
-            tmp.insert(ndxs.begin(), ndxs.end());
+            auto keys = m_link_map->get_origin_objkeys(k);
+            tmp.insert(keys.begin(), keys.end());
         }
         m_index_matches.assign(tmp.begin(), tmp.end());
     }
@@ -533,7 +538,6 @@ std::unique_ptr<ArrayPayload> TwoColumnsNodeBase::update_cached_leaf_pointers_fo
             return std::make_unique<ArrayUUIDNull>(alloc);
         case col_type_TypedLink:
         case col_type_BackLink:
-        case col_type_LinkList:
             break;
     };
     REALM_UNREACHABLE();
@@ -605,7 +609,7 @@ size_t size_of_list_from_ref(ref_type ref, Allocator& alloc, ColumnType col_type
             list.init_from_ref(ref);
             return list.size();
         }
-        case col_type_LinkList: {
+        case col_type_Link: {
             BPlusTree<ObjKey> list(alloc);
             list.init_from_ref(ref);
             return list.size();
@@ -615,7 +619,6 @@ size_t size_of_list_from_ref(ref_type ref, Allocator& alloc, ColumnType col_type
             list.init_from_ref(ref);
             return list.size();
         }
-        case col_type_Link:
         case col_type_BackLink:
             break;
     }

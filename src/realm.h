@@ -65,9 +65,11 @@ typedef void (*realm_free_userdata_func_t)(realm_userdata_t userdata);
 typedef realm_userdata_t (*realm_clone_userdata_func_t)(const realm_userdata_t userdata);
 typedef void (*realm_on_object_store_thread_callback_t)(realm_userdata_t userdata);
 typedef bool (*realm_on_object_store_error_callback_t)(realm_userdata_t userdata, const char*);
+typedef struct realm_key_path_array realm_key_path_array_t;
 
 /* Accessor types */
 typedef struct realm_object realm_object_t;
+
 typedef struct realm_list realm_list_t;
 typedef struct realm_set realm_set_t;
 typedef struct realm_dictionary realm_dictionary_t;
@@ -129,6 +131,8 @@ typedef enum realm_value_type {
     RLM_TYPE_OBJECT_ID,
     RLM_TYPE_LINK,
     RLM_TYPE_UUID,
+    RLM_TYPE_LIST,
+    RLM_TYPE_DICTIONARY,
 } realm_value_type_e;
 
 typedef enum realm_schema_validation_mode {
@@ -201,18 +205,6 @@ typedef struct realm_value {
     } RLM_ANON_UNION_MEMBER(values);
     realm_value_type_e type;
 } realm_value_t;
-typedef struct realm_key_path_elem {
-    realm_class_key_t object;
-    realm_property_key_t property;
-} realm_key_path_elem_t;
-typedef struct realm_key_path {
-    size_t nb_elements;
-    realm_key_path_elem_t* path_elements;
-} realm_key_path_t;
-typedef struct realm_key_path_array {
-    size_t nb_elements;
-    realm_key_path_t* paths;
-} realm_key_path_array_t;
 typedef struct realm_query_arg {
     size_t nb_args;
     bool is_list;
@@ -235,7 +227,7 @@ typedef struct realm_error {
     const char* message;
     // When error is RLM_ERR_CALLBACK this is an opaque pointer to an SDK-owned error object
     // thrown by user code inside a callback with realm_register_user_code_callback_error(), otherwise null.
-    void* usercode_error;
+    void* user_code_error;
     const char* path;
 } realm_error_t;
 
@@ -610,6 +602,22 @@ typedef void (*realm_log_func_t)(realm_userdata_t userdata, realm_log_level_e le
 RLM_API void realm_set_log_callback(realm_log_func_t, realm_log_level_e, realm_userdata_t userdata,
                                     realm_free_userdata_func_t userdata_free) RLM_API_NOEXCEPT;
 RLM_API void realm_set_log_level(realm_log_level_e) RLM_API_NOEXCEPT;
+/**
+ * Set the logging level for given category. Return the previous level.
+ */
+RLM_API realm_log_level_e realm_set_log_level_category(const char*, realm_log_level_e) RLM_API_NOEXCEPT;
+/**
+ * Get the logging level for given category.
+ */
+RLM_API realm_log_level_e realm_get_log_level_category(const char*) RLM_API_NOEXCEPT;
+/**
+ * Get the actual log category names (currently 15)
+  @param num_values number of values in the out_values array
+  @param out_values pointer to an array of size num_values
+  @return returns the number of categories returned. If num_values is zero, it will
+          return the total number of categories.
+ */
+RLM_API size_t realm_get_category_names(size_t num_values, const char** out_values);
 
 /**
  * Get a thread-safe reference representing the same underlying object as some
@@ -785,6 +793,11 @@ RLM_API void realm_config_set_should_compact_on_launch_function(realm_config_t*,
  * This function cannot fail.
  */
 RLM_API bool realm_config_get_disable_format_upgrade(const realm_config_t*);
+
+/**
+ * True if you can open the file without a file_format_upgrade
+ */
+RLM_API bool realm_config_needs_file_format_upgrade(const realm_config_t*);
 
 /**
  * Disable file format upgrade on open (default: false).
@@ -1607,13 +1620,23 @@ RLM_API realm_class_key_t realm_object_get_table(const realm_object_t* object);
 RLM_API realm_link_t realm_object_as_link(const realm_object_t* object);
 
 /**
+ * Helper method for making it easier to to convert SDK input to the underlying
+ * `realm_key_path_array_t`.
+ *
+ * @return A pointer to the converted key path array. NULL in case of an error.
+ */
+RLM_API realm_key_path_array_t* realm_create_key_path_array(const realm_t* realm,
+                                                            const realm_class_key_t object_class_key,
+                                                            size_t num_key_paths, const char** user_key_paths);
+
+/**
  * Subscribe to notifications for this object.
  *
  * @return A non-null pointer if no exception occurred.
  */
 RLM_API realm_notification_token_t* realm_object_add_notification_callback(realm_object_t*, realm_userdata_t userdata,
                                                                            realm_free_userdata_func_t userdata_free,
-                                                                           realm_key_path_array_t*,
+                                                                           realm_key_path_array_t* key_path_array,
                                                                            realm_on_object_change_func_t on_change);
 
 /**
@@ -1665,11 +1688,26 @@ RLM_API bool realm_get_values(const realm_object_t*, size_t num_values, const re
 RLM_API bool realm_set_value(realm_object_t*, realm_property_key_t, realm_value_t new_value, bool is_default);
 
 /**
+ * Assign a JSON formatted string to a Mixed property. Underlying structures will be created as needed
+ *
+ * @param json_string The new value for the property.
+ * @return True if no exception occurred.
+ */
+RLM_API bool realm_set_json(realm_object_t*, realm_property_key_t, const char* json_string);
+
+/**
  * Create an embedded object in a given property.
  *
  * @return A non-NULL pointer if the object was created successfully.
  */
 RLM_API realm_object_t* realm_set_embedded(realm_object_t*, realm_property_key_t);
+
+/**
+ * Create a collection in a given Mixed property.
+ *
+ */
+RLM_API realm_list_t* realm_set_list(realm_object_t*, realm_property_key_t);
+RLM_API realm_dictionary_t* realm_set_dictionary(realm_object_t*, realm_property_key_t);
 
 /** Return the object linked by the given property
  *
@@ -1813,6 +1851,46 @@ RLM_API bool realm_list_set(realm_list_t*, size_t index, realm_value_t value);
 RLM_API bool realm_list_insert(realm_list_t*, size_t index, realm_value_t value);
 
 /**
+ * Insert a collection inside a list (only available for mixed types)
+ *
+ * @param list valid ptr to a list of mixed
+ * @param index position in the list where to add the collection
+ * @return pointer to a valid collection that has been just inserted at the index passed as argument
+ */
+RLM_API realm_list_t* realm_list_insert_list(realm_list_t* list, size_t index);
+RLM_API realm_dictionary_t* realm_list_insert_dictionary(realm_list_t* list, size_t index);
+
+/**
+ * Set a collection inside a list (only available for mixed types).
+ * If the list already contains a collection of the requested type, the
+ * operation is idempotent.
+ *
+ * @param list valid ptr to a list where a nested collection needs to be set
+ * @param index position in the list where to set the collection
+ * @return a valid ptr representing the collection just set
+ */
+RLM_API realm_list_t* realm_list_set_list(realm_list_t* list, size_t index);
+RLM_API realm_dictionary_t* realm_list_set_dictionary(realm_list_t* list, size_t index);
+
+/**
+ * Returns a nested list if such collection exists, NULL otherwise.
+ *
+ * @param list pointer to the list that containes the nested list
+ * @param index index of collection in the list
+ * @return a pointer to the the nested list found at the index passed as argument
+ */
+RLM_API realm_list_t* realm_list_get_list(realm_list_t* list, size_t index);
+
+/**
+ * Returns a nested dictionary if such collection exists, NULL otherwise.
+ *
+ * @param list pointer to the list that containes the nested collection into
+ * @param index position of collection in the list
+ * @return a pointer to the the nested dictionary found at index passed as argument
+ */
+RLM_API realm_dictionary_t* realm_list_get_dictionary(realm_list_t* list, size_t index);
+
+/**
  * Move the element at @a from_index to @a to_index.
  *
  * @param from_index The index of the element to move.
@@ -1872,7 +1950,7 @@ RLM_API bool realm_list_remove_all(realm_list_t*);
  */
 RLM_API realm_notification_token_t* realm_list_add_notification_callback(realm_list_t*, realm_userdata_t userdata,
                                                                          realm_free_userdata_func_t userdata_free,
-                                                                         realm_key_path_array_t*,
+                                                                         realm_key_path_array_t* key_path_array,
                                                                          realm_on_collection_change_func_t on_change);
 
 /**
@@ -1917,10 +1995,12 @@ RLM_API size_t realm_object_changes_get_modified_properties(const realm_object_c
  * @param out_num_modifications The number of modifications. May be NULL.
  * @param out_num_moves The number of moved elements. May be NULL.
  * @param out_collection_was_cleared a flag to signal if the collection has been cleared. May be NULL
+ * @param out_collection_was_deleted a flag to signal if the collection has been deleted. May be NULL
  */
 RLM_API void realm_collection_changes_get_num_changes(const realm_collection_changes_t*, size_t* out_num_deletions,
                                                       size_t* out_num_insertions, size_t* out_num_modifications,
-                                                      size_t* out_num_moves, bool* out_collection_was_cleared);
+                                                      size_t* out_num_moves, bool* out_collection_was_cleared,
+                                                      bool* out_collection_was_deleted);
 
 /**
  * Get the number of various types of changes in a collection notification,
@@ -2001,9 +2081,11 @@ RLM_API void realm_collection_changes_get_ranges(
  * @param out_deletions_size number of deletions
  * @param out_insertion_size number of insertions
  * @param out_modification_size number of modifications
+ * @param out_was_deleted a flag to signal if the dictionary has been deleted.
  */
 RLM_API void realm_dictionary_get_changes(const realm_dictionary_changes_t* changes, size_t* out_deletions_size,
-                                          size_t* out_insertion_size, size_t* out_modification_size);
+                                          size_t* out_insertion_size, size_t* out_modification_size,
+                                          bool* out_was_deleted);
 
 /**
  * Returns the list of keys changed for the dictionary passed as argument.
@@ -2017,11 +2099,12 @@ RLM_API void realm_dictionary_get_changes(const realm_dictionary_changes_t* chan
  * @param insertions_size size of the list of inserted keys
  * @param modifications list of modified keys
  * @param modification_size size of the list of modified keys
+ * @param collection_was_cleared whether or not the collection was cleared
  */
 RLM_API void realm_dictionary_get_changed_keys(const realm_dictionary_changes_t* changes, realm_value_t* deletions,
                                                size_t* deletions_size, realm_value_t* insertions,
                                                size_t* insertions_size, realm_value_t* modifications,
-                                               size_t* modification_size);
+                                               size_t* modification_size, bool* collection_was_cleared);
 
 /**
  * Get a set instance for the property of an object.
@@ -2165,7 +2248,7 @@ RLM_API bool realm_set_remove_all(realm_set_t*);
  */
 RLM_API realm_notification_token_t* realm_set_add_notification_callback(realm_set_t*, realm_userdata_t userdata,
                                                                         realm_free_userdata_func_t userdata_free,
-                                                                        realm_key_path_array_t*,
+                                                                        realm_key_path_array_t* key_path_array,
                                                                         realm_on_collection_change_func_t on_change);
 /**
  * Get an set from a thread-safe reference, potentially originating in a
@@ -2289,6 +2372,29 @@ RLM_API bool realm_dictionary_insert(realm_dictionary_t*, realm_value_t key, rea
 RLM_API realm_object_t* realm_dictionary_insert_embedded(realm_dictionary_t*, realm_value_t key);
 
 /**
+ * Insert a collection inside a dictionary (only available for mixed types)
+ *
+ * @param dictionary valid ptr to a dictionary of mixed
+ * @param key the mixed representing a key for a dictionary (only string)
+ * @return pointer to a valid collection that has been just inserted at the key passed as argument
+ */
+RLM_API realm_list_t* realm_dictionary_insert_list(realm_dictionary_t* dictionary, realm_value_t key);
+RLM_API realm_dictionary_t* realm_dictionary_insert_dictionary(realm_dictionary_t*, realm_value_t);
+
+
+/**
+ * Fetch a list from a dictionary.
+ * @return a valid list that needs to be deleted by the caller or nullptr in case of an error.
+ */
+RLM_API realm_list_t* realm_dictionary_get_list(realm_dictionary_t* dictionary, realm_value_t key);
+
+/**
+ * Fetch a dictioanry from a dictionary.
+ * @return a valid dictionary that needs to be deleted by the caller or nullptr in case of an error.
+ */
+RLM_API realm_dictionary_t* realm_dictionary_get_dictionary(realm_dictionary_t* dictionary, realm_value_t key);
+
+/**
  * Get object identified by key
  *
  * @return A non-NULL pointer if the value associated with key is an object.
@@ -2345,10 +2451,9 @@ RLM_API bool realm_dictionary_clear(realm_dictionary_t*);
  *
  * @return A non-null pointer if no exception occurred.
  */
-RLM_API realm_notification_token_t*
-realm_dictionary_add_notification_callback(realm_dictionary_t*, realm_userdata_t userdata,
-                                           realm_free_userdata_func_t userdata_free, realm_key_path_array_t*,
-                                           realm_on_dictionary_change_func_t on_change);
+RLM_API realm_notification_token_t* realm_dictionary_add_notification_callback(
+    realm_dictionary_t*, realm_userdata_t userdata, realm_free_userdata_func_t userdata_free,
+    realm_key_path_array_t* key_path_array, realm_on_dictionary_change_func_t on_change);
 
 /**
  * Get an dictionary from a thread-safe reference, potentially originating in a
@@ -2585,6 +2690,18 @@ RLM_API realm_results_t* realm_results_limit(realm_results_t* results, size_t ma
 RLM_API bool realm_results_get(realm_results_t*, size_t index, realm_value_t* out_value);
 
 /**
+ * Returns an instance of realm_list at the index passed as argument.
+ * @return A valid ptr to a list instance or nullptr in case of errors
+ */
+RLM_API realm_list_t* realm_results_get_list(realm_results_t*, size_t index);
+
+/**
+ * Returns an instance of realm_dictionary for the index passed as argument.
+ * @return A valid ptr to a dictionary instance or nullptr in case of errors
+ */
+RLM_API realm_dictionary_t* realm_results_get_dictionary(realm_results_t*, size_t index);
+
+/**
  * Find the index for the value passed as parameter inside realm results pointer passed a input parameter.
  *  @param value the value to find inside the realm results
  *  @param out_index the index where the object has been found, or realm::not_found
@@ -2696,7 +2813,7 @@ RLM_API bool realm_results_average(realm_results_t*, realm_property_key_t, realm
 RLM_API realm_notification_token_t* realm_results_add_notification_callback(realm_results_t*,
                                                                             realm_userdata_t userdata,
                                                                             realm_free_userdata_func_t userdata_free,
-                                                                            realm_key_path_array_t*,
+                                                                            realm_key_path_array_t* key_path_array,
                                                                             realm_on_collection_change_func_t);
 
 /**
@@ -2916,6 +3033,21 @@ RLM_API const char* realm_app_credentials_serialize_as_json(realm_app_credential
 RLM_API realm_app_t* realm_app_create(const realm_app_config_t*, const realm_sync_client_config_t*);
 
 /**
+ * Create cached realm_app_t* instance given a valid realm configuration and sync client configuration.
+ *
+ * @return A non-null pointer if no error occurred.
+ */
+RLM_API realm_app_t* realm_app_create_cached(const realm_app_config_t*, const realm_sync_client_config_t*);
+
+/**
+ * Get a cached realm_app_t* instance given an app id. out_app may be null if the app with this id hasn't been
+ * previously cached by calling realm_app_create_cached.
+ *
+ * @return true if no error occurred.
+ */
+RLM_API bool realm_app_get_cached(const char* app_id, const char* base_url, realm_app_t** out_app);
+
+/**
  * Clear all the cached @a realm_app_t* instances in the process.
  *
  * @a realm_app_t* instances will need to be disposed with realm_release()
@@ -2925,6 +3057,36 @@ RLM_API void realm_clear_cached_apps(void) RLM_API_NOEXCEPT;
 
 RLM_API const char* realm_app_get_app_id(const realm_app_t*) RLM_API_NOEXCEPT;
 RLM_API realm_user_t* realm_app_get_current_user(const realm_app_t*) RLM_API_NOEXCEPT;
+
+/**
+ * Update the URL used to communicate with the Realm server. This function will update the location
+ * information used for http and websocket requests to the server. Once this operation has completed,
+ * the new base_url value returned by realm_app_get_base_url() will match the base_url value provided
+ * to this function. Any App requests performed while the base URl update is currently in progress
+ * will continue to use the original base URL value.
+ *
+ * @param app ptr to realm_app
+ * @param base_url The new base URL value to set as the Realm server URL - a null or empty string will
+ *                 use the default base URL value
+ * @param callback invoked once operation has completed
+ * @return True if no error has been recorded, False otherwise
+ */
+RLM_API bool realm_app_update_base_url(realm_app_t* app, const char* base_url,
+                                       realm_app_void_completion_func_t callback, realm_userdata_t userdata,
+                                       realm_free_userdata_func_t userdata_free);
+
+/**
+ * Return the current base URL value used by the app. If the realm_app_update_base_url() is called, this
+ * value will match the base_url value provided to that function when the update is complete. The value
+ * provided by this function is undefined if the realm_app_update_base_url() operation is in progress,
+ * since it will likely be the base_url value prior to realm_app_update_base_url() being called.
+ *
+ * @param app ptr to realm_app
+ * @return The current base URL string used by the app
+ *
+ * Return value must be manually released with realm_free().
+ */
+RLM_API char* realm_app_get_base_url(realm_app_t* app) RLM_API_NOEXCEPT;
 
 /**
  * Get the list of active users in this @a app.
@@ -3410,7 +3572,13 @@ typedef struct realm_sync_error {
 
     realm_sync_error_compensating_write_info_t* compensating_writes;
     size_t compensating_writes_length;
+    void* user_code_error;
 } realm_sync_error_t;
+
+typedef struct realm_salted_file_ident {
+    uint64_t ident;
+    int64_t salt;
+} realm_salted_file_ident_t;
 
 /**
  * Callback function invoked by the sync session once it has uploaded or download
@@ -3451,9 +3619,13 @@ typedef enum realm_flx_sync_subscription_set_state {
 typedef void (*realm_sync_on_subscription_state_changed_t)(realm_userdata_t userdata,
                                                            realm_flx_sync_subscription_set_state_e state);
 
+typedef void (*realm_sync_on_user_state_changed_t)(realm_userdata_t userdata, realm_user_state_e s);
+
+
 typedef struct realm_async_open_task_progress_notification_token realm_async_open_task_progress_notification_token_t;
 typedef struct realm_sync_session_connection_state_notification_token
     realm_sync_session_connection_state_notification_token_t;
+typedef struct realm_sync_user_subscription_token realm_sync_user_subscription_token_t;
 
 /**
  * Callback function invoked by the async open task once the realm is open and fully synchronized.
@@ -3814,6 +3986,13 @@ RLM_API void realm_sync_session_pause(realm_sync_session_t*) RLM_API_NOEXCEPT;
 RLM_API void realm_sync_session_resume(realm_sync_session_t*) RLM_API_NOEXCEPT;
 
 /**
+ * Gets the file ident/salt currently assigned to the realm by sync. Callers should supply a pointer token
+ * a realm_salted_file_ident_t for this function to fill out.
+ */
+RLM_API void realm_sync_session_get_file_ident(realm_sync_session_t*,
+                                               realm_salted_file_ident_t* out) RLM_API_NOEXCEPT;
+
+/**
  * In case manual reset is needed, run this function in order to reset sync client files.
  * The sync_path is going to passed into realm_sync_error_handler_func_t, if manual reset is needed.
  * This function is supposed to be called inside realm_sync_error_handler_func_t callback, if sync client reset is
@@ -3850,6 +4029,15 @@ RLM_API realm_sync_session_connection_state_notification_token_t* realm_sync_ses
     realm_sync_session_t*, realm_sync_progress_func_t, realm_sync_progress_direction_e, bool is_streaming,
     realm_userdata_t userdata, realm_free_userdata_func_t userdata_free) RLM_API_NOEXCEPT;
 
+
+/**
+ * @return a notification token object. Dispose it to stop receiving notifications.
+ */
+RLM_API realm_sync_user_subscription_token_t*
+realm_sync_user_on_state_change_register_callback(realm_user_t*, realm_sync_on_user_state_changed_t,
+                                                  realm_userdata_t userdata,
+                                                  realm_free_userdata_func_t userdata_free);
+
 /**
  * Register a callback that will be invoked when all pending downloads have completed.
  */
@@ -3880,7 +4068,7 @@ RLM_API void realm_sync_session_handle_error_for_testing(const realm_sync_sessio
 /**
  * In case of exception thrown in user code callbacks, this api will allow the sdk to store the user code exception
  * and retrieve a it later via realm_get_last_error.
- * Most importantly the SDK is responsible to handle the memory pointed by usercode_error.
+ * Most importantly the SDK is responsible to handle the memory pointed by user_code_error.
  * @param usercode_error pointer representing whatever object the SDK treats as exception/error.
  */
 RLM_API void realm_register_user_code_callback_error(realm_userdata_t usercode_error) RLM_API_NOEXCEPT;

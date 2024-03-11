@@ -44,10 +44,11 @@ namespace _impl {
 class GroupFriend;
 } // namespace _impl
 
-
 /// A group is a collection of named tables.
 ///
 class Group : public ArrayParent {
+    static constexpr StringData g_class_name_prefix = "class_";
+
 public:
     /// Construct a free-standing group. This group instance will be
     /// in the attached state, but neither associated with a file, nor
@@ -273,7 +274,8 @@ public:
     ///
     //@{
 
-    static const size_t max_table_name_length = 63;
+    static constexpr size_t max_table_name_length = 63;
+    static constexpr size_t max_class_name_length = max_table_name_length - g_class_name_prefix.size();
 
     bool has_table(StringData name) const noexcept;
     TableKey find_table(StringData name) const noexcept;
@@ -294,6 +296,7 @@ public:
     using TableNameBuffer = std::array<char, max_table_name_length>;
     static StringData class_name_to_table_name(StringData class_name, TableNameBuffer& buffer)
     {
+        REALM_ASSERT(class_name.size() <= max_class_name_length);
         char* p = std::copy_n(g_class_name_prefix.data(), g_class_name_prefix.size(), buffer.data());
         size_t len = std::min(class_name.size(), buffer.size() - g_class_name_prefix.size());
         std::copy_n(class_name.data(), len, p);
@@ -475,9 +478,8 @@ public:
     //@}
 
     // Conversion
-    void schema_to_json(std::ostream& out, std::map<std::string, std::string>* renames = nullptr) const;
-    void to_json(std::ostream& out, size_t link_depth = 0, std::map<std::string, std::string>* renames = nullptr,
-                 JSONOutputMode output_mode = output_mode_json) const;
+    void schema_to_json(std::ostream& out) const;
+    void to_json(std::ostream& out, JSONOutputMode output_mode = output_mode_json) const;
 
     /// Compare two groups for equality. Two groups are equal if, and
     /// only if, they contain the same tables in the same order, that
@@ -536,8 +538,6 @@ protected:
     }
 
 private:
-    static constexpr StringData g_class_name_prefix = "class_";
-
     // nullptr, if we're sharing an allocator provided during initialization
     std::unique_ptr<SlabAlloc> m_local_alloc;
     // in-use allocator. If local, then equal to m_local_alloc.
@@ -758,6 +758,11 @@ private:
     ///
     ///  23 Layout of Set and Dictionary changed.
     ///
+    ///  24 Variable sized arrays for Decimal128.
+    ///     Nested collections
+    ///     Backlinks in BPlusTree
+    ///     Sort order of Strings changed (affects sets and the string index)
+    ///
     /// IMPORTANT: When introducing a new file format version, be sure to review
     /// the file validity checks in Group::open() and DB::do_open, the file
     /// format selection logic in
@@ -765,7 +770,7 @@ private:
     /// upgrade logic in Group::upgrade_file_format(), AND the lists of accepted
     /// file formats and the version deletion list residing in "backup_restore.cpp"
 
-    static constexpr int g_current_file_format_version = 23;
+    static constexpr int g_current_file_format_version = 24;
 
     int get_file_format_version() const noexcept;
     void set_file_format_version(int) noexcept;
@@ -781,6 +786,8 @@ private:
                                              int& history_type, int& history_schema_version) noexcept;
     static ref_type get_history_ref(const Array& top) noexcept;
     static size_t get_logical_file_size(const Array& top) noexcept;
+    static size_t get_free_space_size(const Array& top) noexcept;
+    static size_t get_history_size(const Array& top) noexcept;
     size_t get_logical_file_size() const noexcept
     {
         return get_logical_file_size(m_top);
@@ -800,7 +807,7 @@ private:
     Table* get_table_unchecked(TableKey);
     size_t find_table_index(StringData name) const noexcept;
     TableKey ndx2key(size_t ndx) const;
-    size_t key2ndx(TableKey key) const;
+    static size_t key2ndx(TableKey key);
     size_t key2ndx_checked(TableKey key) const;
     void set_size() const noexcept;
     std::map<TableRef, ColKey> get_primary_key_columns_from_pk_table(TableRef pk_table);
@@ -815,15 +822,16 @@ private:
             throw StaleAccessor("Stale transaction");
     }
 
-    friend class Table;
-    friend class GroupWriter;
-    friend class GroupCommitter;
-    friend class DB;
-    friend class _impl::GroupFriend;
-    friend class Transaction;
-    friend class TableKeyIterator;
     friend class CascadeState;
+    friend class DB;
+    friend class GroupCommitter;
+    friend class GroupWriter;
     friend class SlabAlloc;
+    friend class Table;
+    friend class TableKeyIterator;
+    friend class Transaction;
+    friend class _impl::DeepChangeChecker;
+    friend class _impl::GroupFriend;
 };
 
 class TableKeyIterator {
@@ -897,7 +905,7 @@ inline bool Group::is_empty() const noexcept
     return size() == 0;
 }
 
-inline size_t Group::key2ndx(TableKey key) const
+inline size_t Group::key2ndx(TableKey key)
 {
     size_t idx = key.value & 0xFFFF;
     return idx;

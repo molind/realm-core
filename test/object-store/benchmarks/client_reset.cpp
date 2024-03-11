@@ -139,13 +139,16 @@ struct BenchmarkLocalClientReset : public reset_utils::TestClientReset {
         Transaction& wt_local = (Transaction&)m_local->read_group();
         VersionID current_local_version = wt_local.get_version_of_current_transaction();
 
-        util::NullLogger logger;
+        class NullLogger : public util::Logger {
+            // Since we don't want to log anything, do_log() does nothing
+            void do_log(const util::LogCategory&, Level, const std::string&) override {}
+        } logger;
+
         if (m_mode == ClientResyncMode::Recover) {
             auto history_local = dynamic_cast<sync::ClientHistory*>(wt_local.get_replication()->_get_history_write());
             std::vector<sync::ClientHistory::LocalChange> local_changes =
                 history_local->get_local_changes(current_local_version.version);
-            _impl::client_reset::RecoverLocalChangesetsHandler handler{wt_remote, frozen_local, logger, nullptr};
-            handler.process_changesets(local_changes, {}); // throws on error
+            _impl::client_reset::process_recovered_changesets(wt_remote, frozen_local, logger, local_changes);
         }
         _impl::client_reset::transfer_group(wt_remote, wt_local, logger, m_mode == ClientResyncMode::Recover);
         if (m_on_post_reset) {
@@ -193,13 +196,12 @@ TEST_CASE("client reset", "[sync][pbs][benchmark][client reset]") {
     };
 
     TestSyncManager init_sync_manager;
-    SyncTestFile config(init_sync_manager.app(), "default");
-    config.cache = false;
+    SyncTestFile config(init_sync_manager, "default");
     config.automatic_change_notifications = false;
     config.schema = schema;
     ClientResyncMode reset_mode = GENERATE(ClientResyncMode::DiscardLocal, ClientResyncMode::Recover);
     config.sync_config->client_resync_mode = reset_mode;
-    SyncTestFile config2(init_sync_manager.app(), "default");
+    SyncTestFile config2(init_sync_manager, "default");
 
     auto populate_objects = [&](SharedRealm realm, size_t num_objects) {
         TableRef table = get_table(*realm, "object");

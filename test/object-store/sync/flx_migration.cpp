@@ -116,7 +116,6 @@ static std::vector<ObjectId> fill_test_data(SyncTestFile& config, std::optional<
 TEST_CASE("Test server migration and rollback", "[sync][flx][flx migration][baas]") {
     auto logger_ptr = util::Logger::get_default_logger();
 
-    const std::string base_url = get_base_url();
     const std::string partition1 = "migration-test";
     const std::string partition2 = "another-value";
     const Schema mig_schema{
@@ -124,7 +123,7 @@ TEST_CASE("Test server migration and rollback", "[sync][flx][flx migration][baas
                                 {"string_field", PropertyType::String | PropertyType::Nullable},
                                 {"realm_id", PropertyType::String | PropertyType::Nullable}}),
     };
-    auto server_app_config = minimal_app_config(base_url, "server_migrate_rollback", mig_schema);
+    auto server_app_config = minimal_app_config("server_migrate_rollback", mig_schema);
     TestAppSession session(create_app(server_app_config));
     SyncTestFile config1(session.app(), partition1, server_app_config.schema);
     SyncTestFile config2(session.app(), partition2, server_app_config.schema);
@@ -266,17 +265,17 @@ TEST_CASE("Test server migration and rollback", "[sync][flx][flx migration][baas
 TEST_CASE("Test client migration and rollback", "[sync][flx][flx migration][baas]") {
     auto logger_ptr = util::Logger::get_default_logger();
 
-    const std::string base_url = get_base_url();
     const std::string partition = "migration-test";
     const Schema mig_schema{
         ObjectSchema("Object", {{"_id", PropertyType::ObjectId, Property::IsPrimary{true}},
                                 {"string_field", PropertyType::String | PropertyType::Nullable},
                                 {"realm_id", PropertyType::String | PropertyType::Nullable}}),
     };
-    auto server_app_config = minimal_app_config(base_url, "server_migrate_rollback", mig_schema);
+    auto server_app_config = minimal_app_config("server_migrate_rollback", mig_schema);
     TestAppSession session(create_app(server_app_config));
     SyncTestFile config(session.app(), partition, server_app_config.schema);
     config.sync_config->client_resync_mode = ClientResyncMode::DiscardLocal;
+    config.schema_version = 0;
 
     // Fill some objects
     auto objects = fill_test_data(config, partition); // 5 objects starting at 1
@@ -322,16 +321,16 @@ TEST_CASE("Test client migration and rollback", "[sync][flx][flx migration][baas
 TEST_CASE("Test client migration and rollback with recovery", "[sync][flx][flx migration][baas]") {
     auto logger_ptr = util::Logger::get_default_logger();
 
-    const std::string base_url = get_base_url();
     const std::string partition = "migration-test";
     const Schema mig_schema{
         ObjectSchema("Object", {{"_id", PropertyType::ObjectId, Property::IsPrimary{true}},
                                 {"string_field", PropertyType::String | PropertyType::Nullable}}),
     };
-    auto server_app_config = minimal_app_config(base_url, "server_migrate_rollback", mig_schema);
+    auto server_app_config = minimal_app_config("server_migrate_rollback", mig_schema);
     TestAppSession session(create_app(server_app_config));
     SyncTestFile config(session.app(), partition, server_app_config.schema);
     config.sync_config->client_resync_mode = ClientResyncMode::Recover;
+    config.schema_version = 0;
 
     // Fill some objects
     auto objects = fill_test_data(config); // 5 objects starting at 1 with no partition value set
@@ -441,8 +440,12 @@ TEST_CASE("Test client migration and rollback with recovery", "[sync][flx][flx m
     //  Migrate back to FLX - and keep the realm session open
     trigger_server_migration(session.app_session(), MigrateToFLX, logger_ptr);
 
-    REQUIRE(!wait_for_upload(*outer_realm));
-    REQUIRE(!wait_for_download(*outer_realm));
+    // wait for the subscription store to initialize after downloading
+    timed_wait_for(
+        [&outer_realm]() {
+            return outer_realm->sync_session() && outer_realm->sync_session()->get_flx_subscription_store();
+        },
+        std::chrono::seconds(180));
 
     // Verify data has been sync'ed and there is only 1 subscription for the Object table
     {
@@ -473,17 +476,17 @@ TEST_CASE("An interrupted migration or rollback can recover on the next session"
           "[sync][flx][flx migration][baas]") {
     auto logger_ptr = util::Logger::get_default_logger();
 
-    const std::string base_url = get_base_url();
     const std::string partition = "migration-test";
     const Schema mig_schema{
         ObjectSchema("Object", {{"_id", PropertyType::ObjectId, Property::IsPrimary{true}},
                                 {"string_field", PropertyType::String | PropertyType::Nullable},
                                 {"realm_id", PropertyType::String | PropertyType::Nullable}}),
     };
-    auto server_app_config = minimal_app_config(base_url, "server_migrate_rollback", mig_schema);
+    auto server_app_config = minimal_app_config("server_migrate_rollback", mig_schema);
     TestAppSession session(create_app(server_app_config));
     SyncTestFile config(session.app(), partition, server_app_config.schema);
     config.sync_config->client_resync_mode = ClientResyncMode::DiscardLocal;
+    config.schema_version = 0;
 
     // Fill some objects
     auto objects = fill_test_data(config, partition);
@@ -501,100 +504,126 @@ TEST_CASE("An interrupted migration or rollback can recover on the next session"
 
     // Migrate to FLX
     trigger_server_migration(session.app_session(), MigrateToFLX, logger_ptr);
+    enum class State { Initial, FirstError, InClientReset, Resumed, SecondError };
+    TestingStateMachine<State> state(State::Initial);
 
-    auto error_event_hook = [&config](sync::ProtocolError error, int& error_count) {
-        return [&config, &error_count, error](std::weak_ptr<SyncSession> weak_session,
-                                              const SyncClientHookData& data) mutable {
-            if (data.event != SyncClientHookEvent::ErrorMessageReceived) {
-                return SyncClientHookAction::NoAction;
-            }
+    auto error_event_hook = [&config, &state](sync::ProtocolError error) {
+        return [&config, &state, error](std::weak_ptr<SyncSession> weak_session,
+                                        const SyncClientHookData& data) mutable {
             auto session = weak_session.lock();
             REQUIRE(session);
 
+            if (data.event == SyncClientHookEvent::BindMessageSent &&
+                session->path() == _impl::client_reset::get_fresh_path_for(config.path)) {
+                bool wait_for_resume = false;
+                state.transition_with([&](State cur_state) -> std::optional<State> {
+                    if (cur_state == State::FirstError) {
+                        wait_for_resume = true;
+                        return State::InClientReset;
+                    }
+                    return std::nullopt;
+                });
+                if (wait_for_resume) {
+                    state.wait_for(State::Resumed);
+                }
+            }
+
+            if (data.event != SyncClientHookEvent::ErrorMessageReceived) {
+                return SyncClientHookAction::NoAction;
+            }
             if (session->path() != config.path) {
                 return SyncClientHookAction::NoAction;
             }
 
             auto error_code = sync::ProtocolError(data.error_info->raw_error_code);
-
             if (error_code == sync::ProtocolError::initial_sync_not_completed) {
                 return SyncClientHookAction::NoAction;
             }
 
             REQUIRE(error_code == error);
-            ++error_count;
+            state.transition_with([&](State cur_state) -> std::optional<State> {
+                switch (cur_state) {
+                    case State::Initial:
+                        return State::FirstError;
+                    case State::Resumed:
+                        return State::SecondError;
+                    default:
+                        FAIL(util::format("Unxpected state %1", static_cast<int>(cur_state)));
+                }
+                return std::nullopt;
+            });
             return SyncClientHookAction::NoAction;
         };
     };
 
     // Session is interrupted before the migration is completed.
     {
-        auto error_count = 0;
-        config.sync_config->on_sync_client_event_hook =
-            error_event_hook(sync::ProtocolError::migrate_to_flx, error_count);
+        config.sync_config->on_sync_client_event_hook = error_event_hook(sync::ProtocolError::migrate_to_flx);
         auto realm = Realm::get_shared_realm(config);
 
-        timed_wait_for([&] {
-            return util::File::exists(_impl::ClientResetOperation::get_fresh_path_for(config.path));
-        });
+        state.wait_for(State::InClientReset);
 
         // Pause then resume the session. This triggers the server to send a new client reset request.
         realm->sync_session()->pause();
         realm->sync_session()->resume();
+        state.transition_with([&](State cur_state) {
+            REQUIRE(cur_state == State::InClientReset);
+            return State::Resumed;
+        });
 
+        state.wait_for(State::SecondError);
         REQUIRE(!wait_for_upload(*realm));
         REQUIRE(!wait_for_download(*realm));
 
         auto table = realm->read_group().get_table("class_Object");
         CHECK(table->size() == 5);
-
-        // Client reset is requested twice.
-        REQUIRE(error_count == 2);
     }
 
+    state.transition_with([](State) {
+        return State::Initial;
+    });
     //  Roll back to PBS
     trigger_server_migration(session.app_session(), RollbackToPBS, logger_ptr);
 
+
     // Session is interrupted before the rollback is completed.
     {
-        auto error_count = 0;
-        config.sync_config->on_sync_client_event_hook =
-            error_event_hook(sync::ProtocolError::revert_to_pbs, error_count);
+        config.sync_config->on_sync_client_event_hook = error_event_hook(sync::ProtocolError::revert_to_pbs);
         auto realm = Realm::get_shared_realm(config);
 
-        timed_wait_for([&] {
-            return util::File::exists(_impl::ClientResetOperation::get_fresh_path_for(config.path));
-        });
+        state.wait_for(State::InClientReset);
 
         // Pause then resume the session. This triggers the server to send a new client reset request.
         realm->sync_session()->pause();
         realm->sync_session()->resume();
+        state.transition_with([&](State cur_state) {
+            REQUIRE(cur_state == State::InClientReset);
+            return State::Resumed;
+        });
 
+        state.wait_for(State::SecondError);
         REQUIRE(!wait_for_upload(*realm));
         REQUIRE(!wait_for_download(*realm));
 
         auto table = realm->read_group().get_table("class_Object");
         CHECK(table->size() == 5);
-
-        // Client reset is requested twice.
-        REQUIRE(error_count == 2);
     }
 }
 
 TEST_CASE("Update to native FLX after migration", "[sync][flx][flx migration][baas]") {
     auto logger_ptr = util::Logger::get_default_logger();
 
-    const std::string base_url = get_base_url();
     const std::string partition = "migration-test";
     const Schema mig_schema{
         ObjectSchema("Object", {{"_id", PropertyType::ObjectId, Property::IsPrimary{true}},
                                 {"string_field", PropertyType::String | PropertyType::Nullable},
                                 {"realm_id", PropertyType::String | PropertyType::Nullable}}),
     };
-    auto server_app_config = minimal_app_config(base_url, "server_migrate_rollback", mig_schema);
+    auto server_app_config = minimal_app_config("server_migrate_rollback", mig_schema);
     TestAppSession session(create_app(server_app_config));
     SyncTestFile config(session.app(), partition, server_app_config.schema);
     config.sync_config->client_resync_mode = ClientResyncMode::DiscardLocal;
+    config.schema_version = 0;
 
     // Fill some objects
     auto objects = fill_test_data(config, partition); // 5 objects starting at 1
@@ -703,17 +732,19 @@ TEST_CASE("Update to native FLX after migration", "[sync][flx][flx migration][ba
 TEST_CASE("New table is synced after migration", "[sync][flx][flx migration][baas]") {
     auto logger_ptr = util::Logger::get_default_logger();
 
-    const std::string base_url = get_base_url();
     const std::string partition = "migration-test";
-    const Schema mig_schema{
-        ObjectSchema("Object", {{"_id", PropertyType::ObjectId, Property::IsPrimary{true}},
-                                {"string_field", PropertyType::String | PropertyType::Nullable},
-                                {"realm_id", PropertyType::String | PropertyType::Nullable}}),
-    };
-    auto server_app_config = minimal_app_config(base_url, "server_migrate_rollback", mig_schema);
+    const auto obj1_schema = ObjectSchema("Object", {{"_id", PropertyType::ObjectId, Property::IsPrimary{true}},
+                                                     {"string_field", PropertyType::String | PropertyType::Nullable},
+                                                     {"realm_id", PropertyType::String | PropertyType::Nullable}});
+    const auto obj2_schema = ObjectSchema("Object2", {{"_id", PropertyType::ObjectId, Property::IsPrimary{true}},
+                                                      {"realm_id", PropertyType::String | PropertyType::Nullable}});
+    const Schema mig_schema{obj1_schema};
+    const Schema two_obj_schema{obj1_schema, obj2_schema};
+    auto server_app_config = minimal_app_config("server_migrate_rollback", two_obj_schema);
     TestAppSession session(create_app(server_app_config));
     SyncTestFile config(session.app(), partition, server_app_config.schema);
     config.sync_config->client_resync_mode = ClientResyncMode::DiscardLocal;
+    config.schema_version = 0;
 
     // Fill some objects
     auto objects = fill_test_data(config, partition); // 5 objects starting at 1
@@ -744,14 +775,7 @@ TEST_CASE("New table is synced after migration", "[sync][flx][flx migration][baa
 
     // Open a new realm with an additional table.
     {
-        const Schema schema{
-            ObjectSchema("Object", {{"_id", PropertyType::ObjectId, Property::IsPrimary{true}},
-                                    {"string_field", PropertyType::String | PropertyType::Nullable},
-                                    {"realm_id", PropertyType::String | PropertyType::Nullable}}),
-            ObjectSchema("Object2", {{"_id", PropertyType::ObjectId, Property::IsPrimary{true}},
-                                     {"realm_id", PropertyType::String | PropertyType::Nullable}}),
-        };
-        SyncTestFile flx_config(session.app()->current_user(), schema, SyncConfig::FLXSyncEnabled{});
+        SyncTestFile flx_config(session.app()->current_user(), two_obj_schema, SyncConfig::FLXSyncEnabled{});
 
         auto flx_realm = Realm::get_shared_realm(flx_config);
 
@@ -812,7 +836,6 @@ TEST_CASE("New table is synced after migration", "[sync][flx][flx migration][baa
 TEST_CASE("Async open + client reset", "[sync][flx][flx migration][baas]") {
     auto logger_ptr = util::Logger::get_default_logger();
 
-    const std::string base_url = get_base_url();
     const std::string partition = "async-open-migration-test";
     ObjectSchema shared_object("Object", {{"_id", PropertyType::ObjectId, Property::IsPrimary{true}},
                                           {"string_field", PropertyType::String | PropertyType::Nullable},
@@ -820,7 +843,8 @@ TEST_CASE("Async open + client reset", "[sync][flx][flx migration][baas]") {
     const Schema mig_schema{shared_object};
     size_t num_before_reset_notifications = 0;
     size_t num_after_reset_notifications = 0;
-    auto server_app_config = minimal_app_config(base_url, "async_open_during_migration", mig_schema);
+    auto server_app_config = minimal_app_config("async_open_during_migration", mig_schema);
+    server_app_config.dev_mode_enabled = true;
     std::optional<SyncTestFile> config; // destruct this after the sessions are torn down
     TestAppSession session(create_app(server_app_config));
     config.emplace(session.app(), partition, server_app_config.schema);
@@ -846,6 +870,7 @@ TEST_CASE("Async open + client reset", "[sync][flx][flx migration][baas]") {
         REQUIRE(table_after);
         ++num_after_reset_notifications;
     };
+    config->schema_version = 0;
 
     ObjectSchema locally_added("LocallyAdded", {{"_id", PropertyType::ObjectId, Property::IsPrimary{true}},
                                                 {"string_field", PropertyType::String | PropertyType::Nullable},

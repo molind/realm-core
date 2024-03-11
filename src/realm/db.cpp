@@ -913,15 +913,18 @@ void DB::open(const std::string& path, bool no_create_file, const DBOptions& opt
     if (m_replication) {
         m_replication->set_logger(m_logger.get());
     }
-    if (m_logger)
+    if (m_logger) {
         m_logger->log(util::Logger::Level::detail, "Open file: %1", path);
+    }
     SlabAlloc& alloc = m_alloc;
+    ref_type top_ref = 0;
+
     if (options.is_immutable) {
         SlabAlloc::Config cfg;
         cfg.read_only = true;
         cfg.no_create = true;
         cfg.encryption_key = options.encryption_key;
-        auto top_ref = alloc.attach_file(path, cfg);
+        top_ref = alloc.attach_file(path, cfg);
         SlabAlloc::DetachGuard dg(alloc);
         Group::read_only_version_check(alloc, top_ref, path);
         m_fake_read_lock_if_immutable = ReadLockInfo::make_fake(top_ref, m_alloc.get_baseline());
@@ -1152,7 +1155,6 @@ void DB::open(const std::string& path, bool no_create_file, const DBOptions& opt
             cfg.clear_file = (options.durability == Durability::MemOnly && begin_new_session);
 
             cfg.encryption_key = options.encryption_key;
-            ref_type top_ref;
             m_marker_observer = std::make_unique<EncryptionMarkerObserver>(*version_manager);
             try {
                 top_ref = alloc.attach_file(path, cfg, m_marker_observer.get()); // Throws
@@ -1415,6 +1417,39 @@ void DB::open(const std::string& path, bool no_create_file, const DBOptions& opt
         break;
     }
 
+    if (m_logger) {
+        m_logger->log(util::Logger::Level::debug, "   Number of participants: %1", m_info->num_participants);
+        m_logger->log(util::Logger::Level::debug, "   Durability: %1", [&] {
+            switch (options.durability) {
+                case DBOptions::Durability::Full:
+                    return "Full";
+                case DBOptions::Durability::MemOnly:
+                    return "MemOnly";
+                case realm::DBOptions::Durability::Unsafe:
+                    return "Unsafe";
+            }
+            return "";
+        }());
+        m_logger->log(util::Logger::Level::debug, "   EncryptionKey: %1", options.encryption_key ? "yes" : "no");
+        if (m_logger->would_log(util::Logger::Level::debug)) {
+            if (top_ref) {
+                Array top(alloc);
+                top.init_from_ref(top_ref);
+                auto file_size = Group::get_logical_file_size(top);
+                auto history_size = Group::get_history_size(top);
+                auto freee_space_size = Group::get_free_space_size(top);
+                m_logger->log(util::Logger::Level::debug, "   File size: %1", file_size);
+                m_logger->log(util::Logger::Level::debug, "   User data size: %1",
+                              file_size - (freee_space_size + history_size));
+                m_logger->log(util::Logger::Level::debug, "   Free space size: %1", freee_space_size);
+                m_logger->log(util::Logger::Level::debug, "   History size: %1", history_size);
+            }
+            else {
+                m_logger->log(util::Logger::Level::debug, "   Empty file");
+            }
+        }
+    }
+
     // Upgrade file format and/or history schema
     try {
         if (stored_hist_schema_version == -1) {
@@ -1467,25 +1502,28 @@ void DB::open(Replication& repl, const std::string& file, const DBOptions& optio
     bool no_create = false;
     open(file, no_create, options); // Throws
 }
+
 class DBLogger : public Logger {
 public:
     DBLogger(const std::shared_ptr<Logger>& base_logger, unsigned hash) noexcept
-        : Logger(base_logger)
+        : Logger(LogCategory::storage, *base_logger)
         , m_hash(hash)
+        , m_base_logger_ptr(base_logger)
     {
     }
 
 protected:
-    void do_log(Level level, const std::string& message) final
+    void do_log(const LogCategory& category, Level level, const std::string& message) final
     {
         std::ostringstream ostr;
         auto id = std::this_thread::get_id();
-        ostr << "DB: " << m_hash << " Thread " << id << ": ";
-        Logger::do_log(*m_base_logger_ptr, level, ostr.str() + message);
+        ostr << "DB: " << m_hash << " Thread " << id << ": " << message;
+        Logger::do_log(*m_base_logger_ptr, category, level, ostr.str());
     }
 
 private:
     unsigned m_hash;
+    std::shared_ptr<Logger> m_base_logger_ptr;
 };
 
 void DB::set_logger(const std::shared_ptr<util::Logger>& logger) noexcept
@@ -1505,7 +1543,7 @@ void DB::open(Replication& repl, const DBOptions options)
     set_logger(options.logger);
     m_replication->set_logger(m_logger.get());
     if (m_logger)
-        m_logger->log(util::Logger::Level::detail, "Open memory-only realm");
+        m_logger->detail("Open memory-only realm");
 
     auto hist_type = repl.get_history_type();
     m_in_memory_info =
@@ -1738,11 +1776,6 @@ size_t DB::get_allocated_size() const
     return m_alloc.get_allocated_size();
 }
 
-DB::~DB() noexcept
-{
-    close();
-}
-
 void DB::release_all_read_locks() noexcept
 {
     REALM_ASSERT(!m_fake_read_lock_if_immutable);
@@ -1753,109 +1786,6 @@ void DB::release_all_read_locks() noexcept
     }
     m_local_locks_held.clear();
     REALM_ASSERT(m_transaction_count == 0);
-}
-
-// Note: close() and close_internal() may be called from the DB::~DB().
-// in that case, they will not throw. Throwing can only happen if called
-// directly.
-void DB::close(bool allow_open_read_transactions)
-{
-    // make helper thread(s) terminate
-    m_commit_helper.reset();
-
-    if (m_fake_read_lock_if_immutable) {
-        if (!is_attached())
-            return;
-        {
-            CheckedLockGuard local_lock(m_mutex);
-            if (!allow_open_read_transactions && m_transaction_count)
-                throw WrongTransactionState("Closing with open read transactions");
-        }
-        if (m_alloc.is_attached())
-            m_alloc.detach();
-        m_fake_read_lock_if_immutable.reset();
-    }
-    else {
-        close_internal(std::unique_lock<InterprocessMutex>(m_controlmutex, std::defer_lock),
-                       allow_open_read_transactions);
-    }
-}
-
-void DB::close_internal(std::unique_lock<InterprocessMutex> lock, bool allow_open_read_transactions)
-{
-    if (!is_attached())
-        return;
-
-    {
-        CheckedLockGuard local_lock(m_mutex);
-        if (m_write_transaction_open)
-            throw WrongTransactionState("Closing with open write transactions");
-        if (!allow_open_read_transactions && m_transaction_count)
-            throw WrongTransactionState("Closing with open read transactions");
-    }
-    SharedInfo* info = m_info;
-    {
-        if (!lock.owns_lock())
-            lock.lock();
-
-        if (m_alloc.is_attached())
-            m_alloc.detach();
-
-        if (m_is_sync_agent) {
-            REALM_ASSERT(info->sync_agent_present);
-            info->sync_agent_present = 0; // Set to false
-        }
-        release_all_read_locks();
-        --info->num_participants;
-        bool end_of_session = info->num_participants == 0;
-        // std::cerr << "closing" << std::endl;
-        if (end_of_session) {
-
-            // If the db file is just backing for a transient data structure,
-            // we can delete it when done.
-            if (Durability(info->durability) == Durability::MemOnly && !m_in_memory_info) {
-                try {
-                    util::File::remove(m_db_path.c_str());
-                }
-                catch (...) {
-                } // ignored on purpose.
-            }
-        }
-        lock.unlock();
-    }
-    {
-        CheckedLockGuard local_lock(m_mutex);
-
-        m_new_commit_available.close();
-        m_pick_next_writer.close();
-
-        if (m_in_memory_info) {
-            m_in_memory_info.reset();
-        }
-        else {
-            // On Windows it is important that we unmap before unlocking, else a SetEndOfFile() call from another
-            // thread may interleave which is not permitted on Windows. It is permitted on *nix.
-            m_file_map.unmap();
-            m_version_manager.reset();
-            m_file.rw_unlock();
-            // info->~SharedInfo(); // DO NOT Call destructor
-            m_file.close();
-        }
-        m_info = nullptr;
-        if (m_logger)
-            m_logger->log(util::Logger::Level::detail, "DB closed");
-    }
-}
-
-bool DB::other_writers_waiting_for_lock() const
-{
-    SharedInfo* info = m_info;
-
-    uint32_t next_ticket = info->next_ticket.load(std::memory_order_relaxed);
-    uint32_t next_served = info->next_served.load(std::memory_order_relaxed);
-    // When holding the write lock, next_ticket = next_served + 1, hence, if the diference between 'next_ticket' and
-    // 'next_served' is greater than 1, there is at least one thread waiting to acquire the write lock.
-    return next_ticket > next_served + 1;
 }
 
 class DB::AsyncCommitHelper {
@@ -2019,6 +1949,114 @@ private:
     }
 };
 
+DB::~DB() noexcept
+{
+    close();
+}
+
+// Note: close() and close_internal() may be called from the DB::~DB().
+// in that case, they will not throw. Throwing can only happen if called
+// directly.
+void DB::close(bool allow_open_read_transactions)
+{
+    // make helper thread(s) terminate
+    m_commit_helper.reset();
+
+    if (m_fake_read_lock_if_immutable) {
+        if (!is_attached())
+            return;
+        {
+            CheckedLockGuard local_lock(m_mutex);
+            if (!allow_open_read_transactions && m_transaction_count)
+                throw WrongTransactionState("Closing with open read transactions");
+        }
+        if (m_alloc.is_attached())
+            m_alloc.detach();
+        m_fake_read_lock_if_immutable.reset();
+    }
+    else {
+        close_internal(std::unique_lock<InterprocessMutex>(m_controlmutex, std::defer_lock),
+                       allow_open_read_transactions);
+    }
+}
+
+void DB::close_internal(std::unique_lock<InterprocessMutex> lock, bool allow_open_read_transactions)
+{
+    if (!is_attached())
+        return;
+
+    {
+        CheckedLockGuard local_lock(m_mutex);
+        if (m_write_transaction_open)
+            throw WrongTransactionState("Closing with open write transactions");
+        if (!allow_open_read_transactions && m_transaction_count)
+            throw WrongTransactionState("Closing with open read transactions");
+    }
+    SharedInfo* info = m_info;
+    {
+        if (!lock.owns_lock())
+            lock.lock();
+
+        if (m_alloc.is_attached())
+            m_alloc.detach();
+
+        if (m_is_sync_agent) {
+            REALM_ASSERT(info->sync_agent_present);
+            info->sync_agent_present = 0; // Set to false
+        }
+        release_all_read_locks();
+        --info->num_participants;
+        bool end_of_session = info->num_participants == 0;
+        // std::cerr << "closing" << std::endl;
+        if (end_of_session) {
+
+            // If the db file is just backing for a transient data structure,
+            // we can delete it when done.
+            if (Durability(info->durability) == Durability::MemOnly && !m_in_memory_info) {
+                try {
+                    util::File::remove(m_db_path.c_str());
+                }
+                catch (...) {
+                } // ignored on purpose.
+            }
+        }
+        lock.unlock();
+    }
+    {
+        CheckedLockGuard local_lock(m_mutex);
+
+        m_new_commit_available.close();
+        m_pick_next_writer.close();
+
+        if (m_in_memory_info) {
+            m_in_memory_info.reset();
+        }
+        else {
+            // On Windows it is important that we unmap before unlocking, else a SetEndOfFile() call from another
+            // thread may interleave which is not permitted on Windows. It is permitted on *nix.
+            m_file_map.unmap();
+            m_version_manager.reset();
+            m_file.rw_unlock();
+            // info->~SharedInfo(); // DO NOT Call destructor
+            m_file.close();
+        }
+        m_info = nullptr;
+        if (m_logger)
+            m_logger->log(util::Logger::Level::detail, "DB closed");
+    }
+}
+
+bool DB::other_writers_waiting_for_lock() const
+{
+    SharedInfo* info = m_info;
+
+    uint32_t next_ticket = info->next_ticket.load(std::memory_order_relaxed);
+    uint32_t next_served = info->next_served.load(std::memory_order_relaxed);
+    // When holding the write lock, next_ticket = next_served + 1, hence, if the diference between 'next_ticket' and
+    // 'next_served' is greater than 1, there is at least one thread waiting to acquire the write lock.
+    return next_ticket > next_served + 1;
+}
+
 void DB::AsyncCommitHelper::main()
 {
     std::unique_lock lg(m_mutex);
@@ -2092,7 +2130,6 @@ void DB::AsyncCommitHelper::main()
     }
 }
 
-
 void DB::async_begin_write(util::UniqueFunction<void()> fn)
 {
     REALM_ASSERT(m_commit_helper);
@@ -2145,6 +2182,31 @@ void DB::enable_wait_for_change()
     REALM_ASSERT(!m_fake_read_lock_if_immutable);
     std::lock_guard<InterprocessMutex> lock(m_controlmutex);
     m_wait_for_change_enabled = true;
+}
+
+bool DB::needs_file_format_upgrade(const std::string& file, const std::vector<char>& encryption_key)
+{
+    SlabAlloc alloc;
+    SlabAlloc::Config cfg;
+    cfg.session_initiator = false;
+    cfg.read_only = true;
+    cfg.no_create = true;
+    if (!encryption_key.empty()) {
+        cfg.encryption_key = encryption_key.data();
+    }
+    try {
+        alloc.attach_file(file, cfg);
+        if (auto current_file_format_version = alloc.get_committed_file_format_version()) {
+            auto target_file_format_version = Group::g_current_file_format_version;
+            return current_file_format_version < target_file_format_version;
+        }
+    }
+    catch (const FileAccessError& err) {
+        if (err.code() != ErrorCodes::FileNotFound) {
+            throw;
+        }
+    }
+    return false;
 }
 
 void DB::upgrade_file_format(bool allow_file_format_upgrade, int target_file_format_version,
@@ -2306,7 +2368,7 @@ bool DB::do_try_begin_write()
 void DB::do_begin_write()
 {
     if (m_logger) {
-        m_logger->log(util::Logger::Level::trace, "acquire writemutex");
+        m_logger->log(util::LogCategory::transaction, util::Logger::Level::trace, "acquire writemutex");
     }
 
     SharedInfo* info = m_info;
@@ -2368,7 +2430,7 @@ void DB::do_begin_write()
     info->next_served = my_ticket;
     finish_begin_write();
     if (m_logger) {
-        m_logger->log(util::Logger::Level::trace, "writemutex acquired");
+        m_logger->log(util::LogCategory::transaction, util::Logger::Level::trace, "writemutex acquired");
     }
 }
 
@@ -2398,7 +2460,7 @@ void DB::do_end_write() noexcept
     m_pick_next_writer.notify_all();
     m_writemutex.unlock();
     if (m_logger) {
-        m_logger->log(util::Logger::Level::trace, "writemutex released");
+        m_logger->log(util::LogCategory::transaction, util::Logger::Level::trace, "writemutex released");
     }
 }
 
@@ -2487,7 +2549,8 @@ void DB::low_level_commit(uint_fast64_t new_version, Transaction& transaction, b
     auto t1 = std::chrono::steady_clock::now();
     auto commit_size = m_alloc.get_commit_size();
     if (m_logger) {
-        m_logger->log(util::Logger::Level::debug, "Initiate commit version: %1", new_version);
+        m_logger->log(util::LogCategory::transaction, util::Logger::Level::debug, "Initiate commit version: %1",
+                      new_version);
     }
     if (auto limit = out.get_evacuation_limit()) {
         // Get a work limit based on the size of the transaction we're about to commit
@@ -2550,8 +2613,9 @@ void DB::low_level_commit(uint_fast64_t new_version, Transaction& transaction, b
     auto t2 = std::chrono::steady_clock::now();
     if (m_logger) {
         std::string to_disk_str = commit_to_disk ? util::format(" ref %1", new_top_ref) : " (no commit to disk)";
-        m_logger->log(util::Logger::Level::debug, "Commit of size %1 done in %2 us%3", commit_size,
-                      std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count(), to_disk_str);
+        m_logger->log(util::LogCategory::transaction, util::Logger::Level::debug, "Commit of size %1 done in %2 us%3",
+                      commit_size, std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count(),
+                      to_disk_str);
     }
 }
 
@@ -2703,7 +2767,8 @@ void DB::async_request_write_mutex(TransactionRef& tr, util::UniqueFunction<void
         tr->m_async_stage = Transaction::AsyncState::Requesting;
         tr->m_request_time_point = std::chrono::steady_clock::now();
         if (tr->db->m_logger) {
-            tr->db->m_logger->log(util::Logger::Level::trace, "Tr %1: Async request write lock", tr->m_log_id);
+            tr->db->m_logger->log(util::LogCategory::transaction, util::Logger::Level::trace,
+                                  "Tr %1: Async request write lock", tr->m_log_id);
         }
     }
     std::weak_ptr<Transaction> weak_tr = tr;
@@ -2718,7 +2783,8 @@ void DB::async_request_write_mutex(TransactionRef& tr, util::UniqueFunction<void
             if (tr->db->m_logger) {
                 auto t2 = std::chrono::steady_clock::now();
                 tr->db->m_logger->log(
-                    util::Logger::Level::trace, "Tr %1, Got write lock in %2 us", tr->m_log_id,
+                    util::LogCategory::transaction, util::Logger::Level::trace, "Tr %1, Got write lock in %2 us",
+                    tr->m_log_id,
                     std::chrono::duration_cast<std::chrono::microseconds>(t2 - tr->m_request_time_point).count());
             }
             if (tr->m_waiting_for_write_lock) {
@@ -2733,7 +2799,7 @@ void DB::async_request_write_mutex(TransactionRef& tr, util::UniqueFunction<void
     });
 }
 
-inline DB::DB(const DBOptions& options)
+inline DB::DB(Private, const DBOptions& options)
     : m_upgrade_callback(std::move(options.upgrade_callback))
     , m_log_id(util::gen_log_id(this))
 {
@@ -2742,26 +2808,16 @@ inline DB::DB(const DBOptions& options)
     }
 }
 
-namespace {
-class DBInit : public DB {
-public:
-    explicit DBInit(const DBOptions& options)
-        : DB(options)
-    {
-    }
-};
-} // namespace
-
 DBRef DB::create(const std::string& file, bool no_create, const DBOptions& options) NO_THREAD_SAFETY_ANALYSIS
 {
-    DBRef retval = std::make_shared<DBInit>(options);
+    DBRef retval = std::make_shared<DB>(Private(), options);
     retval->open(file, no_create, options);
     return retval;
 }
 
 DBRef DB::create(Replication& repl, const std::string& file, const DBOptions& options) NO_THREAD_SAFETY_ANALYSIS
 {
-    DBRef retval = std::make_shared<DBInit>(options);
+    DBRef retval = std::make_shared<DB>(Private(), options);
     retval->open(repl, file, options);
     return retval;
 }
@@ -2770,7 +2826,7 @@ DBRef DB::create(std::unique_ptr<Replication> repl, const std::string& file,
                  const DBOptions& options) NO_THREAD_SAFETY_ANALYSIS
 {
     REALM_ASSERT(repl);
-    DBRef retval = std::make_shared<DBInit>(options);
+    DBRef retval = std::make_shared<DB>(Private(), options);
     retval->m_history = std::move(repl);
     retval->open(*retval->m_history, file, options);
     return retval;
@@ -2779,7 +2835,7 @@ DBRef DB::create(std::unique_ptr<Replication> repl, const std::string& file,
 DBRef DB::create(std::unique_ptr<Replication> repl, const DBOptions& options) NO_THREAD_SAFETY_ANALYSIS
 {
     REALM_ASSERT(repl);
-    DBRef retval = std::make_shared<DBInit>(options);
+    DBRef retval = std::make_shared<DB>(Private(), options);
     retval->m_history = std::move(repl);
     retval->open(*retval->m_history, options);
     return retval;
@@ -2797,7 +2853,7 @@ DBRef DB::create(BinaryData buffer, bool take_ownership) NO_THREAD_SAFETY_ANALYS
 {
     DBOptions options;
     options.is_immutable = true;
-    DBRef retval = std::make_shared<DBInit>(options);
+    DBRef retval = std::make_shared<DB>(Private(), options);
     retval->open(buffer, take_ownership);
     return retval;
 }

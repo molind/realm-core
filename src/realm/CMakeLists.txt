@@ -24,6 +24,7 @@ set(REALM_SOURCES
     chunked_binary.cpp
     cluster.cpp
     collection.cpp
+    collection_parent.cpp
     cluster_tree.cpp
     error_codes.cpp
     column_binary.cpp
@@ -60,6 +61,7 @@ set(REALM_SOURCES
     object_id.cpp
     table_view.cpp
     tokenizer.cpp
+    to_json.cpp
     transaction.cpp
     sort_descriptor.cpp
     status.cpp
@@ -101,6 +103,8 @@ set(UTIL_SOURCES
     util/random.cpp
     util/resource_limits.cpp
     util/uri.cpp
+    util/bson/bson.cpp
+    util/bson/regular_expression.cpp
 )
 
 set(REALM_INSTALL_HEADERS
@@ -137,9 +141,11 @@ set(REALM_INSTALL_HEADERS
     cluster.hpp
     cluster_tree.hpp
     collection.hpp
+    collection_parent.hpp
     column_binary.hpp
     column_fwd.hpp
     column_integer.hpp
+    column_mixed.hpp
     column_type.hpp
     column_type_traits.hpp
     data_type.hpp
@@ -166,6 +172,7 @@ set(REALM_INSTALL_HEADERS
     obj.hpp
     obj_list.hpp
     object_id.hpp
+    path.hpp
     owned_data.hpp
     query.hpp
     query_conditions.hpp
@@ -175,6 +182,7 @@ set(REALM_INSTALL_HEADERS
     query_value.hpp
     realm_nmmintrin.h
     replication.hpp
+    search_index.hpp
     set.hpp
     sort_descriptor.hpp
     spec.hpp
@@ -208,6 +216,12 @@ set(REALM_INSTALL_HEADERS
     util/base64.hpp
     util/basic_system_errors.hpp
     util/bind_ptr.hpp
+    util/bson/bson.hpp
+    util/bson/indexed_map.hpp
+    util/bson/max_key.hpp
+    util/bson/min_key.hpp
+    util/bson/mongo_timestamp.hpp
+    util/bson/regular_expression.hpp
     util/buffer.hpp
     util/buffer_stream.hpp
     util/cf_ptr.hpp
@@ -232,7 +246,6 @@ set(REALM_INSTALL_HEADERS
     util/memory_stream.hpp
     util/misc_errors.hpp
     util/misc_ext_errors.hpp
-    util/miscellaneous.hpp
     util/optional.hpp
     util/overload.hpp
     util/platform_info.hpp
@@ -356,12 +369,22 @@ elseif(ANDROID)
     target_link_options(Storage INTERFACE LINKER:-gc-sections)
 elseif(APPLE)
     target_link_options(Storage INTERFACE "SHELL:-framework Foundation")
+elseif(LINUX)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^armv7")
+        target_link_libraries(Storage INTERFACE atomic)
+    endif()
 endif()
 
 target_link_libraries(Storage INTERFACE Threads::Threads)
 
-if(TARGET Backtrace::Backtrace)
-    target_link_libraries(Storage PUBLIC Backtrace::Backtrace)
+if(REALM_HAVE_BACKTRACE AND NOT CMAKE_GENERATOR STREQUAL Xcode)
+    # Apple platforms always have backtrace. We disregard the `Backtrace_*` variables
+    # because their paths are hardcoded to one SDK within Xcode (e.g. macosx),
+    # whereas we build for several different SDKs and thus we can't use the include path from one in the other.
+    # Otherwise if CMake found that the backtrace facility is provided by an external library and not built-in
+    # we need to configure the interface target with the library include and link path.
+    target_include_directories(Storage PRIVATE ${Backtrace_INCLUDE_DIRS})
+    target_link_libraries(Storage PUBLIC ${Backtrace_LIBRARIES})
 endif()
 
 if(REALM_ENABLE_ENCRYPTION AND UNIX AND NOT APPLE AND REALM_HAVE_OPENSSL)

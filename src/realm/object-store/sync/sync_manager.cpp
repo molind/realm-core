@@ -29,6 +29,8 @@
 #include <realm/util/sha_crypto.hpp>
 #include <realm/util/hex_dump.hpp>
 
+#include <realm/exceptions.hpp>
+
 using namespace realm;
 using namespace realm::_impl;
 
@@ -41,150 +43,53 @@ SyncClientTimeouts::SyncClientTimeouts()
 {
 }
 
-SyncManager::SyncManager() = default;
-
-void SyncManager::configure(std::shared_ptr<app::App> app, const std::string& sync_route,
-                            const SyncClientConfig& config)
+std::shared_ptr<SyncManager> SyncManager::create(std::shared_ptr<app::App> app, std::optional<std::string> sync_route,
+                                                 const SyncClientConfig& config, const std::string& app_id)
 {
-    std::vector<std::shared_ptr<SyncUser>> users_to_add;
-    {
-        // Locking the mutex here ensures that it is released before locking m_user_mutex
-        util::CheckedLockGuard lock(m_mutex);
-        m_app = app;
-        m_sync_route = sync_route;
-        m_config = std::move(config);
-        if (m_sync_client)
-            return;
+    return std::make_shared<SyncManager>(Private(), std::move(app), std::move(sync_route), config, app_id);
+}
 
-        // create a new logger - if the logger_factory is updated later, a new
-        // logger will be created at that time.
-        do_make_logger();
+SyncManager::SyncManager(Private, std::shared_ptr<app::App> app, std::optional<std::string> sync_route,
+                         const SyncClientConfig& config, const std::string& app_id)
+    : m_config(config)
+    , m_file_manager(std::make_unique<SyncFileManager>(m_config.base_file_path, app_id))
+    , m_sync_route(sync_route)
+    , m_app(app)
+    , m_app_id(app_id)
+{
+    // create the initial logger - if the logger_factory is updated later, a new
+    // logger will be created at that time.
+    do_make_logger();
 
-        {
-            util::CheckedLockGuard lock(m_file_system_mutex);
-
-            // Set up the file manager.
-            if (m_file_manager) {
-                // Changing the base path for tests requires calling reset_for_testing()
-                // first, and otherwise isn't supported
-                REALM_ASSERT(m_file_manager->base_path() == m_config.base_file_path);
-            }
-            else {
-                m_file_manager = std::make_unique<SyncFileManager>(m_config.base_file_path, app->config().app_id);
-            }
-
-            // Set up the metadata manager, and perform initial loading/purging work.
-            if (m_metadata_manager || m_config.metadata_mode == MetadataMode::NoMetadata) {
-                return;
-            }
-
-            bool encrypt = m_config.metadata_mode == MetadataMode::Encryption;
-            m_metadata_manager = std::make_unique<SyncMetadataManager>(m_file_manager->metadata_path(), encrypt,
-                                                                       m_config.custom_encryption_key);
-
-            REALM_ASSERT(m_metadata_manager);
-
-            // Perform our "on next startup" actions such as deleting Realm files
-            // which we couldn't delete immediately due to them being in use
-            std::vector<SyncFileActionMetadata> completed_actions;
-            SyncFileActionMetadataResults file_actions = m_metadata_manager->all_pending_actions();
-            for (size_t i = 0; i < file_actions.size(); i++) {
-                auto file_action = file_actions.get(i);
-                if (run_file_action(file_action)) {
-                    completed_actions.emplace_back(std::move(file_action));
-                }
-            }
-            for (auto& action : completed_actions) {
-                action.remove();
-            }
-
-            // Load persisted users into the users map.
-            SyncUserMetadataResults users = m_metadata_manager->all_unmarked_users();
-            for (size_t i = 0; i < users.size(); i++) {
-                auto user_data = users.get(i);
-                auto refresh_token = user_data.refresh_token();
-                auto access_token = user_data.access_token();
-                if (!refresh_token.empty() && !access_token.empty()) {
-                    users_to_add.push_back(std::make_shared<SyncUser>(user_data, this));
-                }
-            }
-
-            // Delete any users marked for death.
-            std::vector<SyncUserMetadata> dead_users;
-            SyncUserMetadataResults users_to_remove = m_metadata_manager->all_users_marked_for_removal();
-            dead_users.reserve(users_to_remove.size());
-            for (size_t i = 0; i < users_to_remove.size(); i++) {
-                auto user = users_to_remove.get(i);
-                // FIXME: delete user data in a different way? (This deletes a logged-out user's data as soon as the
-                // app launches again, which might not be how some apps want to treat their data.)
-                try {
-                    m_file_manager->remove_user_realms(user.identity(), user.realm_file_paths());
-                    dead_users.emplace_back(std::move(user));
-                }
-                catch (FileAccessError const&) {
-                    continue;
-                }
-            }
-            for (auto& user : dead_users) {
-                user.remove();
-            }
-        }
+    if (m_config.metadata_mode == MetadataMode::NoMetadata) {
+        return;
     }
-    {
-        util::CheckedLockGuard lock(m_user_mutex);
-        m_users.insert(m_users.end(), users_to_add.begin(), users_to_add.end());
+
+    bool encrypt = m_config.metadata_mode == MetadataMode::Encryption;
+    m_metadata_manager = std::make_unique<SyncMetadataManager>(m_file_manager->metadata_path(), encrypt,
+                                                               m_config.custom_encryption_key);
+
+    m_metadata_manager->perform_launch_actions(*m_file_manager);
+
+    // Load persisted users into the users map.
+    for (auto user : m_metadata_manager->all_logged_in_users()) {
+        m_users.push_back(std::make_shared<SyncUser>(SyncUser::Private(), user, this));
     }
 }
 
 bool SyncManager::immediately_run_file_actions(const std::string& realm_path)
 {
     util::CheckedLockGuard lock(m_file_system_mutex);
-    if (!m_metadata_manager) {
-        return false;
-    }
-    if (auto metadata = m_metadata_manager->get_file_action_metadata(realm_path)) {
-        if (run_file_action(*metadata)) {
-            metadata->remove();
-            return true;
-        }
+    if (m_metadata_manager) {
+        return m_metadata_manager->perform_file_actions(*m_file_manager, realm_path);
     }
     return false;
 }
 
-// Perform a file action. Returns whether or not the file action can be removed.
-bool SyncManager::run_file_action(SyncFileActionMetadata& md)
+void SyncManager::tear_down_for_testing()
 {
-    switch (md.action()) {
-        case SyncFileActionMetadata::Action::DeleteRealm:
-            // Delete all the files for the given Realm.
-            return m_file_manager->remove_realm(md.original_name());
-        case SyncFileActionMetadata::Action::BackUpThenDeleteRealm:
-            // Copy the primary Realm file to the recovery dir, and then delete the Realm.
-            auto new_name = md.new_name();
-            auto original_name = md.original_name();
-            if (!util::File::exists(original_name)) {
-                // The Realm file doesn't exist anymore.
-                return true;
-            }
-            if (new_name && !util::File::exists(*new_name) &&
-                m_file_manager->copy_realm_file(original_name, *new_name)) {
-                // We successfully copied the Realm file to the recovery directory.
-                bool did_remove = m_file_manager->remove_realm(original_name);
-                // if the copy succeeded but not the delete, then running BackupThenDelete
-                // a second time would fail, so change this action to just delete the original file.
-                if (did_remove) {
-                    return true;
-                }
-                md.set_action(SyncFileActionMetadata::Action::DeleteRealm);
-                return false;
-            }
-            return false;
-    }
-    return false;
-}
+    close_all_sessions();
 
-void SyncManager::reset_for_testing()
-{
     {
         util::CheckedLockGuard lock(m_file_system_mutex);
         m_metadata_manager = nullptr;
@@ -222,8 +127,8 @@ void SyncManager::reset_for_testing()
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             lock.lock();
         }
-        // Callers of `SyncManager::reset_for_testing` should ensure there are no existing sessions
-        // prior to calling `reset_for_testing`.
+        // Callers of `SyncManager::tear_down_for_testing` should ensure there are no existing sessions
+        // prior to calling `tear_down_for_testing`.
         if (!no_sessions) {
             util::CheckedLockGuard lock(m_mutex);
             for (auto session : m_sessions) {
@@ -244,11 +149,8 @@ void SyncManager::reset_for_testing()
         util::CheckedLockGuard lock(m_mutex);
         // Destroy the client now that we have no remaining sessions.
         m_sync_client = nullptr;
-
-        // Reset even more state.
-        m_config = {};
         m_logger_ptr.reset();
-        m_sync_route = "";
+        m_sync_route.reset();
     }
 
     {
@@ -275,7 +177,8 @@ void SyncManager::set_logger_factory(SyncClientConfig::LoggerFactory factory)
     m_config.logger_factory = std::move(factory);
 
     if (m_sync_client)
-        throw std::logic_error("Cannot set the logger factory after creating the sync client");
+        throw LogicError(ErrorCodes::IllegalOperation,
+                         "Cannot set the logger factory after creating the sync client");
 
     // Create a new logger using the new factory
     do_make_logger();
@@ -336,28 +239,32 @@ bool SyncManager::perform_metadata_update(util::FunctionRef<void(SyncMetadataMan
 std::shared_ptr<SyncUser> SyncManager::get_user(const std::string& user_id, const std::string& refresh_token,
                                                 const std::string& access_token, const std::string& device_id)
 {
-    util::CheckedLockGuard lock(m_user_mutex);
-    auto it = std::find_if(m_users.begin(), m_users.end(), [&](const auto& user) {
-        return user->identity() == user_id && user->state() != SyncUser::State::Removed;
-    });
-    if (it == m_users.end()) {
-        // No existing user.
-        auto new_user = std::make_shared<SyncUser>(refresh_token, user_id, access_token, device_id, this);
-        m_users.emplace(m_users.begin(), new_user);
-        {
-            util::CheckedLockGuard lock(m_file_system_mutex);
-            // m_current_user is normally set very indirectly via the metadata manger
-            if (!m_metadata_manager)
-                m_current_user = new_user;
+    std::shared_ptr<SyncUser> user;
+    {
+        util::CheckedLockGuard lock(m_user_mutex);
+        auto it = std::find_if(m_users.begin(), m_users.end(), [&](const auto& user) {
+            return user->identity() == user_id && user->state() != SyncUser::State::Removed;
+        });
+        if (it == m_users.end()) {
+            // No existing user.
+            auto new_user = std::make_shared<SyncUser>(SyncUser::Private(), refresh_token, user_id, access_token,
+                                                       device_id, this);
+            m_users.emplace(m_users.begin(), new_user);
+            {
+                util::CheckedLockGuard lock(m_file_system_mutex);
+                // m_current_user is normally set very indirectly via the metadata manger
+                if (!m_metadata_manager)
+                    m_current_user = new_user;
+            }
+            return new_user;
         }
-        return new_user;
-    }
-    else { // LoggedOut => LoggedIn
-        auto user = *it;
+
+        // LoggedOut => LoggedIn
+        user = *it;
         REALM_ASSERT(user->state() != SyncUser::State::Removed);
-        user->log_in(access_token, refresh_token);
-        return user;
     }
+    user->log_in(access_token, refresh_token);
+    return user;
 }
 
 std::vector<std::shared_ptr<SyncUser>> SyncManager::all_users()
@@ -723,7 +630,8 @@ void SyncManager::set_session_multiplexing(bool allowed)
         return; // Already enabled, we can ignore
 
     if (m_sync_client)
-        throw std::logic_error("Cannot enable session multiplexing after creating the sync client");
+        throw LogicError(ErrorCodes::IllegalOperation,
+                         "Cannot enable session multiplexing after creating the sync client");
 
     m_config.multiplex_sessions = allowed;
 }
@@ -739,15 +647,6 @@ SyncClient& SyncManager::get_sync_client() const
 std::unique_ptr<SyncClient> SyncManager::create_sync_client() const
 {
     return std::make_unique<SyncClient>(m_logger_ptr, m_config, weak_from_this());
-}
-
-util::Optional<SyncAppMetadata> SyncManager::app_metadata() const
-{
-    util::CheckedLockGuard lock(m_file_system_mutex);
-    if (!m_metadata_manager) {
-        return util::none;
-    }
-    return m_metadata_manager->get_app_metadata();
 }
 
 void SyncManager::close_all_sessions()

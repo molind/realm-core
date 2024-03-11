@@ -1193,7 +1193,7 @@ bool ServerHistory::integrate_remote_changesets(file_ident_type remote_file_iden
         auto apply = [&](const Changeset* c) -> bool {
             TempShortCircuitReplication tdr{*this}; // Short-circuit while integrating changes
             InstructionApplier applier{transaction};
-            applier.apply(*c, &logger);
+            applier.apply(*c);
             reset(); // Reset the instruction encoder
             return true;
         };
@@ -2132,7 +2132,6 @@ void ServerHistory::fixup_state_and_changesets_for_assigned_file_ident(Transacti
     };
 
     auto get_table_for_class = [&](StringData class_name) -> ConstTableRef {
-        REALM_ASSERT(class_name.size() < Group::max_table_name_length - 6);
         Group::TableNameBuffer buffer;
         return group.get_table(Group::class_name_to_table_name(class_name, buffer));
     };

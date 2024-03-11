@@ -26,54 +26,7 @@
 #include <realm/object-store/sync/sync_manager.hpp>
 #include <realm/object-store/sync/sync_session.hpp>
 
-#include <realm/util/base64.hpp>
-
 namespace realm {
-
-static std::string base64_decode(const std::string& in)
-{
-    std::string out;
-    out.resize(util::base64_decoded_size(in.size()));
-    util::base64_decode(in, &out[0], out.size());
-    return out;
-}
-
-static std::vector<std::string> split_token(const std::string& jwt)
-{
-    constexpr static char delimiter = '.';
-
-    std::vector<std::string> parts;
-    size_t pos = 0, start_from = 0;
-
-    while ((pos = jwt.find(delimiter, start_from)) != std::string::npos) {
-        parts.push_back(jwt.substr(start_from, pos - start_from));
-        start_from = pos + 1;
-    }
-
-    parts.push_back(jwt.substr(start_from));
-
-    if (parts.size() != 3) {
-        throw app::AppError(ErrorCodes::BadToken, "jwt missing parts");
-    }
-
-    return parts;
-}
-
-RealmJWT::RealmJWT(const std::string& token)
-    : token(token)
-{
-    auto parts = split_token(this->token);
-
-    auto json_str = base64_decode(parts[1]);
-    auto json = static_cast<bson::BsonDocument>(bson::parse(json_str));
-
-    this->expires_at = static_cast<int64_t>(json["exp"]);
-    this->issued_at = static_cast<int64_t>(json["iat"]);
-
-    if (json.find("user_data") != json.end()) {
-        this->user_data = static_cast<bson::BsonDocument>(json["user_data"]);
-    }
-}
 
 SyncUserIdentity::SyncUserIdentity(const std::string& id, const std::string& provider_type)
     : id(id)
@@ -81,10 +34,7 @@ SyncUserIdentity::SyncUserIdentity(const std::string& id, const std::string& pro
 {
 }
 
-SyncUserContextFactory SyncUser::s_binding_context_factory;
-std::mutex SyncUser::s_binding_context_factory_mutex;
-
-SyncUser::SyncUser(const std::string& refresh_token, const std::string& id, const std::string& access_token,
+SyncUser::SyncUser(Private, const std::string& refresh_token, const std::string& id, const std::string& access_token,
                    const std::string& device_id, SyncManager* sync_manager)
     : m_state(State::LoggedIn)
     , m_identity(id)
@@ -94,12 +44,6 @@ SyncUser::SyncUser(const std::string& refresh_token, const std::string& id, cons
     , m_sync_manager(sync_manager)
 {
     REALM_ASSERT(!access_token.empty() && !refresh_token.empty());
-    {
-        std::lock_guard lock(s_binding_context_factory_mutex);
-        if (s_binding_context_factory) {
-            m_binding_context = s_binding_context_factory();
-        }
-    }
 
     m_sync_manager->perform_metadata_update([&](const auto& manager) NO_THREAD_SAFETY_ANALYSIS {
         auto metadata = manager.get_or_make_user_metadata(m_identity);
@@ -110,7 +54,7 @@ SyncUser::SyncUser(const std::string& refresh_token, const std::string& id, cons
     });
 }
 
-SyncUser::SyncUser(const SyncUserMetadata& data, SyncManager* sync_manager)
+SyncUser::SyncUser(Private, const SyncUserMetadata& data, SyncManager* sync_manager)
     : m_state(data.state())
     , m_legacy_identities(data.legacy_identities())
     , m_identity(data.identity())
@@ -121,21 +65,7 @@ SyncUser::SyncUser(const SyncUserMetadata& data, SyncManager* sync_manager)
     , m_device_id(data.device_id())
     , m_sync_manager(sync_manager)
 {
-    // Check for inconsistent state in the metadata Realm. This shouldn't happen,
-    // but previous versions could sometimes mark a user as logged in with an
-    // empty refresh token.
-    if (m_state == State::LoggedIn && (m_refresh_token.token.empty() || m_access_token.token.empty())) {
-        m_state = State::LoggedOut;
-        m_refresh_token = {};
-        m_access_token = {};
-    }
-
-    {
-        std::lock_guard lock(s_binding_context_factory_mutex);
-        if (s_binding_context_factory) {
-            m_binding_context = s_binding_context_factory();
-        }
-    }
+    REALM_ASSERT(m_state == State::LoggedIn && !m_access_token.token.empty() && !m_refresh_token.token.empty());
 }
 
 std::shared_ptr<SyncManager> SyncUser::sync_manager() const
@@ -429,12 +359,6 @@ app::MongoClient SyncUser::mongo_client(const std::string& service_name)
     util::CheckedLockGuard lk(m_mutex);
     REALM_ASSERT(m_state == SyncUser::State::LoggedIn);
     return app::MongoClient(shared_from_this(), m_sync_manager->app().lock(), service_name);
-}
-
-void SyncUser::set_binding_context_factory(SyncUserContextFactory factory)
-{
-    std::lock_guard<std::mutex> lock(s_binding_context_factory_mutex);
-    s_binding_context_factory = std::move(factory);
 }
 
 void SyncUser::refresh_custom_data(util::UniqueFunction<void(util::Optional<app::AppError>)> completion_block)

@@ -40,6 +40,11 @@ realm_sync_session_connection_state_notification_token::~realm_sync_session_conn
     session->unregister_connection_change_callback(token);
 }
 
+realm_sync_user_subscription_token::~realm_sync_user_subscription_token()
+{
+    user->unsubscribe(token);
+}
+
 namespace realm::c_api {
 
 static_assert(realm_sync_client_metadata_mode_e(SyncClientConfig::MetadataMode::NoEncryption) ==
@@ -264,6 +269,7 @@ RLM_API void realm_sync_config_set_error_handler(realm_sync_config_t* config, re
         c_error.server_requests_action = static_cast<realm_sync_error_action_e>(error.server_requests_action);
         c_error.c_original_file_path_key = error.c_original_file_path_key;
         c_error.c_recovery_file_path_key = error.c_recovery_file_path_key;
+        c_error.user_code_error = ErrorStorage::get_thread_local()->get_and_clear_user_code_error();
 
         std::vector<realm_sync_error_user_info_t> c_user_info;
         c_user_info.reserve(error.user_info.size());
@@ -388,7 +394,7 @@ RLM_API void realm_sync_config_set_before_client_reset_handler(realm_sync_config
     auto cb = [callback, userdata = SharedUserdata(userdata, FreeUserdata(userdata_free))](SharedRealm before_realm) {
         realm_t r1{before_realm};
         if (!callback(userdata.get(), &r1)) {
-            throw CallbackFailed();
+            throw CallbackFailed{};
         }
     };
     config->notify_before_client_reset = std::move(cb);
@@ -404,7 +410,7 @@ RLM_API void realm_sync_config_set_after_client_reset_handler(realm_sync_config_
         realm_t r1{before_realm};
         auto tsr = realm_t::thread_safe_reference(std::move(after_realm));
         if (!callback(userdata.get(), &r1, &tsr, did_recover)) {
-            throw CallbackFailed();
+            throw CallbackFailed{};
         }
     };
     config->notify_after_client_reset = std::move(cb);
@@ -756,6 +762,13 @@ RLM_API void realm_sync_session_pause(realm_sync_session_t* session) noexcept
 RLM_API void realm_sync_session_resume(realm_sync_session_t* session) noexcept
 {
     (*session)->resume();
+}
+
+RLM_API void realm_sync_session_get_file_ident(realm_sync_session_t* session, realm_salted_file_ident_t* out) noexcept
+{
+    auto file_ident = (*session)->get_file_ident();
+    out->ident = file_ident.ident;
+    out->salt = file_ident.salt;
 }
 
 RLM_API bool realm_sync_immediately_run_file_actions(realm_app_t* realm_app, const char* sync_path,

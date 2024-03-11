@@ -127,6 +127,18 @@ public:
 
     std::string get_appservices_connection_id();
 
+protected:
+    friend class ClientImpl;
+
+    // m_initiated/m_abandoned is used to check that we aren't trying to update immutable properties like the progress
+    // handler or connection state listener after we've bound the session. We read the variable a bunch in
+    // REALM_ASSERTS on the event loop and on the user's thread, but we only set it once and while we're registering
+    // the session wrapper to be actualized. This function gets called from
+    // ClientImpl::register_unactualized_session_wrapper() to synchronize updating this variable on the main thread
+    // with reading the variable on the event loop.
+    void mark_initiated();
+    void mark_abandoned();
+
 private:
     ClientImpl& m_client;
     DBRef m_db;
@@ -167,6 +179,8 @@ private:
 
     SessionReason m_session_reason;
 
+    const uint64_t m_schema_version;
+
     std::shared_ptr<SubscriptionStore> m_flx_subscription_store;
     int64_t m_flx_active_version = 0;
     int64_t m_flx_last_seen_version = 0;
@@ -198,6 +212,8 @@ private:
 
     bool m_suspended = false;
 
+    // Set when the session has been abandoned, but before it's been finalized.
+    bool m_abandoned = false;
     // Has the SessionWrapper been finalized?
     bool m_finalized = false;
 
@@ -307,7 +323,6 @@ SessionWrapperStack::~SessionWrapperStack()
 
 
 // ################ ClientImpl ################
-
 
 ClientImpl::~ClientImpl()
 {
@@ -451,6 +466,23 @@ bool ClientImpl::wait_for_session_terminations_or_client_stopped()
 }
 
 
+// This relies on the same assumptions and guarantees as wait_for_session_terminations_or_client_stopped().
+util::Future<void> ClientImpl::notify_session_terminated()
+{
+    auto pf = util::make_promise_future<void>();
+    post([promise = std::move(pf.promise)](Status status) mutable {
+        // Includes operation_aborted
+        if (!status.is_ok()) {
+            promise.set_error(status);
+            return;
+        }
+
+        promise.emplace_value();
+    });
+
+    return std::move(pf.future);
+}
+
 void ClientImpl::drain_connections_on_loop()
 {
     post([this](Status status) mutable {
@@ -492,51 +524,37 @@ void ClientImpl::shutdown() noexcept
 void ClientImpl::register_unactualized_session_wrapper(SessionWrapper* wrapper, ServerEndpoint endpoint)
 {
     // Thread safety required.
-
-    std::lock_guard lock{m_mutex};
-    REALM_ASSERT(m_actualize_and_finalize);
-    m_unactualized_session_wrappers.emplace(wrapper, std::move(endpoint)); // Throws
-    bool retrigger = !m_actualize_and_finalize_needed;
-    m_actualize_and_finalize_needed = true;
-    // The conditional triggering needs to happen before releasing the mutex,
-    // because if two threads call register_unactualized_session_wrapper()
-    // roughly concurrently, then only the first one is guaranteed to be asked
-    // to retrigger, but that retriggering must have happened before the other
-    // thread returns from register_unactualized_session_wrapper().
-    //
-    // Note that a similar argument applies when two threads call
-    // register_abandoned_session_wrapper(), and when one thread calls one of
-    // them and another thread call the other.
-    if (retrigger)
-        m_actualize_and_finalize->trigger();
+    {
+        std::lock_guard lock{m_mutex};
+        REALM_ASSERT(m_actualize_and_finalize);
+        wrapper->mark_initiated();
+        m_unactualized_session_wrappers.emplace(wrapper, std::move(endpoint)); // Throws
+    }
+    m_actualize_and_finalize->trigger();
 }
 
 
 void ClientImpl::register_abandoned_session_wrapper(util::bind_ptr<SessionWrapper> wrapper) noexcept
 {
     // Thread safety required.
+    {
+        std::lock_guard lock{m_mutex};
+        REALM_ASSERT(m_actualize_and_finalize);
+        wrapper->mark_abandoned();
 
-    std::lock_guard lock{m_mutex};
-    REALM_ASSERT(m_actualize_and_finalize);
-
-    // If the session wrapper has not yet been actualized (on the event loop
-    // thread), it can be immediately finalized. This ensures that we will
-    // generally not actualize a session wrapper that has already been
-    // abandoned.
-    auto i = m_unactualized_session_wrappers.find(wrapper.get());
-    if (i != m_unactualized_session_wrappers.end()) {
-        m_unactualized_session_wrappers.erase(i);
-        wrapper->finalize_before_actualization();
-        return;
+        // If the session wrapper has not yet been actualized (on the event loop
+        // thread), it can be immediately finalized. This ensures that we will
+        // generally not actualize a session wrapper that has already been
+        // abandoned.
+        auto i = m_unactualized_session_wrappers.find(wrapper.get());
+        if (i != m_unactualized_session_wrappers.end()) {
+            m_unactualized_session_wrappers.erase(i);
+            wrapper->finalize_before_actualization();
+            return;
+        }
+        m_abandoned_session_wrappers.push(std::move(wrapper));
     }
-    m_abandoned_session_wrappers.push(std::move(wrapper));
-    bool retrigger = !m_actualize_and_finalize_needed;
-    m_actualize_and_finalize_needed = true;
-    // The conditional triggering needs to happen before releasing the
-    // mutex. See implementation of register_unactualized_session_wrapper() for
-    // details.
-    if (retrigger)
-        m_actualize_and_finalize->trigger();
+    m_actualize_and_finalize->trigger();
 }
 
 
@@ -548,7 +566,6 @@ void ClientImpl::actualize_and_finalize_session_wrappers()
     bool stopped;
     {
         std::lock_guard lock{m_mutex};
-        m_actualize_and_finalize_needed = false;
         swap(m_unactualized_session_wrappers, unactualized_session_wrappers);
         swap(m_abandoned_session_wrappers, abandoned_session_wrappers);
         stopped = m_stopped;
@@ -688,11 +705,16 @@ DBRef SessionImpl::get_db() const noexcept
     return m_wrapper.m_db;
 }
 
-ClientReplication& SessionImpl::access_realm()
+ClientReplication& SessionImpl::get_repl() const noexcept
 {
     // Can only be called if the session is active or being activated
     REALM_ASSERT_EX(m_state == State::Active || m_state == State::Unactivated, m_state);
     return m_wrapper.get_replication();
+}
+
+ClientHistory& SessionImpl::get_history() const noexcept
+{
+    return get_repl().get_history();
 }
 
 util::Optional<ClientReset>& SessionImpl::get_client_reset_config() noexcept
@@ -707,6 +729,13 @@ SessionReason SessionImpl::get_session_reason() noexcept
     // Can only be called if the session is active or being activated
     REALM_ASSERT_EX(m_state == State::Active || m_state == State::Unactivated, m_state);
     return m_wrapper.m_session_reason;
+}
+
+uint64_t SessionImpl::get_schema_version() noexcept
+{
+    // Can only be called if the session is active or being activated
+    REALM_ASSERT_EX(m_state == State::Active || m_state == State::Unactivated, m_state);
+    return m_wrapper.m_schema_version;
 }
 
 void SessionImpl::initiate_integrate_changesets(std::uint_fast64_t downloadable_bytes, DownloadBatchState batch_state,
@@ -725,9 +754,7 @@ void SessionImpl::initiate_integrate_changesets(std::uint_fast64_t downloadable_
         version_type client_version;
         if (REALM_LIKELY(!get_client().is_dry_run())) {
             VersionInfo version_info;
-            ClientReplication& repl = access_realm(); // Throws
-            integrate_changesets(repl, progress, downloadable_bytes, changesets, version_info,
-                                 batch_state); // Throws
+            integrate_changesets(progress, downloadable_bytes, changesets, version_info, batch_state); // Throws
             client_version = version_info.realm_version;
         }
         else {
@@ -850,6 +877,9 @@ bool SessionImpl::process_flx_bootstrap_message(const SyncProgress& progress, Do
     catch (const IntegrationException& e) {
         on_integration_failure(e);
     }
+    catch (...) {
+        on_integration_failure(IntegrationException(exception_to_status()));
+    }
 
     return true;
 }
@@ -873,7 +903,7 @@ void SessionImpl::process_pending_flx_bootstrap()
                 "changeset size: %3)",
                 pending_batch_stats.query_version, pending_batch_stats.pending_changesets,
                 pending_batch_stats.pending_changeset_bytes);
-    auto& history = access_realm().get_history();
+    auto& history = get_repl().get_history();
     VersionInfo new_version;
     SyncProgress progress;
     int64_t query_version = -1;
@@ -902,6 +932,9 @@ void SessionImpl::process_pending_flx_bootstrap()
         if (simulate_integration_error) {
             throw IntegrationException(ErrorCodes::BadChangeset, "simulated failure", ProtocolError::bad_changeset);
         }
+
+        call_debug_hook(SyncClientHookEvent::BootstrapBatchAboutToProcess, *pending_batch.progress, query_version,
+                        batch_state, pending_batch.changesets.size());
 
         history.integrate_server_changesets(
             *pending_batch.progress, &downloadable_bytes, pending_batch.changesets, new_version, batch_state, logger,
@@ -1091,8 +1124,10 @@ util::Future<std::string> SessionImpl::send_test_command(std::string body)
 
     get_client().post([this, promise = std::move(pf.promise), body = std::move(body)](Status status) mutable {
         // Includes operation_aborted
-        if (!status.is_ok())
+        if (!status.is_ok()) {
             promise.set_error(status);
+            return;
+        }
 
         auto id = ++m_last_pending_test_command_ident;
         m_pending_test_commands.push_back(PendingTestCommand{id, std::move(body), std::move(promise)});
@@ -1131,14 +1166,16 @@ SessionWrapper::SessionWrapper(ClientImpl& client, DBRef db, std::shared_ptr<Sub
     , m_proxy_config{config.proxy_config} // Throws
     , m_debug_hook(std::move(config.on_sync_client_event_hook))
     , m_session_reason(config.session_reason)
+    , m_schema_version(config.schema_version)
     , m_flx_subscription_store(std::move(flx_sub_store))
     , m_migration_store(std::move(migration_store))
 {
     REALM_ASSERT(m_db);
     REALM_ASSERT(m_db->get_replication());
     REALM_ASSERT(dynamic_cast<ClientReplication*>(m_db->get_replication()));
-
-    update_subscription_version_info();
+    if (m_client_reset_config) {
+        m_session_reason = SessionReason::ClientReset;
+    }
 }
 
 SessionWrapper::~SessionWrapper() noexcept
@@ -1170,9 +1207,7 @@ bool SessionWrapper::has_flx_subscription_store() const
 void SessionWrapper::on_flx_sync_error(int64_t version, std::string_view err_msg)
 {
     REALM_ASSERT(!m_finalized);
-    auto mut_subs = get_flx_subscription_store()->get_mutable_by_version(version);
-    mut_subs.update_state(SubscriptionSet::State::Error, err_msg);
-    mut_subs.commit();
+    get_flx_subscription_store()->update_state(version, SubscriptionSet::State::Error, err_msg);
 }
 
 void SessionWrapper::on_flx_sync_version_complete(int64_t version)
@@ -1221,9 +1256,7 @@ void SessionWrapper::on_flx_sync_progress(int64_t new_version, DownloadBatchStat
             break;
     }
 
-    auto mut_subs = get_flx_subscription_store()->get_mutable_by_version(new_version);
-    mut_subs.update_state(new_state);
-    mut_subs.commit();
+    get_flx_subscription_store()->update_state(new_version, new_state);
 }
 
 SubscriptionStore* SessionWrapper::get_flx_subscription_store()
@@ -1244,6 +1277,21 @@ MigrationStore* SessionWrapper::get_migration_store()
     return m_migration_store.get();
 }
 
+inline void SessionWrapper::mark_initiated()
+{
+    REALM_ASSERT(!m_initiated);
+    REALM_ASSERT(!m_abandoned);
+    m_initiated = true;
+}
+
+
+inline void SessionWrapper::mark_abandoned()
+{
+    REALM_ASSERT(!m_abandoned);
+    m_abandoned = true;
+}
+
+
 inline void SessionWrapper::set_progress_handler(util::UniqueFunction<ProgressHandler> handler)
 {
     REALM_ASSERT(!m_initiated);
@@ -1261,10 +1309,8 @@ SessionWrapper::set_connection_state_change_listener(util::UniqueFunction<Connec
 
 void SessionWrapper::initiate()
 {
-    REALM_ASSERT(!m_initiated);
     ServerEndpoint server_endpoint{m_protocol_envelope, m_server_address, m_server_port, m_user_id, m_sync_mode};
     m_client.register_unactualized_session_wrapper(this, std::move(server_endpoint)); // Throws
-    m_initiated = true;
     m_db->add_commit_listener(this);
 }
 
@@ -1274,10 +1320,6 @@ void SessionWrapper::on_commit(version_type new_version)
     // Thread safety required
     REALM_ASSERT(m_initiated);
 
-    if (REALM_UNLIKELY(m_finalized || m_force_closed)) {
-        return;
-    }
-
     util::bind_ptr<SessionWrapper> self{this};
     m_client.post([self = std::move(self), new_version](Status status) {
         if (status == ErrorCodes::OperationAborted)
@@ -1286,6 +1328,10 @@ void SessionWrapper::on_commit(version_type new_version)
             throw Exception(status);
 
         REALM_ASSERT(self->m_actualized);
+        if (REALM_UNLIKELY(self->m_finalized || self->m_force_closed)) {
+            return;
+        }
+
         if (REALM_UNLIKELY(!self->m_sess))
             return; // Already finalized
         SessionImpl& sess = *self->m_sess;
@@ -1301,10 +1347,6 @@ void SessionWrapper::cancel_reconnect_delay()
     // Thread safety required
     REALM_ASSERT(m_initiated);
 
-    if (REALM_UNLIKELY(m_finalized || m_force_closed)) {
-        return;
-    }
-
     util::bind_ptr<SessionWrapper> self{this};
     m_client.post([self = std::move(self)](Status status) {
         if (status == ErrorCodes::OperationAborted)
@@ -1313,6 +1355,10 @@ void SessionWrapper::cancel_reconnect_delay()
             throw Exception(status);
 
         REALM_ASSERT(self->m_actualized);
+        if (REALM_UNLIKELY(self->m_finalized || self->m_force_closed)) {
+            return;
+        }
+
         if (REALM_UNLIKELY(!self->m_sess))
             return; // Already finalized
         SessionImpl& sess = *self->m_sess;
@@ -1327,7 +1373,6 @@ void SessionWrapper::async_wait_for(bool upload_completion, bool download_comple
 {
     REALM_ASSERT(upload_completion || download_completion);
     REALM_ASSERT(m_initiated);
-    REALM_ASSERT(!m_finalized);
 
     util::bind_ptr<SessionWrapper> self{this};
     m_client.post([self = std::move(self), handler = std::move(handler), upload_completion,
@@ -1370,7 +1415,7 @@ bool SessionWrapper::wait_for_upload_complete_or_client_stopped()
 {
     // Thread safety required
     REALM_ASSERT(m_initiated);
-    REALM_ASSERT(!m_finalized);
+    REALM_ASSERT(!m_abandoned);
 
     std::int_fast64_t target_mark;
     {
@@ -1386,6 +1431,7 @@ bool SessionWrapper::wait_for_upload_complete_or_client_stopped()
             throw Exception(status);
 
         REALM_ASSERT(self->m_actualized);
+        REALM_ASSERT(!self->m_finalized);
         // The session wrapper may already have been finalized. This can only
         // happen if it was abandoned, but in that case, the call of
         // wait_for_upload_complete_or_client_stopped() must have returned
@@ -1414,7 +1460,7 @@ bool SessionWrapper::wait_for_download_complete_or_client_stopped()
 {
     // Thread safety required
     REALM_ASSERT(m_initiated);
-    REALM_ASSERT(!m_finalized);
+    REALM_ASSERT(!m_abandoned);
 
     std::int_fast64_t target_mark;
     {
@@ -1430,6 +1476,7 @@ bool SessionWrapper::wait_for_download_complete_or_client_stopped()
             throw Exception(status);
 
         REALM_ASSERT(self->m_actualized);
+        REALM_ASSERT(!self->m_finalized);
         // The session wrapper may already have been finalized. This can only
         // happen if it was abandoned, but in that case, the call of
         // wait_for_download_complete_or_client_stopped() must have returned
@@ -1458,7 +1505,7 @@ void SessionWrapper::refresh(std::string signed_access_token)
 {
     // Thread safety required
     REALM_ASSERT(m_initiated);
-    REALM_ASSERT(!m_finalized);
+    REALM_ASSERT(!m_abandoned);
 
     m_client.post([self = util::bind_ptr(this), token = std::move(signed_access_token)](Status status) {
         if (status == ErrorCodes::OperationAborted)
@@ -1492,6 +1539,7 @@ inline void SessionWrapper::abandon(util::bind_ptr<SessionWrapper> wrapper) noex
 // Must be called from event loop thread
 void SessionWrapper::actualize(ServerEndpoint endpoint)
 {
+    REALM_ASSERT_DEBUG(m_initiated);
     REALM_ASSERT(!m_actualized);
     REALM_ASSERT(!m_sess);
     // Cannot be actualized if it's already been finalized or force closed
@@ -1527,9 +1575,17 @@ void SessionWrapper::actualize(ServerEndpoint endpoint)
         if (was_created)
             m_client.remove_connection(conn);
 
+        // finalize_before_actualization() expects m_sess to be nullptr, but it's possible that we
+        // reached its assignment above before throwing. Unset it here so we get a clean unhandled
+        // exception failure instead of a REALM_ASSERT in finalize_before_actualization().
+        m_sess = nullptr;
         finalize_before_actualization();
         throw;
     }
+
+    // Initialize the variables relying on the bootstrap store from the event loop to guarantee that a previous
+    // session cannot change the state of the bootstrap store at the same time.
+    update_subscription_version_info();
 
     m_actualized = true;
     if (was_created)
@@ -1574,6 +1630,7 @@ void SessionWrapper::force_close()
 void SessionWrapper::finalize()
 {
     REALM_ASSERT(m_actualized);
+    REALM_ASSERT(m_abandoned);
 
     // Already finalized?
     if (m_finalized) {
@@ -1681,9 +1738,7 @@ void SessionWrapper::on_download_completion()
     if (m_flx_subscription_store && m_flx_pending_mark_version != SubscriptionSet::EmptyVersion) {
         m_sess->logger.debug("Marking query version %1 as complete after receiving MARK message",
                              m_flx_pending_mark_version);
-        auto mutable_subs = m_flx_subscription_store->get_mutable_by_version(m_flx_pending_mark_version);
-        mutable_subs.update_state(SubscriptionSet::State::Complete);
-        mutable_subs.commit();
+        m_flx_subscription_store->update_state(m_flx_pending_mark_version, SubscriptionSet::State::Complete);
         m_flx_pending_mark_version = SubscriptionSet::EmptyVersion;
     }
 
@@ -1785,15 +1840,11 @@ void SessionWrapper::handle_pending_client_reset_acknowledgement()
 {
     REALM_ASSERT(!m_finalized);
 
-    auto pending_reset = [&] {
-        auto ft = m_db->start_frozen();
-        return _impl::client_reset::has_pending_reset(ft);
-    }();
+    auto pending_reset = _impl::client_reset::has_pending_reset(*m_db->start_frozen());
     REALM_ASSERT(pending_reset);
     m_sess->logger.info("Tracking pending client reset of type \"%1\" from %2", pending_reset->type,
                         pending_reset->time);
-    util::bind_ptr<SessionWrapper> self(this);
-    async_wait_for(true, true, [self = std::move(self), pending_reset = *pending_reset](Status status) {
+    async_wait_for(true, true, [self = util::bind_ptr(this), pending_reset = *pending_reset](Status status) {
         if (status == ErrorCodes::OperationAborted) {
             return;
         }
@@ -1804,7 +1855,7 @@ void SessionWrapper::handle_pending_client_reset_acknowledgement()
         }
 
         auto wt = self->m_db->start_write();
-        auto cur_pending_reset = _impl::client_reset::has_pending_reset(wt);
+        auto cur_pending_reset = _impl::client_reset::has_pending_reset(*wt);
         if (!cur_pending_reset) {
             logger.debug(
                 "Was going to remove client reset tracker for type \"%1\" from %2, but it was already removed",
@@ -1821,7 +1872,7 @@ void SessionWrapper::handle_pending_client_reset_acknowledgement()
                          "Removing cycle detection tracker.",
                          pending_reset.type, pending_reset.time);
         }
-        _impl::client_reset::remove_pending_client_resets(wt);
+        _impl::client_reset::remove_pending_client_resets(*wt);
         wt->commit();
     });
 }
@@ -1867,7 +1918,8 @@ ClientImpl::Connection::Connection(ClientImpl& client, connection_ident_type ide
                                    Optional<std::string> ssl_trust_certificate_path,
                                    std::function<SSLVerifyCallback> ssl_verify_callback,
                                    Optional<ProxyConfig> proxy_config, ReconnectInfo reconnect_info)
-    : logger_ptr{std::make_shared<util::PrefixLogger>(make_logger_prefix(ident), client.logger_ptr)} // Throws
+    : logger_ptr{std::make_shared<util::PrefixLogger>(util::LogCategory::session, make_logger_prefix(ident),
+                                                      client.logger_ptr)} // Throws
     , logger{*logger_ptr}
     , m_client{client}
     , m_verify_servers_ssl_certificate{verify_servers_ssl_certificate}    // DEPRECATED
@@ -1924,7 +1976,7 @@ void ClientImpl::Connection::resume_active_sessions()
 
 void ClientImpl::Connection::on_idle()
 {
-    logger.debug("Destroying connection object");
+    logger.debug(util::LogCategory::session, "Destroying connection object");
     ClientImpl& client = get_client();
     client.remove_connection(*this);
     // NOTE: This connection object is now destroyed!
@@ -2006,9 +2058,13 @@ void Client::voluntary_disconnect_all_connections()
 
 bool Client::wait_for_session_terminations_or_client_stopped()
 {
-    return m_impl.get()->wait_for_session_terminations_or_client_stopped();
+    return m_impl->wait_for_session_terminations_or_client_stopped();
 }
 
+util::Future<void> Client::notify_session_terminated()
+{
+    return m_impl->notify_session_terminated();
+}
 
 bool Client::decompose_server_url(const std::string& url, ProtocolEnvelope& protocol, std::string& address,
                                   port_type& port, std::string& path) const

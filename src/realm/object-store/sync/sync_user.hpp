@@ -19,13 +19,10 @@
 #ifndef REALM_OS_SYNC_USER_HPP
 #define REALM_OS_SYNC_USER_HPP
 
-#include <realm/object-store/util/atomic_shared_ptr.hpp>
-#include <realm/object-store/util/bson/bson.hpp>
+#include <realm/object-store/sync/jwt.hpp>
 #include <realm/object-store/sync/subscribable.hpp>
-
+#include <realm/util/bson/bson.hpp>
 #include <realm/util/checked_mutex.hpp>
-#include <realm/util/optional.hpp>
-#include <realm/table.hpp>
 
 #include <memory>
 #include <mutex>
@@ -41,36 +38,6 @@ class MongoClient;
 class SyncManager;
 class SyncSession;
 class SyncUserMetadata;
-
-// A superclass that bindings can inherit from in order to store information
-// upon a `SyncUser` object.
-class SyncUserContext {
-public:
-    virtual ~SyncUserContext() = default;
-};
-
-using SyncUserContextFactory = util::UniqueFunction<std::shared_ptr<SyncUserContext>()>;
-
-// A struct that decodes a given JWT.
-struct RealmJWT {
-    // The token being decoded from.
-    std::string token;
-
-    // When the token expires.
-    int64_t expires_at = 0;
-    // When the token was issued.
-    int64_t issued_at = 0;
-    // Custom user data embedded in the encoded token.
-    util::Optional<bson::BsonDocument> user_data;
-
-    explicit RealmJWT(const std::string& token);
-    RealmJWT() = default;
-
-    bool operator==(const RealmJWT& other) const
-    {
-        return token == other.token;
-    }
-};
 
 struct SyncUserProfile {
     // The full name of the user.
@@ -140,11 +107,10 @@ private:
 
     util::Optional<std::string> get_field(const char* name) const
     {
-        auto it = m_data.find(name);
-        if (it == m_data.end()) {
-            return util::none;
+        if (auto val = m_data.find(name)) {
+            return static_cast<std::string>((*val));
         }
-        return static_cast<std::string>((*it).second);
+        return util::none;
     }
 };
 
@@ -172,6 +138,7 @@ struct SyncUserIdentity {
 // are associated with it.
 class SyncUser : public std::enable_shared_from_this<SyncUser>, public Subscribable<SyncUser> {
     friend class SyncSession;
+    struct Private {};
 
 public:
     enum class State {
@@ -219,14 +186,6 @@ public:
     // Custom user data embedded in the access token.
     util::Optional<bson::BsonDocument> custom_data() const REQUIRES(!m_tokens_mutex);
 
-    std::shared_ptr<SyncUserContext> binding_context() const
-    {
-        return m_binding_context.load();
-    }
-
-    // Optionally set a context factory. If so, must be set before any sessions are created.
-    static void set_binding_context_factory(SyncUserContextFactory factory);
-
     std::shared_ptr<SyncManager> sync_manager() const REQUIRES(!m_mutex);
 
     /// Retrieves a general-purpose service client for the Realm Cloud service
@@ -238,10 +197,11 @@ public:
     // testing purposes. SDKs should not call these directly in non-test code
     // or expose them in the public API.
 
-    // Don't use this directly; use the `SyncManager` APIs. Public for use with `make_shared`.
-    SyncUser(const std::string& refresh_token, const std::string& id, const std::string& access_token,
-             const std::string& device_id, SyncManager* sync_manager);
-    SyncUser(const SyncUserMetadata& data, SyncManager* sync_manager);
+    explicit SyncUser(Private, const std::string& refresh_token, const std::string& id,
+                      const std::string& access_token, const std::string& device_id, SyncManager* sync_manager);
+    explicit SyncUser(Private, const SyncUserMetadata& data, SyncManager* sync_manager);
+    SyncUser(const SyncUser&) = delete;
+    SyncUser& operator=(const SyncUser&) = delete;
 
     // Atomically set the user to be logged in and update both tokens.
     void log_in(const std::string& access_token, const std::string& refresh_token)
@@ -286,22 +246,17 @@ protected:
     void detach_from_sync_manager() REQUIRES(!m_mutex);
 
 private:
-    static SyncUserContextFactory s_binding_context_factory;
-    static std::mutex s_binding_context_factory_mutex;
-
     bool do_is_anonymous() const REQUIRES(m_mutex);
 
     std::vector<std::shared_ptr<SyncSession>> revive_sessions() REQUIRES(m_mutex);
 
     State m_state GUARDED_BY(m_mutex);
 
-    util::AtomicSharedPtr<SyncUserContext> m_binding_context;
-
     // UUIDs which used to be used to generate local Realm file paths. Now only
     // used to locate existing files.
     std::vector<std::string> m_legacy_identities;
 
-    mutable util::CheckedMutex m_mutex;
+    util::CheckedMutex m_mutex;
 
     // Set by the server. The unique ID of the user account on the Realm Application.
     const std::string m_identity;
@@ -313,7 +268,7 @@ private:
     // Waiting sessions are those that should be asked to connect once this user is logged in.
     std::unordered_map<std::string, std::weak_ptr<SyncSession>> m_waiting_sessions;
 
-    mutable util::CheckedMutex m_tokens_mutex;
+    util::CheckedMutex m_tokens_mutex;
 
     // The user's refresh token.
     RealmJWT m_refresh_token GUARDED_BY(m_tokens_mutex);

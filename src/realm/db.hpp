@@ -120,6 +120,7 @@ using DBRef = std::shared_ptr<DB>;
 
 class DB : public std::enable_shared_from_this<DB> {
     struct ReadLockInfo;
+    struct Private {};
 
 public:
     // Create a DB and associate it with a file. DB Objects can only be associated with one file,
@@ -140,6 +141,7 @@ public:
 
     ~DB() noexcept;
 
+    explicit DB(Private, const DBOptions& options);
     // Disable copying to prevent accessor errors. If you really want another
     // instance, open another DB object on the same file. But you don't.
     DB(const DB&) = delete;
@@ -164,6 +166,8 @@ public:
     void close(bool allow_open_read_transactions = false) REQUIRES(!m_mutex);
 
     bool is_attached() const noexcept;
+
+    static bool needs_file_format_upgrade(const std::string& file, const std::vector<char>& encryption_key);
 
     Allocator& get_alloc()
     {
@@ -447,9 +451,6 @@ public:
     void add_commit_listener(CommitListener*);
     void remove_commit_listener(CommitListener*);
 
-protected:
-    explicit DB(const DBOptions& options);
-
 private:
     class AsyncCommitHelper;
     class VersionManager;
@@ -483,7 +484,7 @@ private:
     class ReadLockGuard;
 
     // Member variables
-    mutable util::CheckedMutex m_mutex;
+    util::CheckedMutex m_mutex;
     int m_transaction_count GUARDED_BY(m_mutex) = 0;
     SlabAlloc m_alloc;
     std::unique_ptr<Replication> m_history;

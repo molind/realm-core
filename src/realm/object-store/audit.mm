@@ -282,7 +282,7 @@ public:
         return true;
     }
 
-    bool select_collection(ColKey, ObjKey obj) noexcept
+    bool select_collection(ColKey, ObjKey obj, const StablePath&) noexcept
     {
         REALM_ASSERT(m_active_table);
         m_active_table->modifications.push_back(obj);
@@ -484,7 +484,7 @@ public:
         , m_serializer(serializer)
         , m_table(audit_table)
         , m_repl(*m_table.get_parent_group()->get_replication())
-        , m_repl_buffer([=]() -> const util::AppendBuffer<char>& {
+        , m_repl_buffer([this]() -> const util::AppendBuffer<char>& {
             REALM_ASSERT(typeid(m_repl) == typeid(sync::ClientReplication));
             return static_cast<sync::SyncReplication&>(m_repl).get_instruction_encoder().buffer();
         }())
@@ -615,6 +615,8 @@ private:
 // when the current one grows too large and ensuring that all of the Realms are
 // uploaded to the server.
 class AuditRealmPool : public std::enable_shared_from_this<AuditRealmPool> {
+    struct Private {};
+
 public:
     using ErrorHandler = std::function<void(SyncError)>;
 
@@ -629,9 +631,11 @@ public:
     // of the callback.
     void write(util::FunctionRef<void(Transaction&)> func) REQUIRES(!m_mutex);
 
-    // Do not call directly; use get_pool().
-    AuditRealmPool(std::shared_ptr<SyncUser> user, std::string const& partition_prefix, ErrorHandler error_handler,
-                   const std::shared_ptr<util::Logger>& logger, std::string_view app_id);
+    explicit AuditRealmPool(Private, std::shared_ptr<SyncUser> user, std::string const& partition_prefix,
+                            ErrorHandler error_handler, const std::shared_ptr<util::Logger>& logger,
+                            std::string_view app_id);
+    AuditRealmPool(const AuditRealmPool&) = delete;
+    AuditRealmPool& operator=(const AuditRealmPool&) = delete;
 
     // Block the calling thread until all pooled Realms have been fully uploaded,
     // including ones which do not currently have sync sessions. For testing
@@ -679,7 +683,7 @@ std::shared_ptr<AuditRealmPool> AuditRealmPool::get_pool(std::shared_ptr<SyncUse
                                  }),
                   s_pools.end());
 
-    auto app_id = user->sync_manager()->app().lock()->config().app_id;
+    auto app_id = user->sync_manager()->app_id();
     auto it = std::find_if(s_pools.begin(), s_pools.end(), [&](auto& pool) {
         return pool.user_identity == user->identity() && pool.partition_prefix == partition_prefix &&
                pool.app_id == app_id;
@@ -690,13 +694,13 @@ std::shared_ptr<AuditRealmPool> AuditRealmPool::get_pool(std::shared_ptr<SyncUse
         }
     }
 
-    auto pool = std::make_shared<AuditRealmPool>(user, partition_prefix, error_handler, logger, app_id);
+    auto pool = std::make_shared<AuditRealmPool>(Private(), user, partition_prefix, error_handler, logger, app_id);
     pool->scan_for_realms_to_upload();
     s_pools.push_back({user->identity(), partition_prefix, app_id, pool});
     return pool;
 }
 
-AuditRealmPool::AuditRealmPool(std::shared_ptr<SyncUser> user, std::string const& partition_prefix,
+AuditRealmPool::AuditRealmPool(Private, std::shared_ptr<SyncUser> user, std::string const& partition_prefix,
                                ErrorHandler error_handler, const std::shared_ptr<util::Logger>& logger,
                                std::string_view app_id)
     : m_user(user)
@@ -885,7 +889,6 @@ void AuditRealmPool::open_new_realm()
 
     Realm::Config config;
     config.automatic_change_notifications = false;
-    config.cache = false;
     config.path = util::format("%1%2.realm", m_path_root, partition);
     config.scheduler = util::Scheduler::make_dummy();
     config.schema = Schema{schema};
@@ -1169,6 +1172,14 @@ bool AuditContext::is_scope_valid(uint64_t id)
 void AuditContext::process_scope(AuditContext::Scope& scope) const
 {
     m_logger->info("Events: Processing scope for '%1'", m_source_db->get_path());
+    if (scope.events.empty()) {
+        m_logger->detail("Events: Scope is empty");
+        if (scope.completion)
+            scope.completion(nullptr);
+        m_serializer->scope_complete();
+        return;
+    }
+
     try {
         // Merge single object reads following a query into that query and discard
         // duplicate reads on objects.

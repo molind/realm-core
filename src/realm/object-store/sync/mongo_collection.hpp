@@ -19,7 +19,7 @@
 #ifndef MONGO_COLLECTION_HPP
 #define MONGO_COLLECTION_HPP
 
-#include <realm/object-store/util/bson/bson.hpp>
+#include <realm/util/bson/bson.hpp>
 #include <realm/util/functional.hpp>
 #include <realm/util/optional.hpp>
 
@@ -169,7 +169,7 @@ public:
     /// they will be generated.
     /// @param documents  The `Document` values in a bson array to insert.
     /// @param completion The result of the insert, returns an array inserted document ids in order
-    void insert_many(const bson::BsonArray& documents, ResponseHandler<std::vector<bson::Bson>>&& completion);
+    void insert_many(const bson::BsonArray& documents, ResponseHandler<bson::BsonArray>&& completion);
 
     /// Deletes a single matching document from the collection.
     /// @param filter_bson A `Document` as bson that should match the query.

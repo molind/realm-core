@@ -41,17 +41,17 @@ class CallbackFailed : public RuntimeError {
 public:
     // SDK-provided opaque error value when error == RLM_ERR_CALLBACK with a callout to
     // realm_register_user_code_callback_error()
-    void* usercode_error{nullptr};
+    void* user_code_error{nullptr};
 
     CallbackFailed()
         : RuntimeError(ErrorCodes::CallbackFailed, "User-provided callback failed")
     {
     }
 
-    CallbackFailed(void* str)
+    explicit CallbackFailed(void* error)
         : CallbackFailed()
     {
-        usercode_error = str;
+        user_code_error = error;
     }
 };
 
@@ -411,6 +411,13 @@ struct realm_dictionary : realm::c_api::WrapC, realm::object_store::Dictionary {
     }
 };
 
+struct realm_key_path_array : realm::c_api::WrapC, realm::KeyPathArray {
+    explicit realm_key_path_array(realm::KeyPathArray kpa)
+        : realm::KeyPathArray(std::move(kpa))
+    {
+    }
+};
+
 struct realm_object_changes : realm::c_api::WrapC, realm::CollectionChangeSet {
     explicit realm_object_changes(realm::CollectionChangeSet changes)
         : realm::CollectionChangeSet(std::move(changes))
@@ -562,6 +569,19 @@ struct realm_results : realm::c_api::WrapC, realm::Results {
 };
 
 #if REALM_ENABLE_SYNC
+
+struct realm_sync_user_subscription_token : realm::c_api::WrapC {
+    using Token = realm::Subscribable<realm::SyncUser>::Token;
+    realm_sync_user_subscription_token(std::shared_ptr<realm::SyncUser> user, Token&& token)
+        : user(user)
+        , token(std::move(token))
+    {
+    }
+    ~realm_sync_user_subscription_token();
+    std::shared_ptr<realm::SyncUser> user;
+    Token token;
+};
+
 struct realm_async_open_task_progress_notification_token : realm::c_api::WrapC {
     realm_async_open_task_progress_notification_token(std::shared_ptr<realm::AsyncOpenTask> task, uint64_t token)
         : task(task)

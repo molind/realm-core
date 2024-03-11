@@ -126,6 +126,7 @@ ClientHistory& get_history(DBRef db)
     return get_replication(db).get_history();
 }
 
+#if !REALM_MOBILE // the server is not implemented on devices
 TEST(Sync_BadVirtualPath)
 {
     // NOTE:  This test is no longer valid after migration to MongoDB Realm
@@ -2639,12 +2640,13 @@ TEST(Sync_Permissions)
 
     Session session_valid = fixture.make_bound_session(db_valid, "/valid", g_signed_test_user_token_for_path);
 
-    // Insert some dummy data
-    WriteTransaction wt_valid{db_valid};
-    wt_valid.get_group().add_table_with_primary_key("class_a", type_Int, "id");
-    session_valid.wait_for_upload_complete_or_client_stopped();
+    write_transaction(db_valid, [](WriteTransaction& wt) {
+        wt.get_group().add_table_with_primary_key("class_a", type_Int, "id");
+    });
 
+    auto completed = session_valid.wait_for_upload_complete_or_client_stopped();
     CHECK_NOT(did_see_error_for_valid);
+    CHECK(completed);
 }
 
 
@@ -5588,50 +5590,6 @@ TEST(Sync_ServerSideEncryption)
     CHECK(group.has_table("class_Test"));
 }
 
-
-// This test calls row_for_object_id() for various object ids and tests that
-// the right value is returned including that no assertions are hit.
-TEST(Sync_RowForGlobalKey)
-{
-    TEST_CLIENT_DB(db);
-
-    {
-        WriteTransaction wt(db);
-        TableRef table = wt.add_table("class_foo");
-        table->add_column(type_Int, "i");
-        wt.commit();
-    }
-
-    // Check that various object_ids are not in the table.
-    {
-        ReadTransaction rt(db);
-        ConstTableRef table = rt.get_table("class_foo");
-        CHECK(table);
-
-        // Default constructed GlobalKey
-        {
-            GlobalKey object_id;
-            auto row_ndx = table->get_objkey(object_id);
-            CHECK_NOT(row_ndx);
-        }
-
-        // GlobalKey with small lo and hi values
-        {
-            GlobalKey object_id{12, 24};
-            auto row_ndx = table->get_objkey(object_id);
-            CHECK_NOT(row_ndx);
-        }
-
-        // GlobalKey with lo and hi values past the 32 bit limit.
-        {
-            GlobalKey object_id{uint_fast64_t(1) << 50, uint_fast64_t(1) << 52};
-            auto row_ndx = table->get_objkey(object_id);
-            CHECK_NOT(row_ndx);
-        }
-    }
-}
-
-
 TEST(Sync_LogCompaction_EraseObject_LinkList)
 {
     TEST_DIR(dir);
@@ -5903,9 +5861,12 @@ NONCONCURRENT_TEST_TYPES(Sync_PrimaryKeyTypes, Int, String, ObjectId, UUID, util
 TEST(Sync_Mixed)
 {
     // Test replication and synchronization of Mixed values and lists.
-
-    TEST_CLIENT_DB(db_1);
-    TEST_CLIENT_DB(db_2);
+    DBOptions options;
+    options.logger = test_context.logger;
+    SHARED_GROUP_TEST_PATH(db_1_path);
+    SHARED_GROUP_TEST_PATH(db_2_path);
+    auto db_1 = DB::create(make_client_replication(), db_1_path, options);
+    auto db_2 = DB::create(make_client_replication(), db_2_path, options);
 
     TEST_DIR(dir);
     fixtures::ClientServerFixture fixture{dir, test_context};
@@ -5979,6 +5940,7 @@ TEST(Sync_Mixed)
     }
 }
 
+/*
 TEST(Sync_TypedLinks)
 {
     // Test replication and synchronization of Mixed values and lists.
@@ -6039,6 +6001,7 @@ TEST(Sync_TypedLinks)
         CHECK_EQUAL(l2.get_obj_key(), fops->begin()->get_key());
     }
 }
+*/
 
 TEST(Sync_Dictionary)
 {
@@ -6141,6 +6104,264 @@ TEST(Sync_Dictionary)
         CHECK_EQUAL(dict.size(), 0);
 
         CHECK(compare_groups(read_1, read_2));
+    }
+}
+
+TEST_IF(Sync_CollectionInMixed, sync::SYNC_SUPPORTS_NESTED_COLLECTIONS)
+{
+    TEST_CLIENT_DB(db_1);
+    TEST_CLIENT_DB(db_2);
+
+    TEST_DIR(dir);
+    fixtures::ClientServerFixture fixture{dir, test_context};
+    fixture.start();
+
+    Session session_1 = fixture.make_session(db_1, "/test");
+    Session session_2 = fixture.make_session(db_2, "/test");
+    session_1.bind();
+    session_2.bind();
+
+    Timestamp now{std::chrono::system_clock::now()};
+
+    write_transaction(db_1, [&](WriteTransaction& tr) {
+        auto& g = tr.get_group();
+        auto table = g.add_table_with_primary_key("class_Table", type_Int, "id");
+        auto col_any = table->add_column(type_Mixed, "any");
+
+        auto foo = table->create_object_with_primary_key(123);
+
+        // Create dictionary in Mixed property
+        foo.set_collection(col_any, CollectionType::Dictionary);
+        auto dict = foo.get_dictionary_ptr(col_any);
+        dict->insert("hello", "world");
+        dict->insert("cnt", 7);
+        dict->insert("when", now);
+        // Insert a List in a Dictionary
+        dict->insert_collection("list", CollectionType::List);
+        auto l = dict->get_list("list");
+        l->add(5);
+        l->insert_collection(1, CollectionType::List);
+        l->get_list(1)->add(7);
+
+        auto bar = table->create_object_with_primary_key(456);
+
+        // Create list in Mixed property
+        bar.set_collection(col_any, CollectionType::List);
+        auto list = bar.get_list_ptr<Mixed>(col_any);
+        list->add("John");
+        list->insert(0, 5);
+    });
+
+    session_1.wait_for_upload_complete_or_client_stopped();
+    session_2.wait_for_download_complete_or_client_stopped();
+
+    write_transaction(db_2, [&](WriteTransaction& tr) {
+        auto table = tr.get_table("class_Table");
+        auto col_any = table->get_column_key("any");
+        CHECK_EQUAL(table->size(), 2);
+
+        auto obj = table->get_object_with_primary_key(123);
+        auto dict = obj.get_dictionary_ptr(col_any);
+        CHECK(dict->get_value_data_type() == type_Mixed);
+        CHECK_EQUAL(dict->size(), 4);
+
+        // Check that values are replicated
+        Mixed val = dict->get("hello");
+        CHECK_EQUAL(val.get_string(), "world");
+        val = dict->get("cnt");
+        CHECK_EQUAL(val.get_int(), 7);
+        val = dict->get("when");
+        CHECK_EQUAL(val.get<Timestamp>(), now);
+        CHECK_EQUAL(dict->get_list("list")->get(0).get_int(), 5);
+
+        // Erase dictionary element
+        dict->erase("cnt");
+        // Replace dictionary element
+        dict->insert("hello", "goodbye");
+
+        obj = table->get_object_with_primary_key(456);
+        auto list = obj.get_list_ptr<Mixed>(col_any);
+        // Check that values are replicated
+        CHECK_EQUAL(list->get(0).get_int(), 5);
+        CHECK_EQUAL(list->get(1).get_string(), "John");
+        // Replace list element
+        list->set(1, "Paul");
+        // Erase list element
+        list->remove(0);
+    });
+
+    session_2.wait_for_upload_complete_or_client_stopped();
+    session_1.wait_for_download_complete_or_client_stopped();
+
+    write_transaction(db_1, [&](WriteTransaction& tr) {
+        auto table = tr.get_table("class_Table");
+        auto col_any = table->get_column_key("any");
+        CHECK_EQUAL(table->size(), 2);
+
+        auto obj = table->get_object_with_primary_key(123);
+        auto dict = obj.get_dictionary(col_any);
+        CHECK_EQUAL(dict.size(), 3);
+
+        Mixed val = dict["hello"];
+        CHECK_EQUAL(val.get_string(), "goodbye");
+        val = dict.get("when");
+        CHECK_EQUAL(val.get<Timestamp>(), now);
+
+        // Dictionary clear
+        dict.clear();
+
+        obj = table->get_object_with_primary_key(456);
+        auto list = obj.get_list_ptr<Mixed>(col_any);
+        CHECK_EQUAL(list->size(), 1);
+        CHECK_EQUAL(list->get(0).get_string(), "Paul");
+        // List clear
+        list->clear();
+    });
+
+    session_1.wait_for_upload_complete_or_client_stopped();
+    session_2.wait_for_download_complete_or_client_stopped();
+
+    write_transaction(db_2, [&](WriteTransaction& tr) {
+        auto table = tr.get_table("class_Table");
+        auto col_any = table->get_column_key("any");
+
+        CHECK_EQUAL(table->size(), 2);
+
+        auto obj = table->get_object_with_primary_key(123);
+        auto dict = obj.get_dictionary(col_any);
+        CHECK_EQUAL(dict.size(), 0);
+
+        // Replace dictionary with list on property
+        obj.set_collection(col_any, CollectionType::List);
+
+        obj = table->get_object_with_primary_key(456);
+        auto list = obj.get_list<Mixed>(col_any);
+        CHECK_EQUAL(list.size(), 0);
+        // Replace list with Dictionary on property
+        obj.set_collection(col_any, CollectionType::Dictionary);
+
+    });
+
+    session_2.wait_for_upload_complete_or_client_stopped();
+    session_1.wait_for_download_complete_or_client_stopped();
+
+    {
+        ReadTransaction read_1{db_1};
+        ReadTransaction read_2{db_2};
+
+        auto table = read_2.get_table("class_Table");
+        auto col_any = table->get_column_key("any");
+
+        CHECK_EQUAL(table->size(), 2);
+
+        auto obj = table->get_object_with_primary_key(123);
+        auto list = obj.get_list<Mixed>(col_any);
+        CHECK_EQUAL(list.size(), 0);
+
+        obj = table->get_object_with_primary_key(456);
+        auto dict = obj.get_dictionary(col_any);
+        CHECK_EQUAL(dict.size(), 0);
+
+        CHECK(compare_groups(read_1, read_2));
+    }
+}
+
+TEST_IF(Sync_CollectionInCollection, SYNC_SUPPORTS_NESTED_COLLECTIONS)
+{
+    TEST_CLIENT_DB(db_1);
+    TEST_CLIENT_DB(db_2);
+
+    TEST_DIR(dir);
+    fixtures::ClientServerFixture fixture{dir, test_context};
+    fixture.start();
+
+    Session session_1 = fixture.make_session(db_1, "/test");
+    Session session_2 = fixture.make_session(db_2, "/test");
+    session_1.bind();
+    session_2.bind();
+
+    Timestamp now{std::chrono::system_clock::now()};
+
+    write_transaction(db_1, [&](WriteTransaction& tr) {
+        auto& g = tr.get_group();
+        auto table = g.add_table_with_primary_key("class_Table", type_Int, "id");
+        auto col_any = table->add_column(type_Mixed, "any");
+
+        auto foo = table->create_object_with_primary_key(123);
+
+        // Create dictionary in Mixed property
+        foo.set_collection(col_any, CollectionType::Dictionary);
+        auto dict = foo.get_dictionary_ptr(col_any);
+        dict->insert("hello", "world");
+        dict->insert("cnt", 7);
+        dict->insert("when", now);
+        // Insert a List in a Dictionary
+        dict->insert_collection("collection", CollectionType::List);
+        auto l = dict->get_list("collection");
+        l->add(5);
+
+        auto bar = table->create_object_with_primary_key(456);
+
+        // Create list in Mixed property
+        bar.set_collection(col_any, CollectionType::List);
+        auto list = bar.get_list_ptr<Mixed>(col_any);
+        list->add("John");
+        list->insert(0, 5);
+        // Insert dictionary in List
+        list->insert_collection(2, CollectionType::Dictionary);
+        auto d = list->get_dictionary(2);
+        d->insert("One", 1);
+        d->insert("Two", 2);
+    });
+
+    session_1.wait_for_upload_complete_or_client_stopped();
+    session_2.wait_for_download_complete_or_client_stopped();
+
+    write_transaction(db_2, [&](WriteTransaction& tr) {
+        auto table = tr.get_table("class_Table");
+        auto col_any = table->get_column_key("any");
+        CHECK_EQUAL(table->size(), 2);
+
+        auto obj = table->get_object_with_primary_key(123);
+        auto dict = obj.get_dictionary_ptr(col_any);
+        CHECK(dict->get_value_data_type() == type_Mixed);
+        CHECK_EQUAL(dict->size(), 4);
+
+        // Replace List with Dictionary
+        dict->insert_collection("collection", CollectionType::Dictionary);
+        auto d = dict->get_dictionary("collection");
+        d->insert("Three", 3);
+        d->insert("Four", 4);
+
+        obj = table->get_object_with_primary_key(456);
+        auto list = obj.get_list_ptr<Mixed>(col_any);
+        // Replace Dictionary with List
+        list->set_collection(2, CollectionType::List);
+        auto l = list->get_list(2);
+        l->add(47);
+    });
+
+    session_2.wait_for_upload_complete_or_client_stopped();
+    session_1.wait_for_download_complete_or_client_stopped();
+
+    {
+        ReadTransaction read_1{db_1};
+        ReadTransaction read_2{db_2};
+
+        auto table = read_2.get_table("class_Table");
+        auto col_any = table->get_column_key("any");
+
+        CHECK_EQUAL(table->size(), 2);
+
+        auto obj = table->get_object_with_primary_key(123);
+        auto dict = obj.get_dictionary_ptr(col_any);
+        auto d = dict->get_dictionary("collection");
+        CHECK_EQUAL(d->get("Four").get_int(), 4);
+
+        obj = table->get_object_with_primary_key(456);
+        auto list = obj.get_list_ptr<Mixed>(col_any);
+        auto l = list->get_list(2);
+        CHECK_EQUAL(l->get_any(0).get_int(), 47);
     }
 }
 
@@ -6364,89 +6585,6 @@ TEST(Sync_Set)
     }
 }
 
-TEST(Sync_DanglingLinksCountInPriorSize)
-{
-    SHARED_GROUP_TEST_PATH(path);
-    ClientReplication repl;
-    auto local_db = realm::DB::create(repl, path);
-    auto& history = repl.get_history();
-    history.set_client_file_ident(sync::SaltedFileIdent{1, 123456}, true);
-
-    version_type last_version, last_version_observed = 0;
-    auto dump_uploadable = [&] {
-        UploadCursor upload_cursor{last_version_observed, 0};
-        std::vector<sync::ClientHistory::UploadChangeset> changesets_to_upload;
-        version_type locked_server_version = 0;
-        history.find_uploadable_changesets(upload_cursor, last_version, changesets_to_upload, locked_server_version);
-        CHECK_EQUAL(changesets_to_upload.size(), static_cast<size_t>(1));
-        realm::sync::Changeset parsed_changeset;
-        auto unparsed_changeset = changesets_to_upload[0].changeset.get_first_chunk();
-        realm::util::SimpleInputStream changeset_stream(unparsed_changeset);
-        realm::sync::parse_changeset(changeset_stream, parsed_changeset);
-        test_context.logger->info("changeset at version %1: %2", last_version, parsed_changeset);
-        last_version_observed = last_version;
-        return parsed_changeset;
-    };
-
-    TableKey source_table_key, target_table_key;
-    {
-        auto wt = local_db->start_write();
-        auto source_table = wt->add_table_with_primary_key("class_source", type_String, "_id");
-        auto target_table = wt->add_table_with_primary_key("class_target", type_String, "_id");
-        source_table->add_column_list(*target_table, "links");
-
-        source_table_key = source_table->get_key();
-        target_table_key = target_table->get_key();
-
-        auto obj_to_keep = target_table->create_object_with_primary_key(std::string{"target1"});
-        auto obj_to_delete = target_table->create_object_with_primary_key(std::string{"target2"});
-        auto source_obj = source_table->create_object_with_primary_key(std::string{"source"});
-
-        auto links_list = source_obj.get_linklist("links");
-        links_list.add(obj_to_keep.get_key());
-        links_list.add(obj_to_delete.get_key());
-        last_version = wt->commit();
-    }
-
-    dump_uploadable();
-
-    {
-        // Simulate removing the object via the sync client so we get a dangling link
-        TempShortCircuitReplication disable_repl(repl);
-        auto wt = local_db->start_write();
-        auto target_table = wt->get_table(target_table_key);
-        auto obj = target_table->get_object_with_primary_key(std::string{"target2"});
-        obj.invalidate();
-        last_version = wt->commit();
-    }
-
-    {
-        auto wt = local_db->start_write();
-        auto source_table = wt->get_table(source_table_key);
-        auto target_table = wt->get_table(target_table_key);
-
-        auto obj_to_add = target_table->create_object_with_primary_key(std::string{"target3"});
-
-        auto source_obj = source_table->get_object_with_primary_key(std::string{"source"});
-        auto links_list = source_obj.get_linklist("links");
-        links_list.add(obj_to_add.get_key());
-        last_version = wt->commit();
-    }
-
-    auto changeset = dump_uploadable();
-    CHECK_EQUAL(changeset.size(), static_cast<size_t>(2));
-    auto changeset_it = changeset.end();
-    --changeset_it;
-    auto last_instr = *changeset_it;
-    CHECK_EQUAL(last_instr->type(), Instruction::Type::ArrayInsert);
-    auto arr_insert_instr = last_instr->get_as<Instruction::ArrayInsert>();
-    CHECK_EQUAL(changeset.get_string(arr_insert_instr.table), StringData("source"));
-    CHECK(arr_insert_instr.value.type == sync::instr::Payload::Type::Link);
-    CHECK_EQUAL(changeset.get_string(mpark::get<InternString>(arr_insert_instr.value.data.link.target)),
-                StringData("target3"));
-    CHECK_EQUAL(arr_insert_instr.prior_size, 2);
-}
-
 TEST(Sync_BundledRealmFile)
 {
     TEST_CLIENT_DB(db);
@@ -6475,10 +6613,12 @@ TEST(Sync_BundledRealmFile)
 
 TEST(Sync_UpgradeToClientHistory)
 {
-    SHARED_GROUP_TEST_PATH(db1_path);
-    SHARED_GROUP_TEST_PATH(db2_path);
-    auto db_1 = DB::create(make_in_realm_history(), db1_path);
-    auto db_2 = DB::create(make_in_realm_history(), db2_path);
+    DBOptions options;
+    options.logger = test_context.logger;
+    SHARED_GROUP_TEST_PATH(db_1_path);
+    SHARED_GROUP_TEST_PATH(db_2_path);
+    auto db_1 = DB::create(make_in_realm_history(), db_1_path, options);
+    auto db_2 = DB::create(make_in_realm_history(), db_2_path, options);
     {
         auto tr = db_1->start_write();
 
@@ -6514,16 +6654,23 @@ TEST(Sync_UpgradeToClientHistory)
 
         auto list = baa.get_list<Int>(col_list);
         list.add(1);
+        list.add(0);
         list.add(2);
         list.add(3);
+        list.set(1, 5);
+        list.remove(1);
         auto set = baa.get_set<Int>(col_set);
         set.insert(4);
+        set.insert(2);
         set.insert(5);
         set.insert(6);
+        set.erase(2);
         auto dict = baa.get_dictionary(col_dict);
+        dict.insert("key6", 6);
         dict.insert("key7", 7);
         dict.insert("key8", 8);
         dict.insert("key9", 9);
+        dict.erase("key6");
 
         for (int i = 0; i < 100; i++) {
             foobaas->create_object_with_primary_key(ObjectId::gen()).set(col_time, Timestamp(::time(nullptr), i));
@@ -6631,108 +6778,6 @@ TEST(Sync_MergeStringPrimaryKey)
     }
 }
 
-TEST(Sync_NonIncreasingServerVersions)
-{
-    TEST_CLIENT_DB(db);
-
-    auto& history = get_history(db);
-    history.set_client_file_ident(SaltedFileIdent{2, 0x1234567812345678}, false);
-    timestamp_type timestamp{1};
-    history.set_local_origin_timestamp_source([&] {
-        return ++timestamp;
-    });
-
-    auto latest_local_version = [&] {
-        auto tr = db->start_write();
-        tr->add_table_with_primary_key("class_foo", type_String, "_id")->add_column(type_Int, "int_col");
-        return tr->commit();
-    }();
-
-    std::vector<Changeset> server_changesets;
-    auto prep_changeset = [&](auto pk_name, auto int_col_val) {
-        Changeset changeset;
-        changeset.version = 10;
-        changeset.last_integrated_remote_version = latest_local_version - 1;
-        changeset.origin_timestamp = ++timestamp;
-        changeset.origin_file_ident = 1;
-        instr::PrimaryKey pk{changeset.intern_string(pk_name)};
-        auto table_name = changeset.intern_string("foo");
-        auto col_name = changeset.intern_string("int_col");
-        instr::EraseObject erase_1;
-        erase_1.object = pk;
-        erase_1.table = table_name;
-        changeset.push_back(erase_1);
-        instr::CreateObject create_1;
-        create_1.object = pk;
-        create_1.table = table_name;
-        changeset.push_back(create_1);
-        instr::Update update_1;
-        update_1.table = table_name;
-        update_1.object = pk;
-        update_1.field = col_name;
-        update_1.value = instr::Payload{int64_t(int_col_val)};
-        changeset.push_back(update_1);
-        server_changesets.push_back(std::move(changeset));
-    };
-    prep_changeset("bizz", 1);
-    prep_changeset("buzz", 2);
-    prep_changeset("baz", 3);
-    prep_changeset("bar", 4);
-    ++server_changesets.back().version;
-
-    std::vector<ChangesetEncoder::Buffer> encoded;
-    std::vector<RemoteChangeset> server_changesets_encoded;
-    for (const auto& changeset : server_changesets) {
-        encoded.emplace_back();
-        encode_changeset(changeset, encoded.back());
-        server_changesets_encoded.emplace_back(changeset.version, changeset.last_integrated_remote_version,
-                                               BinaryData(encoded.back().data(), encoded.back().size()),
-                                               changeset.origin_timestamp, changeset.origin_file_ident);
-    }
-
-    SyncProgress progress = {};
-    progress.download.server_version = server_changesets.back().version;
-    progress.download.last_integrated_client_version = latest_local_version - 1;
-    progress.latest_server_version.version = server_changesets.back().version;
-    progress.latest_server_version.salt = 0x7876543217654321;
-
-    uint_fast64_t downloadable_bytes = 0;
-    VersionInfo version_info;
-    auto transact = db->start_read();
-    history.integrate_server_changesets(progress, &downloadable_bytes, server_changesets_encoded, version_info,
-                                        DownloadBatchState::SteadyState, *test_context.logger, transact);
-}
-
-TEST(Sync_InvalidChangesetFromServer)
-{
-    TEST_CLIENT_DB(db);
-
-    auto& history = get_history(db);
-    history.set_client_file_ident(SaltedFileIdent{2, 0x1234567812345678}, false);
-
-    instr::CreateObject bad_instr;
-    bad_instr.object = InternString{1};
-    bad_instr.table = InternString{2};
-
-    Changeset changeset;
-    changeset.push_back(bad_instr);
-
-    ChangesetEncoder::Buffer encoded;
-    encode_changeset(changeset, encoded);
-    RemoteChangeset server_changeset;
-    server_changeset.origin_file_ident = 1;
-    server_changeset.remote_version = 1;
-    server_changeset.data = BinaryData(encoded.data(), encoded.size());
-
-    VersionInfo version_info;
-    auto transact = db->start_read();
-    CHECK_THROW_EX(history.integrate_server_changesets({}, nullptr, util::Span(&server_changeset, 1), version_info,
-                                                       DownloadBatchState::SteadyState, *test_context.logger,
-                                                       transact),
-                   sync::IntegrationException,
-                   StringData(e.what()).contains("Failed to parse received changeset: Invalid interned string"));
-}
-
 TEST(Sync_DifferentUsersMultiplexing)
 {
     ClientServerFixture::Config fixture_config;
@@ -6775,6 +6820,92 @@ TEST(Sync_DifferentUsersMultiplexing)
     CHECK_NOT_EQUAL(user_1_sess_2.sess.get_appservices_connection_id(),
                     user_2_sess_2.sess.get_appservices_connection_id());
 }
+
+TEST(Sync_TransformAgainstEmptyReciprocalChangeset)
+{
+    TEST_CLIENT_DB(seed_db);
+    TEST_CLIENT_DB(db_1);
+    TEST_CLIENT_DB(db_2);
+
+    {
+        auto tr = seed_db->start_write();
+        // Create schema: single table with array of ints as property.
+        auto table = tr->add_table_with_primary_key("class_table", type_Int, "_id");
+        table->add_column_list(type_Int, "ints");
+        table->add_column(type_String, "string");
+        tr->commit_and_continue_writing();
+
+        // Create object and initialize array.
+        table = tr->get_table("class_table");
+        auto obj = table->create_object_with_primary_key(42);
+        auto ints = obj.get_list<int64_t>("ints");
+        for (auto i = 0; i < 8; ++i) {
+            ints.insert(i, i);
+        }
+        tr->commit();
+    }
+
+    {
+        TEST_DIR(dir);
+        MultiClientServerFixture fixture(3, 1, dir, test_context);
+        fixture.start();
+
+        util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
+        util::Optional<Session> db_1_session = fixture.make_bound_session(1, db_1, 0, "/test");
+        util::Optional<Session> db_2_session = fixture.make_bound_session(2, db_2, 0, "/test");
+
+        seed_session->wait_for_upload_complete_or_client_stopped();
+        db_1_session->wait_for_download_complete_or_client_stopped();
+        db_2_session->wait_for_download_complete_or_client_stopped();
+        seed_session.reset();
+        db_2_session.reset();
+
+        auto move_element = [&](const DBRef& db, size_t from, size_t to, size_t string_size = 0) {
+            auto wt = db->start_write();
+            auto table = wt->get_table("class_table");
+            auto obj = table->get_object_with_primary_key(42);
+            auto ints = obj.get_list<int64_t>("ints");
+            ints.move(from, to);
+            obj.set("string", std::string(string_size, 'a'));
+            wt->commit();
+        };
+
+        // Client 1 uploads two move instructions.
+        move_element(db_1, 7, 2);
+        move_element(db_1, 7, 6);
+
+        db_1_session->wait_for_upload_complete_or_client_stopped();
+
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+
+        // Client 2 uploads two move instructions.
+        // The sync client uploads at most 128 KB of data so we make the first changeset large enough so two upload
+        // messages are sent to the server instead of one. Each change is transformed against the changes from
+        // Client 1.
+
+        // First change discards the first change (move(7, 2)) of Client 1.
+        move_element(db_2, 7, 0, 200 * 1024);
+        // Second change is tranformed against an empty reciprocal changeset as result of the change above.
+        move_element(db_2, 7, 5);
+        db_2_session = fixture.make_bound_session(2, db_2, 0, "/test");
+
+        db_1_session->wait_for_upload_complete_or_client_stopped();
+        db_2_session->wait_for_upload_complete_or_client_stopped();
+
+        db_1_session->wait_for_download_complete_or_client_stopped();
+        db_2_session->wait_for_download_complete_or_client_stopped();
+    }
+
+    ReadTransaction rt_1(db_1);
+    ReadTransaction rt_2(db_2);
+    const Group& group_1 = rt_1;
+    const Group& group_2 = rt_2;
+    group_1.verify();
+    group_2.verify();
+    CHECK(compare_groups(rt_1, rt_2));
+}
+
+#endif // !REALM_MOBILE
 
 // Tests that an empty reciprocal changesets is set and retrieved correctly.
 TEST(Sync_SetAndGetEmptyReciprocalChangeset)
@@ -6865,88 +6996,34 @@ TEST(Sync_SetAndGetEmptyReciprocalChangeset)
     CHECK(reciprocal_changeset.empty());
 }
 
-TEST(Sync_TransformAgainstEmptyReciprocalChangeset)
+TEST(Sync_InvalidChangesetFromServer)
 {
-    TEST_CLIENT_DB(seed_db);
-    TEST_CLIENT_DB(db_1);
-    TEST_CLIENT_DB(db_2);
+    TEST_CLIENT_DB(db);
 
-    {
-        auto tr = seed_db->start_write();
-        // Create schema: single table with array of ints as property.
-        auto table = tr->add_table_with_primary_key("class_table", type_Int, "_id");
-        table->add_column_list(type_Int, "ints");
-        table->add_column(type_String, "string");
-        tr->commit_and_continue_writing();
+    auto& history = get_history(db);
+    history.set_client_file_ident(SaltedFileIdent{2, 0x1234567812345678}, false);
 
-        // Create object and initialize array.
-        table = tr->get_table("class_table");
-        auto obj = table->create_object_with_primary_key(42);
-        auto ints = obj.get_list<int64_t>("ints");
-        for (auto i = 0; i < 8; ++i) {
-            ints.insert(i, i);
-        }
-        tr->commit();
-    }
+    instr::CreateObject bad_instr;
+    bad_instr.object = InternString{1};
+    bad_instr.table = InternString{2};
 
-    {
-        TEST_DIR(dir);
-        MultiClientServerFixture fixture(3, 1, dir, test_context);
-        fixture.start();
+    Changeset changeset;
+    changeset.push_back(bad_instr);
 
-        util::Optional<Session> seed_session = fixture.make_bound_session(0, seed_db, 0, "/test");
-        util::Optional<Session> db_1_session = fixture.make_bound_session(1, db_1, 0, "/test");
-        util::Optional<Session> db_2_session = fixture.make_bound_session(2, db_2, 0, "/test");
+    ChangesetEncoder::Buffer encoded;
+    encode_changeset(changeset, encoded);
+    RemoteChangeset server_changeset;
+    server_changeset.origin_file_ident = 1;
+    server_changeset.remote_version = 1;
+    server_changeset.data = BinaryData(encoded.data(), encoded.size());
 
-        seed_session->wait_for_upload_complete_or_client_stopped();
-        db_1_session->wait_for_download_complete_or_client_stopped();
-        db_2_session->wait_for_download_complete_or_client_stopped();
-        seed_session.reset();
-        db_2_session.reset();
-
-        auto move_element = [&](const DBRef& db, size_t from, size_t to, size_t string_size = 0) {
-            auto wt = db->start_write();
-            auto table = wt->get_table("class_table");
-            auto obj = table->get_object_with_primary_key(42);
-            auto ints = obj.get_list<int64_t>("ints");
-            ints.move(from, to);
-            obj.set("string", std::string(string_size, 'a'));
-            wt->commit();
-        };
-
-        // Client 1 uploads two move instructions.
-        move_element(db_1, 7, 2);
-        move_element(db_1, 7, 6);
-
-        db_1_session->wait_for_upload_complete_or_client_stopped();
-
-        std::this_thread::sleep_for(std::chrono::milliseconds{10});
-
-        // Client 2 uploads two move instructions.
-        // The sync client uploads at most 128 KB of data so we make the first changeset large enough so two upload
-        // messages are sent to the server instead of one. Each change is transformed against the changes from
-        // Client 1.
-
-        // First change discards the first change (move(7, 2)) of Client 1.
-        move_element(db_2, 7, 0, 200 * 1024);
-        // Second change is tranformed against an empty reciprocal changeset as result of the change above.
-        move_element(db_2, 7, 5);
-        db_2_session = fixture.make_bound_session(2, db_2, 0, "/test");
-
-        db_1_session->wait_for_upload_complete_or_client_stopped();
-        db_2_session->wait_for_upload_complete_or_client_stopped();
-
-        db_1_session->wait_for_download_complete_or_client_stopped();
-        db_2_session->wait_for_download_complete_or_client_stopped();
-    }
-
-    ReadTransaction rt_1(db_1);
-    ReadTransaction rt_2(db_2);
-    const Group& group_1 = rt_1;
-    const Group& group_2 = rt_2;
-    group_1.verify();
-    group_2.verify();
-    CHECK(compare_groups(rt_1, rt_2, *test_context.logger));
+    VersionInfo version_info;
+    auto transact = db->start_read();
+    CHECK_THROW_EX(history.integrate_server_changesets({}, nullptr, util::Span(&server_changeset, 1), version_info,
+                                                       DownloadBatchState::SteadyState, *test_context.logger,
+                                                       transact),
+                   sync::IntegrationException,
+                   StringData(e.what()).contains("Failed to parse received changeset: Invalid interned string"));
 }
 
 TEST(Sync_ServerVersionsSkippedFromDownloadCursor)
@@ -7008,5 +7085,203 @@ TEST(Sync_ServerVersionsSkippedFromDownloadCursor)
     CHECK_EQUAL(progress.upload.last_integrated_server_version,
                 expected_progress.upload.last_integrated_server_version);
 }
+
+TEST(Sync_NonIncreasingServerVersions)
+{
+    TEST_CLIENT_DB(db);
+
+    auto& history = get_history(db);
+    history.set_client_file_ident(SaltedFileIdent{2, 0x1234567812345678}, false);
+    timestamp_type timestamp{1};
+    history.set_local_origin_timestamp_source([&] {
+        return ++timestamp;
+    });
+
+    auto latest_local_version = [&] {
+        auto tr = db->start_write();
+        tr->add_table_with_primary_key("class_foo", type_String, "_id")->add_column(type_Int, "int_col");
+        return tr->commit();
+    }();
+
+    std::vector<Changeset> server_changesets;
+    auto prep_changeset = [&](auto pk_name, auto int_col_val) {
+        Changeset changeset;
+        changeset.version = 10;
+        changeset.last_integrated_remote_version = latest_local_version - 1;
+        changeset.origin_timestamp = ++timestamp;
+        changeset.origin_file_ident = 1;
+        instr::PrimaryKey pk{changeset.intern_string(pk_name)};
+        auto table_name = changeset.intern_string("foo");
+        auto col_name = changeset.intern_string("int_col");
+        instr::EraseObject erase_1;
+        erase_1.object = pk;
+        erase_1.table = table_name;
+        changeset.push_back(erase_1);
+        instr::CreateObject create_1;
+        create_1.object = pk;
+        create_1.table = table_name;
+        changeset.push_back(create_1);
+        instr::Update update_1;
+        update_1.table = table_name;
+        update_1.object = pk;
+        update_1.field = col_name;
+        update_1.value = instr::Payload{int64_t(int_col_val)};
+        changeset.push_back(update_1);
+        server_changesets.push_back(std::move(changeset));
+    };
+    prep_changeset("bizz", 1);
+    prep_changeset("buzz", 2);
+    prep_changeset("baz", 3);
+    prep_changeset("bar", 4);
+    ++server_changesets.back().version;
+
+    std::vector<ChangesetEncoder::Buffer> encoded;
+    std::vector<RemoteChangeset> server_changesets_encoded;
+    for (const auto& changeset : server_changesets) {
+        encoded.emplace_back();
+        encode_changeset(changeset, encoded.back());
+        server_changesets_encoded.emplace_back(changeset.version, changeset.last_integrated_remote_version,
+                                               BinaryData(encoded.back().data(), encoded.back().size()),
+                                               changeset.origin_timestamp, changeset.origin_file_ident);
+    }
+
+    SyncProgress progress = {};
+    progress.download.server_version = server_changesets.back().version;
+    progress.download.last_integrated_client_version = latest_local_version - 1;
+    progress.latest_server_version.version = server_changesets.back().version;
+    progress.latest_server_version.salt = 0x7876543217654321;
+
+    uint_fast64_t downloadable_bytes = 0;
+    VersionInfo version_info;
+    auto transact = db->start_read();
+    history.integrate_server_changesets(progress, &downloadable_bytes, server_changesets_encoded, version_info,
+                                        DownloadBatchState::SteadyState, *test_context.logger, transact);
+}
+
+TEST(Sync_DanglingLinksCountInPriorSize)
+{
+    SHARED_GROUP_TEST_PATH(path);
+    ClientReplication repl;
+    auto local_db = realm::DB::create(repl, path);
+    auto& history = repl.get_history();
+    history.set_client_file_ident(sync::SaltedFileIdent{1, 123456}, true);
+
+    version_type last_version, last_version_observed = 0;
+    auto dump_uploadable = [&] {
+        UploadCursor upload_cursor{last_version_observed, 0};
+        std::vector<sync::ClientHistory::UploadChangeset> changesets_to_upload;
+        version_type locked_server_version = 0;
+        history.find_uploadable_changesets(upload_cursor, last_version, changesets_to_upload, locked_server_version);
+        CHECK_EQUAL(changesets_to_upload.size(), static_cast<size_t>(1));
+        realm::sync::Changeset parsed_changeset;
+        auto unparsed_changeset = changesets_to_upload[0].changeset.get_first_chunk();
+        realm::util::SimpleInputStream changeset_stream(unparsed_changeset);
+        realm::sync::parse_changeset(changeset_stream, parsed_changeset);
+        test_context.logger->info("changeset at version %1: %2", last_version, parsed_changeset);
+        last_version_observed = last_version;
+        return parsed_changeset;
+    };
+
+    TableKey source_table_key, target_table_key;
+    {
+        auto wt = local_db->start_write();
+        auto source_table = wt->add_table_with_primary_key("class_source", type_String, "_id");
+        auto target_table = wt->add_table_with_primary_key("class_target", type_String, "_id");
+        source_table->add_column_list(*target_table, "links");
+
+        source_table_key = source_table->get_key();
+        target_table_key = target_table->get_key();
+
+        auto obj_to_keep = target_table->create_object_with_primary_key(std::string{"target1"});
+        auto obj_to_delete = target_table->create_object_with_primary_key(std::string{"target2"});
+        auto source_obj = source_table->create_object_with_primary_key(std::string{"source"});
+
+        auto links_list = source_obj.get_linklist("links");
+        links_list.add(obj_to_keep.get_key());
+        links_list.add(obj_to_delete.get_key());
+        last_version = wt->commit();
+    }
+
+    dump_uploadable();
+
+    {
+        // Simulate removing the object via the sync client so we get a dangling link
+        TempShortCircuitReplication disable_repl(repl);
+        auto wt = local_db->start_write();
+        auto target_table = wt->get_table(target_table_key);
+        auto obj = target_table->get_object_with_primary_key(std::string{"target2"});
+        obj.invalidate();
+        last_version = wt->commit();
+    }
+
+    {
+        auto wt = local_db->start_write();
+        auto source_table = wt->get_table(source_table_key);
+        auto target_table = wt->get_table(target_table_key);
+
+        auto obj_to_add = target_table->create_object_with_primary_key(std::string{"target3"});
+
+        auto source_obj = source_table->get_object_with_primary_key(std::string{"source"});
+        auto links_list = source_obj.get_linklist("links");
+        links_list.add(obj_to_add.get_key());
+        last_version = wt->commit();
+    }
+
+    auto changeset = dump_uploadable();
+    CHECK_EQUAL(changeset.size(), static_cast<size_t>(2));
+    auto changeset_it = changeset.end();
+    --changeset_it;
+    auto last_instr = *changeset_it;
+    CHECK_EQUAL(last_instr->type(), Instruction::Type::ArrayInsert);
+    auto arr_insert_instr = last_instr->get_as<Instruction::ArrayInsert>();
+    CHECK_EQUAL(changeset.get_string(arr_insert_instr.table), StringData("source"));
+    CHECK(arr_insert_instr.value.type == sync::instr::Payload::Type::Link);
+    CHECK_EQUAL(changeset.get_string(mpark::get<InternString>(arr_insert_instr.value.data.link.target)),
+                StringData("target3"));
+    CHECK_EQUAL(arr_insert_instr.prior_size, 2);
+}
+
+// This test calls row_for_object_id() for various object ids and tests that
+// the right value is returned including that no assertions are hit.
+TEST(Sync_RowForGlobalKey)
+{
+    TEST_CLIENT_DB(db);
+
+    {
+        WriteTransaction wt(db);
+        TableRef table = wt.add_table("class_foo");
+        table->add_column(type_Int, "i");
+        wt.commit();
+    }
+
+    // Check that various object_ids are not in the table.
+    {
+        ReadTransaction rt(db);
+        ConstTableRef table = rt.get_table("class_foo");
+        CHECK(table);
+
+        // Default constructed GlobalKey
+        {
+            GlobalKey object_id;
+            auto row_ndx = table->get_objkey(object_id);
+            CHECK_NOT(row_ndx);
+        }
+
+        // GlobalKey with small lo and hi values
+        {
+            GlobalKey object_id{12, 24};
+            auto row_ndx = table->get_objkey(object_id);
+            CHECK_NOT(row_ndx);
+        }
+
+        // GlobalKey with lo and hi values past the 32 bit limit.
+        {
+            GlobalKey object_id{uint_fast64_t(1) << 50, uint_fast64_t(1) << 52};
+            auto row_ndx = table->get_objkey(object_id);
+            CHECK_NOT(row_ndx);
+        }
+    }
+}
+
 
 } // unnamed namespace

@@ -42,6 +42,8 @@ class WeakRealmNotifier;
 // RealmCoordinator manages the weak cache of Realm instances and communication
 // between per-thread Realm instances for a given file
 class RealmCoordinator : public std::enable_shared_from_this<RealmCoordinator>, DB::CommitListener {
+    struct Private {};
+
 public:
     // Get the coordinator for the given path, creating it if neccesary
     static std::shared_ptr<RealmCoordinator> get_coordinator(StringData path);
@@ -153,8 +155,9 @@ public:
     // Verify that there are no Realms open for any paths
     static void assert_no_open_realms() noexcept;
 
-    // Explicit constructor/destructor needed for the unique_ptrs to forward-declared types
-    RealmCoordinator();
+    explicit RealmCoordinator(Private);
+    RealmCoordinator(const RealmCoordinator&) = delete;
+    RealmCoordinator& operator=(const RealmCoordinator&) = delete;
     ~RealmCoordinator();
 
     // Called by Realm's destructor to ensure the cache is cleaned up promptly
@@ -230,7 +233,7 @@ private:
     Realm::Config m_config;
     std::shared_ptr<DB> m_db;
 
-    mutable util::CheckedMutex m_schema_cache_mutex;
+    util::CheckedMutex m_schema_cache_mutex;
     util::Optional<Schema> m_cached_schema GUARDED_BY(m_schema_cache_mutex);
     uint64_t m_schema_version GUARDED_BY(m_schema_cache_mutex) = -1;
     uint64_t m_schema_transaction_version_min GUARDED_BY(m_schema_cache_mutex) = 0;
