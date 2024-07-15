@@ -445,7 +445,7 @@ bool ServerHistory::integrate_client_changesets(const IntegratableChangesets& in
                 // Regular changeset
                 const IntegratableChangeset& ic = *result.integrated_changesets[changeset_ndx];
                 std::string hex_dump = util::hex_dump(ic.changeset.data(),
-                                                      ic.changeset.size()); // Throws
+                                                      std::min(ic.changeset.size(), size_t(512))); // Throws
                 logger.error("Failed transaction (part %1/%2): Changeset "
                              "(client_file_ident=%3, origin_timestamp=%4, "
                              "origin_file_ident=%5, client_version=%6, "
