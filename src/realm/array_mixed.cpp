@@ -215,7 +215,15 @@ void ArrayMixed::clear()
     Array::set(payload_idx_int, 0);
     Array::set(payload_idx_pair, 0);
     Array::set(payload_idx_str, 0);
-    Array::set(payload_idx_ref, 0);
+    if (Array::size() > payload_idx_ref) {
+        Array::set(payload_idx_ref, 0);
+    }
+    if (Array::size() > payload_idx_key) {
+        if (auto ref = Array::get_as_ref(payload_idx_key)) {
+            Array::destroy(ref, m_composite.get_alloc());
+            Array::set(payload_idx_key, 0);
+        }
+    }
 }
 
 void ArrayMixed::erase(size_t ndx)
@@ -236,6 +244,7 @@ void ArrayMixed::move(ArrayMixed& dst, size_t ndx)
 {
     auto sz = size();
     size_t i = ndx;
+    const size_t original_dst_size = dst.size();
     while (i < sz) {
         auto val = get(i++);
         dst.add(val);
@@ -246,7 +255,7 @@ void ArrayMixed::move(ArrayMixed& dst, size_t ndx)
             Array keys(Array::get_alloc());
             keys.set_parent(const_cast<ArrayMixed*>(this), payload_idx_key);
             keys.init_from_ref(ref);
-            for (size_t j = 0, i = ndx; i < sz; i++, j++) {
+            for (size_t j = original_dst_size, i = ndx; i < sz; i++, j++) {
                 dst.set_key(j, keys.get(i));
             }
             keys.truncate(ndx);
@@ -289,9 +298,12 @@ bool ArrayMixed::ensure_keys()
 
 size_t ArrayMixed::find_key(int64_t key) const noexcept
 {
-    Array keys(Array::get_alloc());
-    ensure_array_accessor(keys, payload_idx_key);
-    return keys.find_first(key);
+    if (ref_type ref = get_as_ref(payload_idx_key)) {
+        Array keys(Array::get_alloc());
+        keys.init_from_ref(ref);
+        return keys.find_first(key);
+    }
+    return realm::not_found;
 }
 
 void ArrayMixed::set_key(size_t ndx, int64_t key)
@@ -550,7 +562,7 @@ int64_t ArrayMixed::store(const Mixed& value)
             break;
         }
         default:
-            REALM_ASSERT(type == type_List || type == type_Dictionary || type == type_Set);
+            REALM_ASSERT(type == type_List || type == type_Dictionary);
             ensure_ref_array();
             size_t ndx = m_refs.size();
             m_refs.add(value.get_ref());

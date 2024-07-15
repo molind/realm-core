@@ -85,13 +85,13 @@ const bool generate_all = false;
 void setup_multi_table(Table& table, size_t rows)
 {
     // Create table with all column types
-    table.add_column(type_Int, "int");                                     //  0
-    table.add_column(type_Bool, "bool");                                   //  1
-    table.add_column(type_Timestamp, "date");                              //  2
-    table.add_column(type_Float, "float");                                 //  3
-    table.add_column(type_Double, "double");                               //  4
-    table.add_column(type_String, "string");                               //  5
-    table.add_column(type_String, "string_long");                          //  6
+    table.add_column(type_Int, "int");                                         //  0
+    table.add_column(type_Bool, "bool");                                       //  1
+    table.add_column(type_Timestamp, "date");                                  //  2
+    table.add_column(type_Float, "float");                                     //  3
+    table.add_column(type_Double, "double");                                   //  4
+    table.add_column(type_String, "string");                                   //  5
+    table.add_column(type_String, "string_long");                              //  6
     ColKey col_string_big = table.add_column(type_String, "string_big_blobs"); //  7
     ColKey col_string_enum = table.add_column(type_String, "string_enum");     //  8 - becomes StringEnumColumn
     ColKey col_binary = table.add_column(type_Binary, "binary");               //  9
@@ -201,7 +201,7 @@ bool json_test(std::string json, std::string expected_file, bool generate)
             std::string path = file_name + "bad_" + expected_file + ".json";
             std::string pathOld = "bad_" + file_name;
             File out(path, File::mode_Write);
-            out.write(json);
+            out.write(0, json);
             std::cerr << "\n error result in '" << std::string(path) << "'\n";
             return false;
         }

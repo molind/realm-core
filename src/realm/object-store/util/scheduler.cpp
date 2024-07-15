@@ -28,7 +28,16 @@
 #include <realm/object-store/util/apple/scheduler.hpp>
 #endif
 
-#if REALM_ANDROID
+// When building Realm within the VNDK in AOSP, __ANDROID__ is defined.
+// However, access to libandroid is restricted by VNDK policies.
+// As a result, we cannot utilize the built-in ALooper functionality.
+// Instead, we require users to provide their own scheduler implementation.
+
+#if REALM_ANDROID && !defined(REALM_AOSP_VENDOR)
+#define HAS_ANDROID_ALOOPER
+#endif
+
+#if defined(HAS_ANDROID_ALOOPER)
 #include <realm/object-store/util/android/scheduler.hpp>
 #endif
 
@@ -41,7 +50,7 @@
 namespace realm::util {
 namespace {
 
-util::UniqueFunction<std::shared_ptr<Scheduler>()> s_factory = &Scheduler::make_platform_default;
+std::shared_ptr<Scheduler> (*s_factory)() = Scheduler::make_platform_default;
 
 class FrozenScheduler : public util::Scheduler {
 public:
@@ -108,7 +117,7 @@ void InvocationQueue::invoke_all()
 
 Scheduler::~Scheduler() = default;
 
-void Scheduler::set_default_factory(util::UniqueFunction<std::shared_ptr<Scheduler>()> factory)
+void Scheduler::set_default_factory(std::shared_ptr<Scheduler> (*factory)())
 {
     s_factory = std::move(factory);
 }
@@ -125,7 +134,7 @@ std::shared_ptr<Scheduler> Scheduler::make_platform_default()
 #else
 #if REALM_PLATFORM_APPLE
     return make_runloop(nullptr);
-#elif REALM_ANDROID
+#elif defined(HAS_ANDROID_ALOOPER)
     return make_alooper();
 #elif defined(__EMSCRIPTEN__)
     return std::make_shared<EmscriptenScheduler>();
@@ -167,12 +176,12 @@ std::shared_ptr<Scheduler> Scheduler::make_dispatch(void* queue)
 }
 #endif // REALM_PLATFORM_APPLE
 
-#if REALM_ANDROID
+#if defined(HAS_ANDROID_ALOOPER)
 std::shared_ptr<Scheduler> Scheduler::make_alooper()
 {
     return std::make_shared<ALooperScheduler>();
 }
-#endif // REALM_ANDROID
+#endif // HAS_ANDROID_ALOOPER
 
 #if REALM_HAVE_UV
 std::shared_ptr<Scheduler> Scheduler::make_uv()

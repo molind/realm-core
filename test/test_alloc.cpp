@@ -156,9 +156,6 @@ TEST(Alloc_AttachFile)
     }
 }
 
-
-// FIXME: Fails on Windows
-#ifndef _MSC_VER
 TEST(Alloc_BadFile)
 {
     GROUP_TEST_PATH(path_1);
@@ -166,7 +163,7 @@ TEST(Alloc_BadFile)
 
     {
         File file(path_1, File::mode_Append);
-        file.write("foo");
+        file.write(0, "foo");
     }
 
     {
@@ -189,8 +186,6 @@ TEST(Alloc_BadFile)
         CHECK_THROW(alloc.attach_file(path_1, cfg), InvalidDatabase);
     }
 }
-#endif
-
 
 TEST(Alloc_AttachBuffer)
 {
@@ -211,7 +206,7 @@ TEST(Alloc_AttachBuffer)
             buffer_size = size_t(file.get_size());
             buffer.reset(new char[buffer_size]);
             CHECK(bool(buffer));
-            file.read(buffer.get(), buffer_size);
+            file.read(0, buffer.get(), buffer_size);
         }
         File::remove(path);
     }
@@ -325,6 +320,10 @@ NONCONCURRENT_TEST_IF(Alloc_MapFailureRecovery, _impl::SimulatedFailure::is_enab
     Group().write(path);
 
     SlabAlloc::Config cfg;
+    // mimic a DB initiating a session
+    cfg.is_shared = true;
+    cfg.session_initiator = true;
+
     SlabAlloc alloc;
 
     { // Initial Header mapping fails
@@ -350,19 +349,31 @@ NONCONCURRENT_TEST_IF(Alloc_MapFailureRecovery, _impl::SimulatedFailure::is_enab
         _impl::SimulatedFailure::prime_mmap(nullptr);
         auto top_ref = alloc.attach_file(path, cfg);
         CHECK(alloc.is_attached());
+        if (cfg.encryption_key) {
+            // the internal baseline has capacity for a page but it is not entirely backed by a file (yet)
+            CHECK_EQUAL(alloc.get_baseline(), page_size);
+        }
+        else {
+            CHECK_NOT_EQUAL(alloc.get_baseline(), page_size);
+        }
         // file has not (yet) been expanded to match:
-        CHECK(alloc.get_baseline() != page_size);
+        CHECK_NOT_EQUAL(alloc.get_file_size(), page_size);
         // convert before aligning file size
         alloc.convert_from_streaming_form(top_ref);
         // file is expanded:
         CHECK(alloc.align_filesize_for_mmap(top_ref, cfg));
+        CHECK(!alloc.is_attached());
         // and consequently needs to be reattached:
         alloc.detach();
         alloc.attach_file(path, cfg);
         alloc.init_mapping_management(1);
+        CHECK(alloc.is_attached());
+        // now both the allocator and the backing file agree on the capacity
+        CHECK_EQUAL(alloc.get_baseline(), page_size);
+        CHECK_EQUAL(alloc.get_file_size(), page_size);
     }
 
-    { // Extendind the first mapping
+    { // Extending the first mapping
         const auto initial_baseline = alloc.get_baseline();
         const auto initial_version = alloc.get_mapping_version();
         const char* initial_translated = alloc.translate(1000);

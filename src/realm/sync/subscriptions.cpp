@@ -630,42 +630,50 @@ SubscriptionStore::SubscriptionStore(Private, DBRef db)
     };
 
     auto tr = m_db->start_read();
-    SyncMetadataSchemaVersions schema_versions(tr);
+    // Start with a reader so it doesn't try to write until we are ready
+    SyncMetadataSchemaVersionsReader schema_versions_reader(tr);
 
-    if (auto schema_version = schema_versions.get_version_for(tr, internal_schema_groups::c_flx_subscription_store);
-        !schema_version) {
-        tr->promote_to_write();
-        schema_versions.set_version_for(tr, internal_schema_groups::c_flx_subscription_store, c_flx_schema_version);
-        create_sync_metadata_schema(tr, &internal_tables);
-        tr->commit_and_continue_as_read();
-    }
-    else {
+    if (auto schema_version =
+            schema_versions_reader.get_version_for(tr, internal_schema_groups::c_flx_subscription_store)) {
         if (*schema_version != c_flx_schema_version) {
             throw RuntimeError(ErrorCodes::UnsupportedFileFormatVersion,
                                "Invalid schema version for flexible sync metadata");
         }
         load_sync_metadata_schema(tr, &internal_tables);
     }
+    else {
+        tr->promote_to_write();
+        // Ensure the schema versions table is initialized (may add its own commit)
+        SyncMetadataSchemaVersions schema_versions(tr);
+        // Create the metadata schema and set the version (in the same commit)
+        schema_versions.set_version_for(tr, internal_schema_groups::c_flx_subscription_store, c_flx_schema_version);
+        create_sync_metadata_schema(tr, &internal_tables);
+        tr->commit_and_continue_as_read();
+    }
+    REALM_ASSERT(m_sub_set_table);
 
     // Make sure the subscription set table is properly initialized
-    initialize_subscriptions_table(std::move(tr), false);
+    initialize_subscriptions_table(std::move(tr));
 }
 
-void SubscriptionStore::initialize_subscriptions_table(TransactionRef&& tr, bool clear_table)
+void SubscriptionStore::initialize_subscriptions_table(TransactionRef&& tr)
 {
-    if (auto sub_sets = tr->get_table(m_sub_set_table); clear_table || sub_sets->is_empty()) {
+    if (auto sub_sets = tr->get_table(m_sub_set_table); sub_sets->is_empty()) {
         tr->promote_to_write();
-        // If erase_table is true, clear out the sub_sets table
-        if (clear_table) {
-            sub_sets->clear();
-        }
-        // There should always be at least one subscription set so that the user can always wait
-        // for synchronizationon on the result of get_latest().
-        auto zero_sub = sub_sets->create_object_with_primary_key(Mixed{int64_t(0)});
-        zero_sub.set(m_sub_set_state, static_cast<int64_t>(SubscriptionSet::State::Pending));
-        zero_sub.set(m_sub_set_snapshot_version, tr->get_version());
+        clear(*tr);
         tr->commit();
     }
+}
+
+void SubscriptionStore::clear(Transaction& wt)
+{
+    auto sub_sets = wt.get_table(m_sub_set_table);
+    sub_sets->clear();
+    // There should always be at least one subscription set so that the user can always wait
+    // for synchronizationon on the result of get_latest().
+    auto zero_sub = sub_sets->create_object_with_primary_key(Mixed{int64_t(0)});
+    zero_sub.set(m_sub_set_state, static_cast<int64_t>(SubscriptionSet::State::Pending));
+    zero_sub.set(m_sub_set_snapshot_version, wt.get_version());
 }
 
 SubscriptionSet SubscriptionStore::get_latest()
@@ -792,10 +800,10 @@ void SubscriptionStore::notify_all_state_change_notifications(Status status)
     }
 }
 
-void SubscriptionStore::terminate()
+void SubscriptionStore::reset(Transaction& wt)
 {
     // Clear out and initialize the subscription store
-    initialize_subscriptions_table(m_db->start_read(), true);
+    clear(wt);
 
     util::CheckedUniqueLock lk(m_pending_notifications_mutex);
     auto to_finish = std::move(m_pending_notifications);

@@ -46,23 +46,27 @@ ColInfo get_col_info(const Table* table)
 }
 
 void add_list_to_repl(CollectionBase& list, Replication& repl, util::UniqueFunction<void(Mixed)> update_embedded);
+
 void add_dictionary_to_repl(Dictionary& dict, Replication& repl, util::UniqueFunction<void(Mixed)> update_embedded)
 {
     size_t sz = dict.size();
     for (size_t n = 0; n < sz; ++n) {
         const auto& [key, val] = dict.get_pair(n);
-        repl.dictionary_insert(dict, n, key, val);
         if (val.is_type(type_List)) {
+            repl.dictionary_insert(dict, n, key, Mixed{0, CollectionType::List});
             auto n_list = dict.get_list({key.get_string()});
-            add_list_to_repl(*n_list, *dict.get_table()->get_repl(), nullptr);
+            add_list_to_repl(*n_list, repl, nullptr);
         }
         else if (val.is_type(type_Dictionary)) {
-            repl.dictionary_insert(dict, n, key, val);
+            repl.dictionary_insert(dict, n, key, Mixed{0, CollectionType::Dictionary});
             auto n_dict = dict.get_dictionary({key.get_string()});
-            add_dictionary_to_repl(*n_dict, *dict.get_table()->get_repl(), nullptr);
+            add_dictionary_to_repl(*n_dict, repl, nullptr);
         }
-        else if (update_embedded) {
-            update_embedded(val);
+        else {
+            repl.dictionary_insert(dict, n, key, val);
+            if (update_embedded) {
+                update_embedded(val);
+            }
         }
     }
 }
@@ -72,17 +76,21 @@ void add_list_to_repl(CollectionBase& list, Replication& repl, util::UniqueFunct
     auto sz = list.size();
     for (size_t n = 0; n < sz; n++) {
         auto val = list.get_any(n);
-        repl.list_insert(list, n, val, n);
         if (val.is_type(type_List)) {
+            repl.list_insert(list, n, Mixed{0, CollectionType::List}, n);
             auto n_list = list.get_list({n});
-            add_list_to_repl(*n_list, *list.get_table()->get_repl(), nullptr);
+            add_list_to_repl(*n_list, repl, nullptr);
         }
         else if (val.is_type(type_Dictionary)) {
+            repl.list_insert(list, n, Mixed{0, CollectionType::Dictionary}, n);
             auto n_dict = list.get_dictionary({n});
-            add_dictionary_to_repl(*n_dict, *list.get_table()->get_repl(), nullptr);
+            add_dictionary_to_repl(*n_dict, repl, nullptr);
         }
-        else if (update_embedded) {
-            update_embedded(val);
+        else {
+            repl.list_insert(list, n, val, n);
+            if (update_embedded) {
+                update_embedded(val);
+            }
         }
     }
 }
@@ -163,7 +171,6 @@ Transaction::Transaction(DBRef _db, SlabAlloc* alloc, DB::ReadLockInfo& rli, DB:
     bool writable = stage == DB::transact_Writing;
     m_transact_stage = DB::transact_Ready;
     set_transact_stage(stage);
-    m_alloc.note_reader_start(this);
     attach_shared(m_read_lock.m_top_ref, m_read_lock.m_file_size, writable,
                   VersionID{rli.m_version, rli.m_reader_idx});
     if (db->m_logger) {
@@ -419,7 +426,7 @@ _impl::History* Transaction::get_history() const
 Obj Transaction::import_copy_of(const Obj& original)
 {
     if (bool(original) && original.is_valid()) {
-        TableKey tk = original.get_table_key();
+        TableKey tk = original.get_table()->get_key();
         ObjKey rk = original.get_key();
         auto table = get_table(tk);
         if (table->is_valid(rk))
@@ -819,7 +826,6 @@ void Transaction::do_end_read() noexcept
     }
     db->release_read_lock(m_read_lock);
 
-    m_alloc.note_reader_end(this);
     set_transact_stage(DB::transact_Ready);
     // reset the std::shared_ptr to allow the DB object to release resources
     // as early as possible.
@@ -843,7 +849,6 @@ void Transaction::close_read_with_lock()
                     m_oldest_version_not_persisted->m_file_size);
     db->do_release_read_lock(m_read_lock);
 
-    m_alloc.note_reader_end(this);
     set_transact_stage(DB::transact_Ready);
     // reset the std::shared_ptr to allow the DB object to release resources
     // as early as possible.

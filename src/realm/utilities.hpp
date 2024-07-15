@@ -121,10 +121,6 @@ REALM_FORCEINLINE bool sseavx()
 }
 
 void cpuid_init();
-void* round_up(void* p, size_t align);
-void* round_down(void* p, size_t align);
-constexpr size_t round_up(size_t p, size_t align);
-constexpr size_t round_down(size_t p, size_t align);
 void millisleep(unsigned long milliseconds);
 
 #ifdef _WIN32
@@ -271,16 +267,13 @@ struct InternalFindResult {
 // realm::is_any<T, U1, U2, U3, ...> ==
 // std::is_same<T, U1>::value || std::is_same<T, U2>::value || std::is_same<T, U3>::value ...
 template <typename... T>
-struct is_any : std::false_type {
-};
+struct is_any : std::false_type {};
 
 template <typename T, typename... Ts>
-struct is_any<T, T, Ts...> : std::true_type {
-};
+struct is_any<T, T, Ts...> : std::true_type {};
 
 template <typename T, typename U, typename... Ts>
-struct is_any<T, U, Ts...> : is_any<T, Ts...> {
-};
+struct is_any<T, U, Ts...> : is_any<T, Ts...> {};
 
 template <typename... Ts>
 inline constexpr bool is_any_v = is_any<Ts...>::value;
@@ -337,25 +330,25 @@ inline char toLowerAscii(char c)
     return c;
 }
 
-inline void* round_up(void* p, size_t align)
+inline void* round_up(void* p, uintptr_t align)
 {
-    size_t r = size_t(p) % align == 0 ? 0 : align - size_t(p) % align;
+    uintptr_t r = uintptr_t(p) % align == 0 ? 0 : align - uintptr_t(p) % align;
     return static_cast<char*>(p) + r;
 }
 
-inline void* round_down(void* p, size_t align)
+inline void* round_down(void* p, uintptr_t align)
 {
-    size_t r = size_t(p);
+    uintptr_t r = uintptr_t(p);
     return reinterpret_cast<void*>(r & ~(align - 1));
 }
 
-constexpr inline size_t round_up(size_t p, size_t align)
+constexpr size_t round_up(size_t p, size_t align)
 {
     size_t r = p % align == 0 ? 0 : align - p % align;
     return p + r;
 }
 
-constexpr inline size_t round_down(size_t p, size_t align)
+constexpr size_t round_down(size_t p, size_t align)
 {
     size_t r = p;
     return r & (~(align - 1));

@@ -10,14 +10,13 @@
 #include <realm/sync/network/network_ssl.hpp>
 #include <realm/sync/noinst/client_history_impl.hpp>
 #include <realm/sync/noinst/migration_store.hpp>
-#include <realm/sync/noinst/migration_store.hpp>
 #include <realm/sync/noinst/protocol_codec.hpp>
 #include <realm/sync/protocol.hpp>
 #include <realm/sync/subscriptions.hpp>
 #include <realm/sync/trigger.hpp>
 #include <realm/util/buffer_stream.hpp>
+#include <realm/util/checked_mutex.hpp>
 #include <realm/util/logger.hpp>
-#include <realm/util/optional.hpp>
 #include <realm/util/span.hpp>
 
 #include <cstdint>
@@ -27,25 +26,28 @@
 #include <map>
 #include <random>
 #include <string>
+#include <unordered_set>
 #include <utility>
 
 namespace realm::sync {
 
-// (protocol, address, port, session_multiplex_ident)
+// (protocol, address, port, user_id)
 //
 // `protocol` is included for convenience, even though it is not strictly part
 // of an endpoint.
-
 struct ServerEndpoint {
     ProtocolEnvelope envelope;
     std::string address;
     network::Endpoint::port_type port;
     std::string user_id;
     SyncServerMode server_mode = SyncServerMode::PBS;
+    bool is_verified = false;
 
 private:
     auto to_tuple() const
     {
+        // Does not include server_mode because all endpoints for a single Client
+        // must have the same mode. is_verified is not part of an endpoint's identity.
         return std::make_tuple(server_mode, envelope, std::ref(address), port, std::ref(user_id));
     }
 
@@ -54,7 +56,6 @@ public:
     {
         return lhs.to_tuple() == rhs.to_tuple();
     }
-
 
     friend inline bool operator<(const ServerEndpoint& lhs, const ServerEndpoint& rhs)
     {
@@ -70,13 +71,9 @@ public:
     void push(util::bind_ptr<SessionWrapper>) noexcept;
     util::bind_ptr<SessionWrapper> pop() noexcept;
     void clear() noexcept;
+    bool erase(SessionWrapper*) noexcept;
     SessionWrapperStack() noexcept = default;
-    SessionWrapperStack(SessionWrapperStack&&) noexcept;
     ~SessionWrapperStack();
-    friend void swap(SessionWrapperStack& q_1, SessionWrapperStack& q_2) noexcept
-    {
-        std::swap(q_1.m_back, q_2.m_back);
-    }
 
 private:
     SessionWrapper* m_back = nullptr;
@@ -206,9 +203,9 @@ public:
 
     static constexpr int get_oldest_supported_protocol_version() noexcept;
 
-    void shutdown() noexcept;
+    void shutdown() noexcept REQUIRES(!m_mutex, !m_drain_mutex);
 
-    void shutdown_and_wait();
+    void shutdown_and_wait() REQUIRES(!m_mutex, !m_drain_mutex);
 
     const std::string& get_user_agent_string() const noexcept;
     ReconnectMode get_reconnect_mode() const noexcept;
@@ -216,9 +213,11 @@ public:
 
     // Functions to post onto the event loop and create an event loop timer using the
     // SyncSocketProvider
-    void post(SyncSocketProvider::FunctionHandler&& handler);
+    void post(SyncSocketProvider::FunctionHandler&& handler) REQUIRES(!m_drain_mutex);
+    void post(util::UniqueFunction<void()>&& handler) REQUIRES(!m_drain_mutex);
     SyncSocketProvider::SyncTimer create_timer(std::chrono::milliseconds delay,
-                                               SyncSocketProvider::FunctionHandler&& handler);
+                                               SyncSocketProvider::FunctionHandler&& handler)
+        REQUIRES(!m_drain_mutex);
     using SyncTrigger = std::unique_ptr<Trigger<ClientImpl>>;
     SyncTrigger create_trigger(SyncSocketProvider::FunctionHandler&& handler);
 
@@ -228,11 +227,11 @@ public:
     bool decompose_server_url(const std::string& url, ProtocolEnvelope& protocol, std::string& address,
                               port_type& port, std::string& path) const;
 
-    void cancel_reconnect_delay();
-    bool wait_for_session_terminations_or_client_stopped();
+    void cancel_reconnect_delay() REQUIRES(!m_drain_mutex);
+    bool wait_for_session_terminations_or_client_stopped() REQUIRES(!m_mutex, !m_drain_mutex);
     // Async version of wait_for_session_terminations_or_client_stopped().
-    util::Future<void> notify_session_terminated();
-    void voluntary_disconnect_all_connections();
+    util::Future<void> notify_session_terminated() REQUIRES(!m_drain_mutex);
+    void voluntary_disconnect_all_connections() REQUIRES(!m_drain_mutex);
 
 private:
     using connection_ident_type = std::int_fast64_t;
@@ -260,10 +259,10 @@ private:
     SyncTrigger m_actualize_and_finalize;
 
     // Note: There is one server slot per server endpoint (hostname, port,
-    // session_multiplex_ident), and it survives from one connection object to
-    // the next, which is important because it carries information about a
-    // possible reconnect delay applying to the new connection object (server
-    // hammering protection).
+    // user_id), and it survives from one connection object to the next, which
+    // is important because it carries information about a possible reconnect
+    // delay applying to the new connection object (server hammering
+    // protection).
     struct ServerSlot {
         explicit ServerSlot(ReconnectInfo reconnect_info);
         ~ServerSlot();
@@ -282,36 +281,32 @@ private:
     // Must be accessed only by event loop thread
     connection_ident_type m_prev_connection_ident = 0;
 
-    std::mutex m_drain_mutex;
+    util::CheckedMutex m_drain_mutex;
     std::condition_variable m_drain_cv;
-    bool m_drained = false;
-    uint64_t m_outstanding_posts = 0;
-    uint64_t m_num_connections = 0;
+    bool m_drained GUARDED_BY(m_drain_mutex) = false;
+    uint64_t m_outstanding_posts GUARDED_BY(m_drain_mutex) = 0;
+    uint64_t m_num_connections GUARDED_BY(m_drain_mutex) = 0;
 
-    std::mutex m_mutex;
+    util::CheckedMutex m_mutex;
 
-    bool m_stopped = false;                       // Protected by `m_mutex`
-    bool m_sessions_terminated = false;           // Protected by `m_mutex`
+    bool m_stopped GUARDED_BY(m_mutex) = false;
+    bool m_sessions_terminated GUARDED_BY(m_mutex) = false;
 
     // The set of session wrappers that are not yet wrapping a session object,
     // and are not yet abandoned (still referenced by the application).
-    //
-    // Protected by `m_mutex`.
-    std::map<SessionWrapper*, ServerEndpoint> m_unactualized_session_wrappers;
+    SessionWrapperStack m_unactualized_session_wrappers GUARDED_BY(m_mutex);
 
     // The set of session wrappers that were successfully actualized, but are
     // now abandoned (no longer referenced by the application), and have not yet
     // been finalized. Order in queue is immaterial.
-    //
-    // Protected by `m_mutex`.
-    SessionWrapperStack m_abandoned_session_wrappers;
+    SessionWrapperStack m_abandoned_session_wrappers GUARDED_BY(m_mutex);
 
-    // Protected by `m_mutex`.
+    // Used with m_mutex
     std::condition_variable m_wait_or_client_stopped_cond;
 
-    void register_unactualized_session_wrapper(SessionWrapper*, ServerEndpoint);
-    void register_abandoned_session_wrapper(util::bind_ptr<SessionWrapper>) noexcept;
-    void actualize_and_finalize_session_wrappers();
+    void register_unactualized_session_wrapper(SessionWrapper*) REQUIRES(!m_mutex);
+    void register_abandoned_session_wrapper(util::bind_ptr<SessionWrapper>) noexcept REQUIRES(!m_mutex);
+    void actualize_and_finalize_session_wrappers() REQUIRES(!m_mutex);
 
     // Get or create a connection. If a connection exists for the specified
     // endpoint, it will be returned, otherwise a new connection will be
@@ -327,25 +322,22 @@ private:
     // approach would be to allow for per-endpoint SSL parameters to be
     // specifiable through public member functions of ClientImpl from where they
     // could then be picked up as new connections are created on demand.
-    //
-    // FIXME: `session_multiplex_ident` should be eliminated from ServerEndpoint
-    // as it effectively disables part of the hammering protection scheme if it
-    // is used to ensure that each session gets a separate connection. With the
-    // alternative approach outlined in the previous FIXME (specify per endpoint
-    // SSL parameters at the client object level), there seems to be no more use
-    // for `session_multiplex_ident`.
     ClientImpl::Connection& get_connection(ServerEndpoint, const std::string& authorization_header_name,
                                            const std::map<std::string, std::string>& custom_http_headers,
                                            bool verify_servers_ssl_certificate,
                                            util::Optional<std::string> ssl_trust_certificate_path,
                                            std::function<SyncConfig::SSLVerifyCallback>,
-                                           util::Optional<SyncConfig::ProxyConfig>, bool& was_created);
+                                           util::Optional<SyncConfig::ProxyConfig>, bool& was_created)
+        REQUIRES(!m_drain_mutex);
 
     // Destroys the specified connection.
-    void remove_connection(ClientImpl::Connection&) noexcept;
+    void remove_connection(ClientImpl::Connection&) noexcept REQUIRES(!m_drain_mutex);
 
     void drain_connections();
-    void drain_connections_on_loop();
+    void drain_connections_on_loop() REQUIRES(!m_drain_mutex);
+
+    void incr_outstanding_posts() REQUIRES(!m_drain_mutex);
+    void decr_outstanding_posts() REQUIRES(!m_drain_mutex);
 
     session_ident_type get_next_session_ident() noexcept;
 
@@ -388,7 +380,6 @@ enum class ClientImpl::ConnectionTerminationReason {
     missing_protocol_feature,
 };
 
-
 /// All use of connection objects, including construction and destruction, must
 /// occur on behalf of the event loop thread of the associated client object.
 
@@ -399,6 +390,7 @@ public:
     using SSLVerifyCallback = SyncConfig::SSLVerifyCallback;
     using ProxyConfig = SyncConfig::ProxyConfig;
     using ReconnectInfo = ClientImpl::ReconnectInfo;
+    using DownloadMessage = ClientProtocol::DownloadMessage;
 
     std::shared_ptr<util::Logger> logger_ptr;
     util::Logger& logger;
@@ -562,8 +554,8 @@ private:
     void receive_query_error_message(int error_code, std::string_view message, int64_t query_version,
                                      session_ident_type);
     void receive_ident_message(session_ident_type, SaltedFileIdent);
-    void receive_download_message(session_ident_type, const SyncProgress&, std::uint_fast64_t downloadable_bytes,
-                                  int64_t query_version, DownloadBatchState batch_state, const ReceivedChangesets&);
+    void receive_download_message(session_ident_type, const DownloadMessage& message);
+
     void receive_mark_message(session_ident_type, request_ident_type);
     void receive_unbound_message(session_ident_type);
     void receive_test_command_response(session_ident_type, request_ident_type, std::string_view body);
@@ -691,7 +683,7 @@ private:
     OutputBuffer m_output_buffer;
 
     const connection_ident_type m_ident;
-    const ServerEndpoint m_server_endpoint;
+    ServerEndpoint m_server_endpoint;
     std::string m_appservices_coid;
 
     /// DEPRECATED - These will be removed in a future release
@@ -710,6 +702,7 @@ private:
 class ClientImpl::Session {
 public:
     using ReceivedChangesets = ClientProtocol::ReceivedChangesets;
+    using DownloadMessage = ClientProtocol::DownloadMessage;
 
     std::shared_ptr<util::Logger> logger_ptr;
     util::Logger& logger;
@@ -733,49 +726,6 @@ public:
     /// It is an error to call this function before activation of the session,
     /// or after initiation of deactivation.
     void recognize_sync_version(version_type);
-
-    /// \brief Request notification when all changesets in the local history
-    /// have been uploaded to the server.
-    ///
-    /// When uploading completes, on_upload_completion() will be called by the
-    /// thread that processes the event loop (as long as such a thread exists).
-    ///
-    /// IMPORTANT: on_upload_completion() may get called before
-    /// request_upload_completion_notification() returns (reentrant callback).
-    ///
-    /// If request_upload_completion_notification() is called while a previously
-    /// requested completion notification has not yet occurred, the previous
-    /// request is canceled and the corresponding notification will never
-    /// occur. This ensure that there is no ambiguity about the meaning of each
-    /// completion notification.
-    ///
-    /// The application must be prepared for "spurious" invocations of
-    /// on_upload_completion() before the client's first invocation of
-    /// request_upload_completion_notification(), or after a previous invocation
-    /// of on_upload_completion(), as long as it is before the subsequent
-    /// invocation by the client of
-    /// request_upload_completion_notification(). This is possible because the
-    /// client reserves the right to request upload completion notifications
-    /// internally.
-    ///
-    /// Upload is considered complete when all changesets in the history, that
-    /// are supposed to be uploaded, and that precede `current_client_version`,
-    /// have been uploaded and acknowledged by the
-    /// server. `current_client_version` is generally the version that refers to
-    /// the last changeset in the history, but more precisely, it may be any
-    /// version between the last version reported by the application through
-    /// recognize_sync_version() and the version referring to the last history
-    /// entry (both ends inclusive).
-    ///
-    /// If new changesets are added to the history while a previously requested
-    /// completion notification has not yet occurred, it is unspecified whether
-    /// the addition of those changesets will cause `current_client_version` to
-    /// be bumped or stay fixed, regardless of whether they are advertised via
-    /// recognize_sync_version().
-    ///
-    /// It is an error to call this function before activation of the session,
-    /// or after initiation of deactivation.
-    void request_upload_completion_notification();
 
     /// \brief Request notification when all changesets currently avaialble on
     /// the server have been downloaded.
@@ -836,13 +786,6 @@ public:
     void integrate_changesets(const SyncProgress&, std::uint_fast64_t downloadable_bytes, const ReceivedChangesets&,
                               VersionInfo&, DownloadBatchState last_in_batch);
 
-    /// To be used in connection with implementations of
-    /// initiate_integrate_changesets().
-    ///
-    /// If \a success is true, the value of \a error does not matter. If \a
-    /// success is false, the values of \a client_version and \a
-    /// download_progress do not matter.
-    ///
     /// It is an error to call this function before activation of the session
     /// (Connection::activate_session()), or after initiation of deactivation
     /// (Connection::initiate_session_deactivation()).
@@ -904,6 +847,10 @@ private:
     /// Returns the schema version the synchronization session connects with to the server.
     uint64_t get_schema_version() noexcept;
 
+    // Returns false if this session is not allowed to send UPLOAD messages to the server to
+    // update the cursor info, such as during a client reset fresh realm download
+    bool upload_messages_allowed() noexcept;
+
     /// \brief Initiate the integration of downloaded changesets.
     ///
     /// This function must provide for the passed changesets (if any) to
@@ -947,14 +894,7 @@ private:
     void initiate_integrate_changesets(std::uint_fast64_t downloadable_bytes, DownloadBatchState batch_state,
                                        const SyncProgress& progress, const ReceivedChangesets&);
 
-    /// See request_upload_completion_notification().
-    ///
-    /// The default implementation does nothing.
-    void on_upload_completion();
-
     /// See request_download_completion_notification().
-    ///
-    /// The default implementation does nothing.
     void on_download_completion();
 
     //@{
@@ -964,8 +904,6 @@ private:
     ///
     /// A switch to the suspended state only happens when an error occurs,
     /// and information about that error is passed to on_suspended().
-    ///
-    /// The default implementations of these functions do nothing.
     ///
     /// These functions are always called by the event loop thread of the
     /// associated client object.
@@ -1015,12 +953,11 @@ private:
     SyncSocketProvider::SyncTimer m_try_again_activation_timer;
     ErrorBackoffState<sync::ProtocolError, RandomEngine> m_try_again_delay_info;
 
-    // Set to true when download completion is reached. Set to false after a
-    // slow reconnect, such that the upload process will become suspended until
-    // download completion is reached again.
-    bool m_allow_upload = false;
-
-    bool m_upload_completion_notification_requested = false;
+    // Set to false when download completion is reached. Set to true after a
+    // slow reconnect, such that UPLOAD and QUERY messages will not be sent until
+    // download completion is reached again. This feature can be disabled (always
+    // false) if ClientConfig::disable_upload_activation_delay is true.
+    bool m_delay_uploads = true;
 
     bool m_is_flx_sync_session = false;
 
@@ -1047,9 +984,6 @@ private:
 
     // `ident == 0` means unassigned.
     SaltedFileIdent m_client_file_ident = {0, 0};
-
-    // True while this session is in the process of performing a client reset.
-    bool m_performing_client_reset = false;
 
     // The latest sync progress reported by the server via a DOWNLOAD
     // message. See struct SyncProgress for a description. The values stored in
@@ -1087,15 +1021,6 @@ private:
     //
     // INVARIANT: m_progress.upload.client_version <= m_upload_progress.client_version
     UploadCursor m_upload_progress = {0, 0};
-
-    // Set to `m_progress.upload.client_version` at session activation time and
-    // whenever the connection to the server is lost. Otherwise it is the
-    // version of the latest changeset that has been selected for upload while
-    // scanning the history.
-    //
-    // INVARIANT: m_progress.upload.client_version <= m_last_version_selected_for_upload
-    // INVARIANT: m_last_version_selected_for_upload <= m_upload_progress.client_version
-    version_type m_last_version_selected_for_upload = 0;
 
     // Same as `m_progress.download` but is updated only as the progress gets
     // persisted.
@@ -1174,9 +1099,7 @@ private:
     void send_json_error_message();
     void send_test_command_message();
     Status receive_ident_message(SaltedFileIdent);
-    Status receive_download_message(const SyncProgress&, std::uint_fast64_t downloadable_bytes,
-                                    DownloadBatchState last_in_batch, int64_t query_version,
-                                    const ReceivedChangesets&);
+    Status receive_download_message(const DownloadMessage& message);
     Status receive_mark_message(request_ident_type);
     Status receive_unbound_message();
     Status receive_error_message(const ProtocolErrorInfo& info);
@@ -1188,15 +1111,18 @@ private:
     void ensure_enlisted_to_send();
     void enlist_to_send();
     Status check_received_sync_progress(const SyncProgress&) noexcept;
-    void check_for_upload_completion();
     void check_for_download_completion();
 
     SyncClientHookAction call_debug_hook(SyncClientHookEvent event, const SyncProgress&, int64_t, DownloadBatchState,
                                          size_t);
     SyncClientHookAction call_debug_hook(SyncClientHookEvent event, const ProtocolErrorInfo&);
     SyncClientHookAction call_debug_hook(const SyncClientHookData& data);
+    SyncClientHookAction call_debug_hook(SyncClientHookEvent event);
 
     bool is_steady_state_download_message(DownloadBatchState batch_state, int64_t query_version);
+
+    void init_progress_handler();
+    void enable_progress_notifications();
 
     friend class Connection;
 };
@@ -1279,6 +1205,9 @@ void ClientImpl::Connection::for_each_active_session(H handler)
 
 inline void ClientImpl::Connection::voluntary_disconnect()
 {
+    if (m_state == ConnectionState::disconnected) {
+        return;
+    }
     m_reconnect_info.update(ConnectionTerminationReason::closed_voluntarily, std::nullopt);
     SessionErrorInfo error_info{Status{ErrorCodes::ConnectionClosed, "Connection closed"}, IsFatal{false}};
     error_info.server_requests_action = ProtocolErrorInfo::Action::Transient;
@@ -1393,18 +1322,10 @@ inline void ClientImpl::Session::recognize_sync_version(version_type version)
         // Since the deactivation process has not been initiated, the UNBIND
         // message cannot have been sent unless the session was suspended due to
         // an error.
-        REALM_ASSERT(m_suspended || !m_unbind_message_sent);
+        REALM_ASSERT_3(m_suspended, ||, !m_unbind_message_sent);
         if (m_ident_message_sent && !m_suspended)
             ensure_enlisted_to_send(); // Throws
     }
-}
-
-inline void ClientImpl::Session::request_upload_completion_notification()
-{
-    REALM_ASSERT(m_state == Active);
-
-    m_upload_completion_notification_requested = true;
-    check_for_upload_completion(); // Throws
 }
 
 inline void ClientImpl::Session::request_download_completion_notification()
@@ -1437,7 +1358,7 @@ inline ClientImpl::Session::Session(SessionWrapper& wrapper, Connection& conn, s
     , m_wrapper{wrapper}
 {
     if (get_client().m_disable_upload_activation_delay)
-        m_allow_upload = true;
+        m_delay_uploads = false;
 }
 
 inline bool ClientImpl::Session::do_recognize_sync_version(version_type version) noexcept
@@ -1466,10 +1387,10 @@ inline void ClientImpl::Session::connection_established(bool fast_reconnect)
     if (!fast_reconnect && !get_client().m_disable_upload_activation_delay) {
         // Disallow immediate activation of the upload process, even if download
         // completion was reached during an earlier period of connectivity.
-        m_allow_upload = false;
+        m_delay_uploads = true;
     }
 
-    if (!m_allow_upload) {
+    if (m_delay_uploads) {
         // Request download completion notification
         ++m_target_download_mark;
     }
@@ -1507,6 +1428,14 @@ inline void ClientImpl::Session::message_sent()
 
     // No message will be sent after the UNBIND message
     REALM_ASSERT(!m_unbind_message_send_complete);
+
+    // If the client reset config structure is populated, then try to perform
+    // the client reset diff once the BIND message has been sent successfully
+    if (m_bind_message_sent && m_state == Active && get_client_reset_config()) {
+        client_reset_if_needed();
+        // Ready to send the IDENT message
+        ensure_enlisted_to_send(); // Throws
+    }
 
     if (m_unbind_message_sent) {
         REALM_ASSERT(!m_enlisted_to_send);
@@ -1550,10 +1479,9 @@ inline void ClientImpl::Session::initiate_rebind()
 
 inline void ClientImpl::Session::reset_protocol_state() noexcept
 {
-    // clang-format off
-    m_enlisted_to_send                    = false;
-    m_bind_message_sent                   = false;
-    m_error_to_send                       = false;
+    m_enlisted_to_send = false;
+    m_bind_message_sent = false;
+    m_error_to_send = false;
     m_ident_message_sent = false;
     m_unbind_message_sent = false;
     m_unbind_message_send_complete = false;
@@ -1562,9 +1490,7 @@ inline void ClientImpl::Session::reset_protocol_state() noexcept
     m_client_error = util::none;
 
     m_upload_progress = m_progress.upload;
-    m_last_version_selected_for_upload = m_upload_progress.client_version;
-    m_last_download_mark_sent          = m_last_download_mark_received;
-    // clang-format on
+    m_last_download_mark_sent = m_last_download_mark_received;
 }
 
 inline void ClientImpl::Session::ensure_enlisted_to_send()

@@ -511,6 +511,14 @@ CollectionType Table::get_collection_type(ColKey col_key) const
     return CollectionType::Dictionary;
 }
 
+void Table::remove_columns()
+{
+    for (size_t i = get_column_count(); i > 0; --i) {
+        ColKey col_key = spec_ndx2colkey(i - 1);
+        remove_column(col_key);
+    }
+}
+
 void Table::remove_column(ColKey col_key)
 {
     check_column(col_key);
@@ -1082,9 +1090,9 @@ void Table::do_erase_root_column(ColKey col_key)
     bump_storage_version();
 }
 
-Query Table::where(const DictionaryLinkValues& dictionary_of_links) const
+Query Table::where(const Dictionary& dict) const
 {
-    return Query(m_own_ref, dictionary_of_links);
+    return Query(m_own_ref, dict.clone_as_obj_list());
 }
 
 void Table::set_table_type(Type table_type, bool handle_backlinks)
@@ -1567,16 +1575,6 @@ uint64_t Table::allocate_sequence_number()
     m_top.set(top_position_for_sequence_number, rot);
 
     return sn;
-}
-
-void Table::set_sequence_number(uint64_t seq)
-{
-    m_top.set(top_position_for_sequence_number, RefOrTagged::make_tagged(seq));
-}
-
-void Table::set_collision_map(ref_type ref)
-{
-    m_top.set(top_position_for_collision_map, RefOrTagged::make_ref(ref));
 }
 
 void Table::set_col_key_sequence_number(uint64_t seq)
@@ -2245,8 +2243,10 @@ Obj Table::create_linked_object()
 
     GlobalKey object_id = allocate_object_id_squeezed();
     ObjKey key = object_id.get_local_key(get_sync_file_id());
-
     REALM_ASSERT(key.value >= 0);
+
+    if (auto repl = get_repl())
+        repl->create_linked_object(this, key);
 
     Obj obj = m_clusters.insert(key, {});
 
@@ -2359,6 +2359,13 @@ Obj Table::create_object_with_primary_key(const Mixed& primary_key, FieldValues&
 
     // Check if unresolved exists
     if (unres_key) {
+        if (Replication* repl = get_repl()) {
+            if (auto logger = repl->would_log(util::Logger::Level::debug)) {
+                logger->log(LogCategory::object, util::Logger::Level::debug, "Cancel tombstone on '%1': %2",
+                            get_class_name(), unres_key);
+            }
+        }
+
         auto tombstone = m_tombstones->get(unres_key);
         ret.assign_pk_and_backlinks(tombstone);
         // If tombstones had no links to it, it may still be alive
@@ -2629,6 +2636,13 @@ Obj Table::get_or_create_tombstone(ObjKey key, ColKey pk_col, Mixed pk_val)
             }
         }
         return tombstone;
+    }
+    if (Replication* repl = get_repl()) {
+        if (auto logger = repl->would_log(util::Logger::Level::debug)) {
+            logger->log(LogCategory::object, util::Logger::Level::debug,
+                        "Create tombstone for object '%1' with primary key %2 : %3", get_class_name(), pk_val,
+                        unres_key);
+        }
     }
     return m_tombstones->insert(unres_key, {{pk_col, pk_val}});
 }

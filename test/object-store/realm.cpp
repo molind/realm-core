@@ -45,13 +45,19 @@
 
 #if REALM_ENABLE_SYNC
 #include <util/sync/flx_sync_harness.hpp>
+#include <util/sync/sync_test_utils.hpp>
+#include <util/test_file.hpp>
+#ifdef REALM_ENABLE_AUTH_TESTS
+#include <util/sync/baas_admin_api.hpp>
+#endif // REALM_ENABLE_AUTH_TESTS
 
 #include <realm/object-store/sync/async_open_task.hpp>
-#include <realm/object-store/sync/impl/sync_metadata.hpp>
+#include <realm/object-store/sync/impl/app_metadata.hpp>
 #include <realm/object-store/sync/sync_session.hpp>
+
 #include <realm/sync/noinst/client_history_impl.hpp>
 #include <realm/sync/subscriptions.hpp>
-#endif
+#endif // REALM_ENABLE_SYNC
 
 #include <catch2/catch_all.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
@@ -61,7 +67,7 @@
 #include <array>
 #if REALM_HAVE_UV
 #include <uv.h>
-#endif
+#endif // REALM_HAVE_UV
 
 namespace realm {
 class TestHelper {
@@ -241,7 +247,6 @@ TEST_CASE("SharedRealm: get_shared_realm()") {
                 Catch::Matchers::ContainsSubstring("Migration is required due to the following errors:"));
         }
     }
-
 
 // Windows doesn't use fifos
 #ifndef _WIN32
@@ -455,6 +460,7 @@ TEST_CASE("SharedRealm: get_shared_realm()") {
         REQUIRE(realm4->schema().size() == 1);
         REQUIRE(realm4->schema().find("object") != realm4->schema().end());
     }
+
 #ifndef _WIN32
     SECTION("should throw when creating the notification pipe fails") {
         // The ExternalCommitHelper implementation on Windows doesn't rely on FIFOs
@@ -474,21 +480,23 @@ TEST_CASE("SharedRealm: get_shared_realm()") {
     }
 #endif
 
+#if !REALM_USE_UV && !TEST_SCHEDULER_UV // uv scheduler does not support background threads
     SECTION("should get different instances on different threads") {
         config.cache = true;
         auto realm1 = Realm::get_shared_realm(config);
-        std::thread([&] {
+        JoiningThread([&] {
             auto realm2 = Realm::get_shared_realm(config);
             REQUIRE(realm1 != realm2);
-        }).join();
+        });
     }
+#endif
 
     SECTION("should detect use of Realm on incorrect thread") {
         auto realm = Realm::get_shared_realm(config);
-        std::thread([&] {
+        JoiningThread([&] {
             REQUIRE_THROWS_MATCHES(realm->verify_thread(), LogicError,
                                    Catch::Matchers::Message("Realm accessed from incorrect thread."));
-        }).join();
+        });
     }
 
     // Our test scheduler uses a simple integer identifier to allow cross thread scheduling
@@ -537,19 +545,19 @@ TEST_CASE("SharedRealm: get_shared_realm()") {
         config.cache = true;
         config.scheduler = std::make_shared<SimpleScheduler>(1);
         auto realm = Realm::get_shared_realm(config);
-        std::thread([&] {
+        JoiningThread([&] {
             REQUIRE_NOTHROW(realm->verify_thread());
-        }).join();
+        });
     }
 
     SECTION("should get same instance for same explicit execution context on different thread") {
         config.cache = true;
         config.scheduler = std::make_shared<SimpleScheduler>(1);
         auto realm1 = Realm::get_shared_realm(config);
-        std::thread([&] {
+        JoiningThread([&] {
             auto realm2 = Realm::get_shared_realm(config);
             REQUIRE(realm1 == realm2);
-        }).join();
+        });
     }
 
     SECTION("should not modify the schema when fetching from the cache") {
@@ -935,27 +943,9 @@ TEST_CASE("Get Realm using Async Open", "[sync][pbs][async open]") {
 
     std::mutex mutex;
 
-    auto async_open_realm = [&](const Realm::Config& config) {
-        ThreadSafeReference realm_ref;
-        std::exception_ptr error;
-        auto task = Realm::get_synchronized_realm(config);
-        task->start([&](ThreadSafeReference&& ref, std::exception_ptr e) {
-            std::lock_guard lock(mutex);
-            realm_ref = std::move(ref);
-            error = e;
-        });
-        util::EventLoop::main().run_until([&] {
-            std::lock_guard lock(mutex);
-            return realm_ref || error;
-        });
-        return std::pair(std::move(realm_ref), error);
-    };
-
     SECTION("can open synced Realms that don't already exist") {
-        auto [ref, error] = async_open_realm(config);
-        REQUIRE(ref);
-        REQUIRE_FALSE(error);
-        REQUIRE(Realm::get_shared_realm(std::move(ref))->read_group().get_table("class_object"));
+        auto realm = successfully_async_open_realm(config);
+        REQUIRE(realm->read_group().get_table("class_object"));
     }
 
     SECTION("can write a realm file without client file id") {
@@ -974,11 +964,8 @@ TEST_CASE("Get Realm using Async Open", "[sync][pbs][async open]") {
 
         // Create realm file without client file id
         {
-            auto [ref, error] = async_open_realm(config);
-            REQUIRE(ref);
-            REQUIRE_FALSE(error);
+            auto realm = successfully_async_open_realm(config);
             // Write some data
-            SharedRealm realm = Realm::get_shared_realm(std::move(ref));
             realm->begin_transaction();
             realm->get_class("object").create_object(2);
             realm->commit_transaction();
@@ -1026,10 +1013,8 @@ TEST_CASE("Get Realm using Async Open", "[sync][pbs][async open]") {
             wait_for_upload(*realm);
         }
 
-        auto [ref, error] = async_open_realm(config);
-        REQUIRE(ref);
-        REQUIRE_FALSE(error);
-        REQUIRE(Realm::get_shared_realm(std::move(ref))->read_group().get_table("class_object"));
+        auto realm = successfully_async_open_realm(config);
+        REQUIRE(realm->read_group().get_table("class_object"));
     }
 
     SECTION("progress notifiers of a task are cancelled if the task is cancelled") {
@@ -1054,12 +1039,12 @@ TEST_CASE("Get Realm using Async Open", "[sync][pbs][async open]") {
         std::shared_ptr<AsyncOpenTask> task2 = Realm::get_synchronized_realm(config);
         REQUIRE(task);
         REQUIRE(task2);
-        task->register_download_progress_notifier([&](uint64_t, uint64_t) {
+        task->register_download_progress_notifier([&](uint64_t, uint64_t, double) {
             std::lock_guard<std::mutex> guard(mutex);
             REQUIRE(!task1_completed);
             progress_notifier1_called = true;
         });
-        task2->register_download_progress_notifier([&](uint64_t, uint64_t) {
+        task2->register_download_progress_notifier([&](uint64_t, uint64_t, double) {
             std::lock_guard<std::mutex> guard(mutex);
             REQUIRE(!task2_completed);
             progress_notifier2_called = true;
@@ -1104,10 +1089,8 @@ TEST_CASE("Get Realm using Async Open", "[sync][pbs][async open]") {
             wait_for_upload(*realm);
         }
 
-        auto [ref, error] = async_open_realm(config);
-        REQUIRE(ref);
-        REQUIRE_FALSE(error);
-        REQUIRE(Realm::get_shared_realm(std::move(ref))->read_group().get_table("class_object")->size() == 1);
+        auto realm = successfully_async_open_realm(config);
+        REQUIRE(realm->read_group().get_table("class_object")->size() == 1);
     }
 
     SECTION("can download multiple Realms at a time") {
@@ -1137,11 +1120,24 @@ TEST_CASE("Get Realm using Async Open", "[sync][pbs][async open]") {
     auto expired_token = encode_fake_jwt("", 123, 456);
 
     SECTION("can async open while waiting for a token refresh") {
-        SyncTestFile config(tsm, "realm");
-        auto user = config.sync_config->user;
+        struct User : TestUser {
+            using TestUser::TestUser;
+            CompletionHandler stored_completion;
+            void request_access_token(CompletionHandler&& completion) override
+            {
+                stored_completion = std::move(completion);
+            }
+            bool access_token_refresh_required() const override
+            {
+                return !stored_completion;
+            }
+        };
+        auto user = std::make_shared<User>("realm", tsm.sync_manager());
+        SyncTestFile config(user, "realm");
         auto valid_token = user->access_token();
-        user->update_access_token(std::move(expired_token));
+        user->m_access_token = expired_token;
 
+        REQUIRE_FALSE(user->stored_completion);
         std::atomic<bool> called{false};
         auto task = Realm::get_synchronized_realm(config);
         task->start([&](auto ref, auto error) {
@@ -1150,11 +1146,11 @@ TEST_CASE("Get Realm using Async Open", "[sync][pbs][async open]") {
             REQUIRE(!error);
             called = true;
         });
-        auto session = tsm.sync_manager()->get_existing_session(config.path);
-        REQUIRE(session);
-        CHECK(session->state() == SyncSession::State::WaitingForAccessToken);
+        REQUIRE(user->stored_completion);
+        user->m_access_token = valid_token;
+        user->stored_completion({});
+        user->stored_completion = {};
 
-        session->update_access_token(valid_token);
         util::EventLoop::main().run_until([&] {
             return called.load();
         });
@@ -1163,25 +1159,21 @@ TEST_CASE("Get Realm using Async Open", "[sync][pbs][async open]") {
     }
 
     SECTION("cancels download and reports an error on auth error") {
-        struct Transport : UnitTestTransport {
-            void send_request_to_server(
-                const realm::app::Request& req,
-                realm::util::UniqueFunction<void(const realm::app::Response&)>&& completion) override
+        struct User : TestUser {
+            using TestUser::TestUser;
+            void request_access_token(CompletionHandler&& completion) override
             {
-                if (req.url.find("/auth/session") != std::string::npos) {
-                    completion(app::Response{403});
-                }
-                else {
-                    UnitTestTransport::send_request_to_server(req, std::move(completion));
-                }
+                completion(app::AppError(ErrorCodes::HTTPError, "403 error", "", 403));
+            }
+            bool access_token_refresh_required() const override
+            {
+                return true;
             }
         };
-        OfflineAppSession::Config oas_config;
-        oas_config.transport = std::make_shared<Transport>();
-        OfflineAppSession oas(oas_config);
-
-        SyncTestFile config(oas, "realm");
-        config.sync_config->user->log_in(expired_token, expired_token);
+        auto user = std::make_shared<User>("realm", tsm.sync_manager());
+        user->m_access_token = expired_token;
+        user->m_refresh_token = expired_token;
+        SyncTestFile config(user, "realm");
 
         bool got_error = false;
         config.sync_config->error_handler = [&](std::shared_ptr<SyncSession>, SyncError) {
@@ -1192,9 +1184,8 @@ TEST_CASE("Get Realm using Async Open", "[sync][pbs][async open]") {
         task->start([&](auto ref, auto error) {
             std::lock_guard<std::mutex> lock(mutex);
             REQUIRE(error);
-            REQUIRE_EXCEPTION(
-                std::rethrow_exception(error), HTTPError,
-                "Unable to refresh the user access token: http error code considered fatal. Client Error: 403");
+            REQUIRE_EXCEPTION(std::rethrow_exception(error), HTTPError,
+                              "Unable to refresh the user access token: 403 error. Client Error: 403");
             REQUIRE(!ref);
             called = true;
         });
@@ -1206,6 +1197,142 @@ TEST_CASE("Get Realm using Async Open", "[sync][pbs][async open]") {
         REQUIRE(got_error);
     }
 
+#if REALM_APP_SERVICES
+
+    SECTION("waiters are cancelled if cancel_waits_on_nonfatal_error") {
+        auto logger = util::Logger::get_default_logger();
+        auto transport = std::make_shared<HookedTransport<UnitTestTransport>>();
+        auto socket_provider = std::make_shared<HookedSocketProvider>(logger, "some user agent");
+        enum TestMode { expired_at_start, expired_by_websocket, websocket_fails };
+        enum FailureMode { location_fails, token_fails, token_not_authorized };
+        auto txt_test_mode = [](TestMode mode) {
+            switch (mode) {
+                case TestMode::expired_at_start:
+                    return "access token expired when realm is opened";
+                case TestMode::expired_by_websocket:
+                    return "access token expired by websocket";
+                case TestMode::websocket_fails:
+                    return "websocket returns connection failed";
+                default:
+                    return "Unknown TestMode";
+            }
+        };
+        auto txt_failure_mode = [](FailureMode mode) {
+            switch (mode) {
+                case FailureMode::location_fails:
+                    return "location update fails";
+                case FailureMode::token_fails:
+                    return "access token refresh fails";
+                case FailureMode::token_not_authorized:
+                    return "websocket connect not authorized";
+                default:
+                    return "Unknown FailureMode";
+            }
+        };
+
+        app::AppConfig app_config;
+        set_app_config_defaults(app_config, transport);
+        app_config.sync_client_config.socket_provider = socket_provider;
+        app_config.base_file_path = util::make_temp_dir();
+        app_config.metadata_mode = app::AppConfig::MetadataMode::NoEncryption;
+
+        auto app = app::App::get_app(app::App::CacheMode::Disabled, app_config);
+        create_user_and_log_in(app);
+        auto user = app->current_user();
+        // User should be logged in at this point
+        REQUIRE(user->is_logged_in());
+
+        bool not_authorized = false;
+        bool token_refresh_called = false;
+        bool location_refresh_called = false;
+
+        TestMode test_mode = GENERATE(expired_at_start, expired_by_websocket, websocket_fails);
+        FailureMode failure = GENERATE(location_fails, token_fails, token_not_authorized);
+
+        logger->info("TEST: %1 - %2", txt_test_mode(test_mode), txt_failure_mode(failure));
+        if (test_mode == TestMode::expired_at_start) {
+            // invalidate the user's cached access token
+            auto app_user = app->current_user();
+            app_user->update_data_for_testing([&](app::UserData& data) {
+                data.access_token = RealmJWT(expired_token);
+            });
+        }
+        else if (test_mode == TestMode::expired_by_websocket) {
+            // tell websocket to return not authorized to refresh access token
+            not_authorized = true;
+        }
+
+        app.reset();
+
+        auto err_handler = [](std::shared_ptr<SyncSession> session, SyncError error) {
+            auto logger = util::Logger::get_default_logger();
+            logger->debug("The sync error handler caught an error: '%1' for '%2'", error.status, session->path());
+            // Ignore connection failed non-fatal errors and check for access token refresh unauthorized fatal errors
+            if (error.status.code() == ErrorCodes::SyncConnectFailed) {
+                REQUIRE_FALSE(error.is_fatal);
+                return;
+            }
+            // If it's not SyncConnectFailed, then it should be AuthError
+            REQUIRE(error.status.code() == ErrorCodes::AuthError);
+            REQUIRE(error.is_fatal);
+        };
+
+        transport->request_hook = [&](const app::Request& req) -> std::optional<app::Response> {
+            static constexpr int CURLE_OPERATION_TIMEDOUT = 28;
+            std::lock_guard<std::mutex> lock(mutex);
+            if (req.url.find("/auth/session") != std::string::npos) {
+                token_refresh_called = true;
+                if (failure == FailureMode::token_not_authorized) {
+                    return app::Response{403, 0, {}, "403 not authorized"};
+                }
+                if (failure == FailureMode::token_fails) {
+                    return app::Response{0, CURLE_OPERATION_TIMEDOUT, {}, "Operation timed out"};
+                }
+            }
+            else if (req.url.find("/location") != std::string::npos) {
+                location_refresh_called = true;
+                if (failure == FailureMode::location_fails) {
+                    // Fake "offline/request timed out" custom error response
+                    return app::Response{0, CURLE_OPERATION_TIMEDOUT, {}, "Operation timed out"};
+                }
+            }
+            return std::nullopt;
+        };
+
+        socket_provider->websocket_connect_func = [&]() -> std::optional<SocketProviderError> {
+            if (not_authorized) {
+                not_authorized = false; // one shot
+                return SocketProviderError(sync::websocket::WebSocketError::websocket_unauthorized,
+                                           "403 not authorized");
+            }
+            return SocketProviderError(sync::websocket::WebSocketError::websocket_connection_failed,
+                                       "Operation timed out");
+        };
+
+        app = app::App::get_app(app::App::CacheMode::Disabled, app_config);
+        SyncTestFile config(app->current_user(), "realm");
+        config.sync_config->cancel_waits_on_nonfatal_error = true;
+        config.sync_config->error_handler = err_handler;
+
+        // User should be logged in at this point
+        REQUIRE(config.sync_config->user->is_logged_in());
+
+        auto status = async_open_realm(config);
+        REQUIRE_FALSE(status.is_ok());
+
+        {
+            std::lock_guard lock(mutex);
+            REQUIRE(location_refresh_called);
+            if (failure != FailureMode::location_fails) {
+                REQUIRE(token_refresh_called);
+            }
+        }
+
+        app->sync_manager()->tear_down_for_testing();
+    }
+
+#endif // REALM_APP_SERVICES
+
     SECTION("read-only mode sets the schema version") {
         {
             SharedRealm realm = Realm::get_shared_realm(config);
@@ -1214,10 +1341,8 @@ TEST_CASE("Get Realm using Async Open", "[sync][pbs][async open]") {
         }
 
         config2.schema_mode = SchemaMode::ReadOnly;
-        auto [ref, error] = async_open_realm(config2);
-        REQUIRE(ref);
-        REQUIRE_FALSE(error);
-        REQUIRE(Realm::get_shared_realm(std::move(ref))->schema_version() == 1);
+        auto realm = successfully_async_open_realm(config2);
+        REQUIRE(realm->schema_version() == 1);
     }
 
     Schema with_added_object = Schema{object_schema,
@@ -1241,10 +1366,7 @@ TEST_CASE("Get Realm using Async Open", "[sync][pbs][async open]") {
 
         // Verify that the table gets added when reopening
         config2.schema_mode = SchemaMode::ReadOnly;
-        auto [ref, error] = async_open_realm(config2);
-        REQUIRE(ref);
-        REQUIRE_FALSE(error);
-        auto realm = Realm::get_shared_realm(std::move(ref));
+        auto realm = successfully_async_open_realm(config2);
         REQUIRE(realm->schema().find("added") != realm->schema().end());
         REQUIRE(realm->read_group().get_table("class_added"));
     }
@@ -1255,10 +1377,7 @@ TEST_CASE("Get Realm using Async Open", "[sync][pbs][async open]") {
 
         config2.schema = with_added_object;
         config2.schema_mode = SchemaMode::ReadOnly;
-        auto [ref, error] = async_open_realm(config2);
-        REQUIRE(ref);
-        REQUIRE_FALSE(error);
-        auto realm = Realm::get_shared_realm(std::move(ref));
+        auto realm = successfully_async_open_realm(config2);
         REQUIRE(realm->schema().find("added") != realm->schema().end());
         REQUIRE_FALSE(realm->read_group().get_table("class_added"));
     }
@@ -1275,10 +1394,10 @@ TEST_CASE("Get Realm using Async Open", "[sync][pbs][async open]") {
                                     {"value2", PropertyType::Int},
                                 }}};
 
-        auto [ref, error] = async_open_realm(config);
-        REQUIRE_FALSE(ref);
-        REQUIRE(error);
-        REQUIRE_THROWS_CONTAINING(std::rethrow_exception(error), "Property 'object.value2' has been added.");
+        auto status = async_open_realm(config);
+        REQUIRE_FALSE(status.is_ok());
+        REQUIRE_THAT(status.get_status().reason(),
+                     Catch::Matchers::ContainsSubstring("Property 'object.value2' has been added."));
     }
 
     SECTION("adding a property to an existing read-only Realm reports an error") {
@@ -1293,10 +1412,10 @@ TEST_CASE("Get Realm using Async Open", "[sync][pbs][async open]") {
                                 }}};
         REQUIRE_THROWS_CONTAINING(Realm::get_shared_realm(config), "Property 'object.value2' has been added.");
 
-        auto [ref, error] = async_open_realm(config);
-        REQUIRE_FALSE(ref);
-        REQUIRE(error);
-        REQUIRE_THROWS_CONTAINING(std::rethrow_exception(error), "Property 'object.value2' has been added.");
+        auto status = async_open_realm(config);
+        REQUIRE_FALSE(status.is_ok());
+        REQUIRE_THAT(status.get_status().reason(),
+                     Catch::Matchers::ContainsSubstring("Property 'object.value2' has been added."));
     }
 
     SECTION("removing a property from a newly downloaded read-only Realm leaves the column in place") {
@@ -1310,13 +1429,8 @@ TEST_CASE("Get Realm using Async Open", "[sync][pbs][async open]") {
                                     {"_id", PropertyType::Int, Property::IsPrimary{true}},
                                 }}};
 
-        auto [ref, error] = async_open_realm(config);
-        REQUIRE(ref);
-        REQUIRE_FALSE(error);
-        REQUIRE(Realm::get_shared_realm(std::move(ref))
-                    ->read_group()
-                    .get_table("class_object")
-                    ->get_column_key("value") != ColKey{});
+        auto realm = successfully_async_open_realm(config);
+        REQUIRE(realm->read_group().get_table("class_object")->get_column_key("value") != ColKey{});
     }
 
     SECTION("removing a property from a existing read-only Realm leaves the column in place") {
@@ -1329,15 +1443,115 @@ TEST_CASE("Get Realm using Async Open", "[sync][pbs][async open]") {
                                     {"_id", PropertyType::Int, Property::IsPrimary{true}},
                                 }}};
 
-        auto [ref, error] = async_open_realm(config);
-        REQUIRE(ref);
-        REQUIRE_FALSE(error);
-        REQUIRE(Realm::get_shared_realm(std::move(ref))
-                    ->read_group()
-                    .get_table("class_object")
-                    ->get_column_key("value") != ColKey{});
+        auto realm = successfully_async_open_realm(config);
+        REQUIRE(realm->read_group().get_table("class_object")->get_column_key("value") != ColKey{});
     }
+
+    _impl::RealmCoordinator::assert_no_open_realms();
 }
+
+#if REALM_ENABLE_AUTH_TESTS
+
+TEST_CASE("Synchronized realm: AutoOpen", "[sync][baas][pbs][async open]") {
+    const auto partition = random_string(100);
+    auto schema = get_default_schema();
+    enum TestMode { expired_at_start, expired_by_websocket, websocket_fails };
+    enum FailureMode { location_fails, token_fails, token_not_authorized };
+
+    auto logger = util::Logger::get_default_logger();
+    auto transport = std::make_shared<HookedTransport<>>();
+    auto socket_provider = std::make_shared<HookedSocketProvider>(logger, "some user agent");
+    std::mutex mutex;
+
+    // Create the app session and get the logged in user identity
+    auto server_app_config = minimal_app_config("autoopen-realm", schema);
+    TestAppSession session(create_app(server_app_config), transport, DeleteApp{true}, realm::ReconnectMode::normal,
+                           socket_provider);
+    auto user = session.app()->current_user();
+    std::string identity = user->user_id();
+    REQUIRE(user->is_logged_in());
+    REQUIRE(!identity.empty());
+    // Reopen the App instance and retrieve the cached user
+    session.reopen(false);
+    user = session.app()->get_existing_logged_in_user(identity);
+
+    SyncTestFile config(user, partition, schema);
+    config.sync_config->cancel_waits_on_nonfatal_error = true;
+    config.sync_config->error_handler = [&logger](std::shared_ptr<SyncSession> session, SyncError error) {
+        logger->debug("The sync error handler caught an error: '%1' for '%2'", error.status, session->path());
+        // Ignore connection failed non-fatal errors and check for access token refresh unauthorized fatal errors
+        if (error.status.code() == ErrorCodes::SyncConnectFailed) {
+            REQUIRE_FALSE(error.is_fatal);
+            return;
+        }
+        // If it's not SyncConnectFailed, then it should be AuthError
+        REQUIRE(error.status.code() == ErrorCodes::AuthError);
+        REQUIRE(error.is_fatal);
+    };
+
+    bool not_authorized = false;
+    bool token_refresh_called = false;
+    bool location_refresh_called = false;
+
+    FailureMode failure = FailureMode::location_fails;
+
+    transport->request_hook = [&](const app::Request& req) -> std::optional<app::Response> {
+        static constexpr int CURLE_OPERATION_TIMEDOUT = 28;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (req.url.find("/auth/session") != std::string::npos) {
+            token_refresh_called = true;
+            if (failure == FailureMode::token_not_authorized) {
+                return app::Response{403, 0, {}, "403 not authorized"};
+            }
+            if (failure == FailureMode::token_fails) {
+                return app::Response{0, CURLE_OPERATION_TIMEDOUT, {}, "Operation timed out"};
+            }
+        }
+        else if (req.url.find("/location") != std::string::npos) {
+            location_refresh_called = true;
+            if (failure == FailureMode::location_fails) {
+                // Fake "offline/request timed out" custom error response
+                return app::Response{0, CURLE_OPERATION_TIMEDOUT, {}, "Operation timed out"};
+            }
+        }
+        return std::nullopt;
+    };
+
+    socket_provider->websocket_connect_func = [&]() -> std::optional<SocketProviderError> {
+        if (not_authorized) {
+            not_authorized = false; // one shot
+            return SocketProviderError(sync::websocket::WebSocketError::websocket_unauthorized, "403 not authorized");
+        }
+        return SocketProviderError(sync::websocket::WebSocketError::websocket_connection_failed,
+                                   "Operation timed out");
+    };
+
+    auto task = Realm::get_synchronized_realm(config);
+    auto pf = util::make_promise_future<std::exception_ptr>();
+    task->start([&pf](auto ref, auto error) mutable {
+        REQUIRE(!ref);
+        REQUIRE(error);
+        pf.promise.emplace_value(error);
+    });
+
+    auto result = pf.future.get_no_throw();
+    REQUIRE(result.is_ok());
+    REQUIRE(result.get_value());
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        REQUIRE(location_refresh_called);
+        if (failure != FailureMode::location_fails) {
+            REQUIRE(token_refresh_called);
+        }
+    }
+
+    transport->request_hook = nullptr;
+    socket_provider->websocket_connect_func = nullptr;
+    auto r = Realm::get_shared_realm(config);
+    wait_for_download(*r);
+}
+
+#endif // REALM_ENABLE_AUTH_TESTS
 
 TEST_CASE("SharedRealm: convert", "[sync][pbs][convert]") {
     TestSyncManager tsm;
@@ -2440,6 +2654,68 @@ TEST_CASE("SharedRealm: async writes") {
 
     _impl::RealmCoordinator::clear_all_caches();
 }
+
+TEST_CASE("Call run_async_completions after realm has been closed") {
+    // This requires a special scheduler as we have to call Realm::close
+    // just after DB::AsyncCommitHelper has made a callback to the function
+    // that asks the scheduler to invoke run_async_completions()
+
+    struct ManualScheduler : util::Scheduler {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::vector<util::UniqueFunction<void()>> callbacks;
+
+        void invoke(util::UniqueFunction<void()>&& cb) override
+        {
+            {
+                std::lock_guard lock(mutex);
+                callbacks.push_back(std::move(cb));
+            }
+            cv.notify_all();
+        }
+
+        bool is_on_thread() const noexcept override
+        {
+            return true;
+        }
+        bool is_same_as(const Scheduler*) const noexcept override
+        {
+            return false;
+        }
+        bool can_invoke() const noexcept override
+        {
+            return true;
+        }
+    };
+
+    auto scheduler = std::make_shared<ManualScheduler>();
+
+    TestFile config;
+    config.schema_version = 0;
+    config.schema = Schema{{"object", {{"value", PropertyType::Int}}}};
+    config.scheduler = scheduler;
+    config.automatic_change_notifications = false;
+
+    auto realm = Realm::get_shared_realm(config);
+
+    realm->begin_transaction();
+    realm->async_commit_transaction([](std::exception_ptr) {});
+
+    std::vector<util::UniqueFunction<void()>> callbacks;
+    {
+        std::unique_lock lock(scheduler->mutex);
+        // Wait for scheduler to be invoked
+        scheduler->cv.wait(lock, [&] {
+            return !scheduler->callbacks.empty();
+        });
+        callbacks.swap(scheduler->callbacks);
+    }
+    realm->close();
+    // Call whatever functions that was added to scheduler.
+    for (auto& cb : callbacks)
+        cb();
+}
+
 // Our libuv scheduler currently does not support background threads, so we can
 // only run this on apple platforms
 #if REALM_PLATFORM_APPLE
@@ -3738,15 +4014,15 @@ TEST_CASE("SharedRealm: compact on launch") {
         config.scheduler = util::Scheduler::make_frozen(VersionID());
         r = Realm::get_shared_realm(config);
         REQUIRE(num_opens == 2);
-        std::thread([&] {
+        JoiningThread([&] {
             auto r2 = Realm::get_shared_realm(config);
             REQUIRE(num_opens == 2);
-        }).join();
+        });
         r->close();
-        std::thread([&] {
+        JoiningThread([&] {
             auto r3 = Realm::get_shared_realm(config);
             REQUIRE(num_opens == 3);
-        }).join();
+        });
     }
 }
 
@@ -4034,16 +4310,16 @@ TEST_CASE("RealmCoordinator: get_unbound_realm()") {
     };
 
     ThreadSafeReference ref;
-    std::thread([&] {
+    JoiningThread([&] {
         ref = _impl::RealmCoordinator::get_coordinator(config)->get_unbound_realm();
-    }).join();
+    });
 
     SECTION("checks thread after being resolved") {
         auto realm = Realm::get_shared_realm(std::move(ref));
         REQUIRE_NOTHROW(realm->verify_thread());
-        std::thread([&] {
+        JoiningThread([&] {
             REQUIRE_EXCEPTION(realm->verify_thread(), WrongThread, "Realm accessed from incorrect thread.");
-        }).join();
+        });
     }
 
     SECTION("delivers notifications to the thread it is resolved on") {
@@ -4075,9 +4351,9 @@ TEST_CASE("RealmCoordinator: get_unbound_realm()") {
         REQUIRE(r1 != r2);
 
         // New unbound with cache disabled
-        std::thread([&] {
+        JoiningThread([&] {
             ref = _impl::RealmCoordinator::get_coordinator(config)->get_unbound_realm();
-        }).join();
+        });
         auto r3 = Realm::get_shared_realm(std::move(ref));
         REQUIRE(r1 != r3);
         REQUIRE(r2 != r3);

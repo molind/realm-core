@@ -273,32 +273,6 @@ void CollectionBaseImpl<SetBase>::to_json(std::ostream& out, JSONOutputMode outp
     }
 }
 
-bool SetBase::do_init_from_parent(ref_type ref, bool allow_create) const
-{
-    try {
-        if (ref) {
-            m_tree->init_from_ref(ref);
-        }
-        else {
-            if (m_tree->init_from_parent()) {
-                // All is well
-                return true;
-            }
-            if (!allow_create) {
-                return false;
-            }
-            // The ref in the column was NULL, create the tree in place.
-            m_tree->create();
-            REALM_ASSERT(m_tree->is_attached());
-        }
-    }
-    catch (...) {
-        m_tree->detach();
-        throw;
-    }
-    return true;
-}
-
 void SetBase::resort_range(size_t start, size_t end)
 {
     if (end > size()) {
@@ -509,19 +483,9 @@ void LnkSet::remove_all_target_rows()
     }
 }
 
-void LnkSet::to_json(std::ostream& out, JSONOutputMode, util::FunctionRef<void(const Mixed&)> fn) const
+void LnkSet::to_json(std::ostream& out, JSONOutputMode mode, util::FunctionRef<void(const Mixed&)> fn) const
 {
-    out << "[";
-
-    auto sz = m_set.size();
-    for (size_t i = 0; i < sz; i++) {
-        if (i > 0)
-            out << ",";
-        Mixed val(m_set.get(i));
-        fn(val);
-    }
-
-    out << "]";
+    m_set.to_json(out, mode, fn);
 }
 
 void set_sorted_indices(size_t sz, std::vector<size_t>& indices, bool ascending)

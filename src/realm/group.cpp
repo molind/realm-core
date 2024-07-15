@@ -839,10 +839,7 @@ void Group::remove_table(size_t table_ndx, TableKey key)
         // We don't want to replicate the individual column removals along the
         // way as they're covered by the table removal
         Table::DisableReplication dr(*table);
-        for (size_t i = table->get_column_count(); i > 0; --i) {
-            ColKey col_key = table->spec_ndx2colkey(i - 1);
-            table->remove_column(col_key);
-        }
+        table->remove_columns();
     }
 
     size_t prior_num_tables = m_tables.size();
@@ -954,8 +951,7 @@ auto Group::DefaultTableWriter::write_history(_impl::OutputStream& out) -> Histo
                                                          m_group->m_top.get_ref(), version, history_type,
                                                          history_schema_version);
         REALM_ASSERT(history_type != Replication::hist_None);
-        if (!m_should_write_history ||
-            (history_type != Replication::hist_SyncClient && history_type != Replication::hist_SyncServer)) {
+        if (!m_should_write_history || history_type == Replication::hist_None) {
             return info; // Only sync history should be preserved when writing to a new file
         }
         info.type = history_type;
@@ -988,14 +984,10 @@ void Group::write(File& file, const char* encryption_key, uint_fast64_t version_
 
     file.set_encryption_key(encryption_key);
 
-    // Force the file system to allocate a node so we get a stable unique id.
-    // See File::get_unique_id(). This is used to distinguish encrypted mappings.
-    file.resize(1);
-
     // The aim is that the buffer size should be at least 1/256 of needed size but less than 64 Mb
     constexpr size_t upper_bound = 64 * 1024 * 1024;
     size_t min_space = std::min(get_used_space() >> 8, upper_bound);
-    size_t buffer_size = 4096;
+    size_t buffer_size = page_size();
     while (buffer_size < min_space) {
         buffer_size <<= 1;
     }

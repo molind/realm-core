@@ -20,6 +20,7 @@
 #include <util/test_path.hpp>
 
 #include <realm/util/features.h>
+#include <realm/util/logger.hpp>
 #include <realm/util/to_string.hpp>
 
 #if TEST_SCHEDULER_UV
@@ -37,6 +38,77 @@
 #include <fstream>
 #include <iostream>
 #include <limits.h>
+#include <thread>
+
+#ifndef TEST_ENABLE_LOGGING
+#define TEST_ENABLE_LOGGING 0 // change to 1 to enable trace-level logging
+#endif
+
+#ifndef TEST_LOGGING_LEVEL
+#if TEST_ENABLE_LOGGING
+#define TEST_LOGGING_LEVEL all
+#else
+#define TEST_LOGGING_LEVEL off
+#endif // TEST_ENABLE_LOGGING
+#endif // TEST_LOGGING_LEVEL
+
+#define TEST_LOGGING_LEVEL_STORAGE off
+#define TEST_LOGGING_LEVEL_SERVER off
+/*
+#define TEST_LOGGING_LEVEL_SYNC off
+#define TEST_LOGGING_LEVEL_RESET trace
+#define TEST_LOGGING_LEVEL_APP off
+*/
+
+static std::vector<std::pair<std::string_view, realm::util::Logger::Level>> default_log_levels = {
+    {"Realm", realm::util::Logger::Level::TEST_LOGGING_LEVEL},
+#ifdef TEST_LOGGING_LEVEL_STORAGE
+    {"Realm.Storage", realm::util::Logger::Level::TEST_LOGGING_LEVEL_STORAGE},
+#endif
+#ifdef TEST_LOGGING_LEVEL_TRANSACTION
+    {"Realm.Storage.Transaction", realm::util::Logger::Level::TEST_LOGGING_LEVEL_TRANSACTION},
+#endif
+#ifdef TEST_LOGGING_LEVEL_QUERY
+    {"Realm.Storage.Query", realm::util::Logger::Level::TEST_LOGGING_LEVEL_QUERY},
+#endif
+#ifdef TEST_LOGGING_LEVEL_OBJECT
+    {"Realm.Storage.Object", realm::util::Logger::Level::TEST_LOGGING_LEVEL_OBJECT},
+#endif
+#ifdef TEST_LOGGING_LEVEL_NOTIFICATION
+    {"Realm.Storage.Notification", realm::util::Logger::Level::TEST_LOGGING_LEVEL_NOTIFICATION},
+#endif
+#ifdef TEST_LOGGING_LEVEL_SYNC
+    {"Realm.Sync", realm::util::Logger::Level::TEST_LOGGING_LEVEL_SYNC},
+#endif
+#ifdef TEST_LOGGING_LEVEL_CLIENT
+    {"Realm.Sync.Client", realm::util::Logger::Level::TEST_LOGGING_LEVEL_CLIENT},
+#endif
+#ifdef TEST_LOGGING_LEVEL_SESSION
+    {"Realm.Sync.Client.Session", realm::util::Logger::Level::TEST_LOGGING_LEVEL_SESSION},
+#endif
+#ifdef TEST_LOGGING_LEVEL_CHANGESET
+    {"Realm.Sync.Client.Changeset", realm::util::Logger::Level::TEST_LOGGING_LEVEL_CHANGESET},
+#endif
+#ifdef TEST_LOGGING_LEVEL_NETWORK
+    {"Realm.Sync.Client.Network", realm::util::Logger::Level::TEST_LOGGING_LEVEL_NETWORK},
+#endif
+#ifdef TEST_LOGGING_LEVEL_RESET
+    {"Realm.Sync.Client.Reset", realm::util::Logger::Level::TEST_LOGGING_LEVEL_RESET},
+#endif
+#ifdef TEST_LOGGING_LEVEL_SERVER
+    {"Realm.Sync.Server", realm::util::Logger::Level::TEST_LOGGING_LEVEL_SERVER},
+#endif
+#ifdef TEST_LOGGING_LEVEL_APP
+    {"Realm.App", realm::util::Logger::Level::TEST_LOGGING_LEVEL_APP},
+#endif
+};
+
+static void set_default_level_thresholds()
+{
+    for (auto [cat, level] : default_log_levels) {
+        realm::util::LogCategory::get_category(cat).set_default_level_threshold(level);
+    }
+}
 
 
 int run_object_store_tests(int argc, const char** argv);
@@ -86,10 +158,15 @@ int run_object_store_tests(int argc, const char** argv)
 #endif
 
 #if TEST_SCHEDULER_UV
-    realm::util::Scheduler::set_default_factory([]() {
+    static std::thread::id s_main_thread_id = std::this_thread::get_id();
+    realm::util::Scheduler::set_default_factory([]() -> std::shared_ptr<realm::util::Scheduler> {
+        // The libuv scheduler can only be constructed from the main thread
+        REALM_ASSERT_RELEASE(std::this_thread::get_id() == s_main_thread_id);
         return std::make_shared<realm::util::UvMainLoopScheduler>();
     });
 #endif
+
+    set_default_level_thresholds();
 
     Catch::Session session;
     session.useConfigData(config);

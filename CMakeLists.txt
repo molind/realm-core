@@ -34,7 +34,9 @@ endif()
 set(PROJECT_VERSION ${DEP_VERSION})
 
 # Project-wide build flags
-set(CMAKE_CXX_STANDARD 17)
+if (NOT DEFINED CMAKE_CXX_STANDARD)
+    set(CMAKE_CXX_STANDARD 17)
+endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -127,6 +129,9 @@ if(MSVC)
     # We use these in our AtomicSharedPtr implementation and it can't move
     # to atomic<shared_ptr<T>> because NotificationToken relies on movability.
     add_compile_options(/D_SILENCE_CXX20_OLD_SHARED_PTR_ATOMIC_SUPPORT_DEPRECATION_WARNING)
+
+    # Enable __cplusplus macro
+    add_compile_options(/Zc:__cplusplus)
 else()
     add_compile_options(-Wall -Wextra -Wempty-body -Wparentheses -Wunknown-pragmas -Wunreachable-code -Wunused-parameter -Wno-missing-field-initializers)
     # TODO: Remove this when fixed
@@ -266,6 +271,7 @@ option(REALM_VALGRIND "Tell the test suite we are running with valgrind" OFF)
 option(REALM_SYNC_MULTIPLEXING "Enables/disables sync session multiplexing by default" ON)
 set(REALM_MAX_BPNODE_SIZE "1000" CACHE STRING "Max B+ tree node size.")
 option(REALM_ENABLE_GEOSPATIAL "Enable geospatial types and queries." ON)
+option(REALM_APP_SERVICES "Enable the default app services implementation." ON)
 
 # Find dependencies
 set(THREADS_PREFER_PTHREAD_FLAG ON)
@@ -399,27 +405,10 @@ install(FILES tools/cmake/AcquireRealmDependency.cmake
         COMPONENT devel
         )
 
-if(CMAKE_SYSTEM_NAME MATCHES "^Windows")
-    # Increase the Catch2 virtual console width because our test names can be very long and they break test reports
-    set(CATCH_CONFIG_CONSOLE_WIDTH 300)
-elseif(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    set(CATCH_CONFIG_NO_POSIX_SIGNALS ON CACHE BOOL "Disable Catch support for POSIX signals on Apple platforms other than macOS")
+if(NOT REALM_BUILD_LIB_ONLY AND NOT REALM_NO_TESTS)
+    enable_testing()
+    add_subdirectory(test)
 endif()
-set(CATCH_CONFIG_ENABLE_ALL_STRINGMAKERS ON CACHE BOOL "Enable Catch2's optional standard library stringmakers")
-
-add_subdirectory(external EXCLUDE_FROM_ALL)
-
-# Cmake does not let us easily set the deployment target per-target, but Catch2
-# can use modern features because we only run tests on recent OS versions.
-target_compile_definitions(Catch2 PRIVATE _LIBCPP_DISABLE_AVAILABILITY)
-
-# Enable CTest and include unit tests
-enable_testing()
-
-if(REALM_BUILD_LIB_ONLY OR REALM_NO_TESTS)
-    set(REALM_EXCLUDE_TESTS EXCLUDE_FROM_ALL)
-endif()
-add_subdirectory(test ${REALM_EXCLUDE_TESTS})
 
 if (REALM_BUILD_TEST_CLIENT)
     add_subdirectory(test/client)

@@ -496,6 +496,8 @@ TEST_CASE("flx: client reset", "[sync][flx][client reset][baas]") {
              {"non_queryable_field", PropertyType::String | PropertyType::Nullable},
              {"list_of_ints_field", PropertyType::Int | PropertyType::Array},
              {"sum_of_list_field", PropertyType::Int},
+             {"any_mixed", PropertyType::Mixed | PropertyType::Nullable},
+             {"dictionary_mixed", PropertyType::Dictionary | PropertyType::Mixed | PropertyType::Nullable},
          }},
         {"TopLevel2",
          {
@@ -592,6 +594,24 @@ TEST_CASE("flx: client reset", "[sync][flx][client reset][baas]") {
     config_local.sync_config->notify_after_client_reset = [&after_reset_count](SharedRealm, ThreadSafeReference,
                                                                                bool) {
         ++after_reset_count;
+    };
+
+    config_local.sync_config->on_sync_client_event_hook = [](std::weak_ptr<SyncSession> weak_session,
+                                                             const SyncClientHookData& data) {
+        // To prevent the upload cursors from becoming out of sync when the local realm assumes
+        // the client file ident of the fresh realm, UPLOAD messages are not allowed during the
+        // fresh realm download so the server's upload cursor versions start at 0 when the
+        // local realm resumes after the client reset.
+        if (data.event == SyncClientHookEvent::UploadMessageSent) {
+            // If this is an UPLOAD message event, check to see if the fresh realm is being downloaded
+            if (auto session = weak_session.lock()) {
+                // Check for a "fresh" path to determine if this is a client reset fresh download session
+                if (_impl::client_reset::is_fresh_path(session->path())) {
+                    FAIL("UPLOAD messages are not allowed during client reset fresh realm download");
+                }
+            }
+        }
+        return SyncClientHookAction::NoAction;
     };
 
     SECTION("Recover: offline writes and subscription (single subscription)") {
@@ -728,6 +748,7 @@ TEST_CASE("flx: client reset", "[sync][flx][client reset][baas]") {
                 REQUIRE(mode == ClientResyncMode::Recover);
                 auto subs = local_realm->get_latest_subscription_set();
                 subs.get_state_change_notification(sync::SubscriptionSet::State::Complete).get();
+                subs.refresh();
                 // make sure that the subscription for "foo" survived the reset
                 size_t count_of_foo = count_queries_with_str(subs, util::format("\"%1\"", str_field_value));
                 REQUIRE(subs.state() == sync::SubscriptionSet::State::Complete);
@@ -906,6 +927,8 @@ TEST_CASE("flx: client reset", "[sync][flx][client reset][baas]") {
                 REQUIRE(before_reset_count == 1);
                 REQUIRE(after_reset_count == 0);
                 REQUIRE(sync_error.status == ErrorCodes::AutoClientResetFailed);
+                REQUIRE(sync_error.status.reason().find(
+                            "SyncClientResetRequired: Bad client file identifier (IDENT)") != std::string::npos);
                 REQUIRE(sync_error.is_client_reset_requested());
                 local_realm->refresh();
                 auto table = local_realm->read_group().get_table("class_TopLevel");
@@ -1131,6 +1154,8 @@ TEST_CASE("flx: client reset", "[sync][flx][client reset][baas]") {
                 auto sync_error = wait_for_future(std::move(err_future)).get();
                 INFO(sync_error.status);
                 CHECK(sync_error.status == ErrorCodes::AutoClientResetFailed);
+                REQUIRE(sync_error.status.reason().find(
+                            "SyncClientResetRequired: Bad client file identifier (IDENT)") != std::string::npos);
             })
             ->run();
     }
@@ -1258,27 +1283,21 @@ TEST_CASE("flx: client reset", "[sync][flx][client reset][baas]") {
     SECTION("Adding a local property matching a server addition is allowed") {
         auto mode = GENERATE(ClientResyncMode::DiscardLocal, ClientResyncMode::Recover);
         config_local.sync_config->client_resync_mode = mode;
-        seed_realm(config_local, ResetMode::InitiateClientReset);
+        CHECK_NOTHROW(seed_realm(config_local, ResetMode::InitiateClientReset));
         std::vector<ObjectSchema> changed_schema = schema;
         changed_schema[0].persisted_properties.push_back(
             {"queryable_oid_field", PropertyType::ObjectId | PropertyType::Nullable});
         // In a separate Realm, make the property addition.
         // Since this is dev mode, it will be added to the server's schema.
         config_remote.schema = changed_schema;
-        seed_realm(config_remote, ResetMode::NoReset);
+        CHECK_NOTHROW(seed_realm(config_remote, ResetMode::NoReset));
         std::swap(changed_schema[0].persisted_properties[1], changed_schema[0].persisted_properties[2]);
         config_local.schema = changed_schema;
         auto future = setup_reset_handlers_for_schema_validation(config_local, changed_schema);
-
-        async_open_realm(config_local,
-                         [&, fut = std::move(future)](ThreadSafeReference&& ref, std::exception_ptr error) {
-                             REQUIRE(ref);
-                             REQUIRE_FALSE(error);
-                             auto realm = Realm::get_shared_realm(std::move(ref));
-                             fut.get();
-                             CHECK(before_reset_count == 1);
-                             CHECK(after_reset_count == 1);
-                         });
+        successfully_async_open_realm(config_local);
+        CHECK_NOTHROW(future.get());
+        CHECK(before_reset_count == 1);
+        CHECK(after_reset_count == 1);
     }
 
     SECTION("Adding a local property matching a server addition inside the before reset callback is allowed") {
@@ -1310,15 +1329,10 @@ TEST_CASE("flx: client reset", "[sync][flx][client reset][baas]") {
             notify_after(before, std::move(after), did_recover);
         };
 
-        async_open_realm(config_local,
-                         [&, fut = std::move(future)](ThreadSafeReference&& ref, std::exception_ptr error) {
-                             REQUIRE(ref);
-                             REQUIRE_FALSE(error);
-                             auto realm = Realm::get_shared_realm(std::move(ref));
-                             fut.get();
-                             CHECK(before_reset_count == 1);
-                             CHECK(after_reset_count == 1);
-                         });
+        successfully_async_open_realm(config_local);
+        future.get();
+        CHECK(before_reset_count == 1);
+        CHECK(after_reset_count == 1);
     }
 
     auto make_additive_changes = [](std::vector<ObjectSchema> schema) {
@@ -1341,16 +1355,12 @@ TEST_CASE("flx: client reset", "[sync][flx][client reset][baas]") {
         config_local.sync_config->client_resync_mode = ClientResyncMode::Recover;
         ThreadSafeReference ref_async;
         auto future = setup_reset_handlers_for_schema_validation(config_local, changed_schema);
-        async_open_realm(config_local, [&](ThreadSafeReference&& ref, std::exception_ptr error) {
-            REQUIRE(ref);
-            REQUIRE_FALSE(error);
-            ref_async = std::move(ref);
-        });
-        future.get();
-        CHECK(before_reset_count == 1);
-        CHECK(after_reset_count == 1);
         {
-            auto realm = Realm::get_shared_realm(std::move(ref_async));
+            auto realm = successfully_async_open_realm(config_local);
+            future.get();
+            CHECK(before_reset_count == 1);
+            CHECK(after_reset_count == 1);
+
             // make changes to the newly added property
             realm->begin_transaction();
             auto table = realm->read_group().get_table("class_TopLevel");
@@ -1374,9 +1384,10 @@ TEST_CASE("flx: client reset", "[sync][flx][client reset][baas]") {
                               .get_state_change_notification(sync::SubscriptionSet::State::Complete)
                               .get();
             CHECK(result == sync::SubscriptionSet::State::Complete);
-            wait_for_advance(*realm);
+            realm->sync_session()->shutdown_and_wait();
             realm->close();
         }
+        REQUIRE_FALSE(_impl::RealmCoordinator::get_existing_coordinator(config_local.path));
         {
             // ensure that an additional schema change after the successful reset is also accepted by the server
             changed_schema[0].persisted_properties.push_back(
@@ -1387,23 +1398,19 @@ TEST_CASE("flx: client reset", "[sync][flx][client reset][baas]") {
                                           {"str_field_2", PropertyType::String | PropertyType::Nullable},
                                       }});
             config_local.schema = changed_schema;
-            async_open_realm(config_local, [&](ThreadSafeReference&& ref, std::exception_ptr error) {
-                REQUIRE(ref);
-                REQUIRE_FALSE(error);
-                auto realm = Realm::get_shared_realm(std::move(ref));
-                auto table = realm->read_group().get_table("class_AddedClassSecond");
-                ColKey new_col = table->get_column_key("str_field_2");
-                REQUIRE(new_col);
-                auto new_subs = realm->get_latest_subscription_set().make_mutable_copy();
-                new_subs.insert_or_assign(Query(table).equal(new_col, "hello"));
-                auto subs = new_subs.commit();
-                realm->begin_transaction();
-                table->create_object_with_primary_key(Mixed{ObjectId::gen()}, {{new_col, "hello"}});
-                realm->commit_transaction();
-                subs.get_state_change_notification(sync::SubscriptionSet::State::Complete).get();
-                wait_for_advance(*realm);
-                REQUIRE(table->size() == 1);
-            });
+            auto realm = Realm::get_shared_realm(config_local);
+            auto table = realm->read_group().get_table("class_AddedClassSecond");
+            ColKey new_col = table->get_column_key("str_field_2");
+            REQUIRE(new_col);
+            auto new_subs = realm->get_latest_subscription_set().make_mutable_copy();
+            new_subs.insert_or_assign(Query(table).equal(new_col, "hello"));
+            auto subs = new_subs.commit();
+            realm->begin_transaction();
+            table->create_object_with_primary_key(Mixed{ObjectId::gen()}, {{new_col, "hello"}});
+            realm->commit_transaction();
+            subs.get_state_change_notification(sync::SubscriptionSet::State::Complete).get();
+            wait_for_advance(*realm);
+            REQUIRE(table->size() == 1);
         }
     }
 
@@ -1414,13 +1421,11 @@ TEST_CASE("flx: client reset", "[sync][flx][client reset][baas]") {
         config_local.sync_config->client_resync_mode = ClientResyncMode::DiscardLocal;
         auto&& [error_future, err_handler] = make_error_handler();
         config_local.sync_config->error_handler = err_handler;
-        async_open_realm(config_local, [&](ThreadSafeReference&& ref, std::exception_ptr error) {
-            REQUIRE(!ref);
-            REQUIRE(error);
-            REQUIRE_THROWS_CONTAINING(std::rethrow_exception(error),
-                                      "A fatal error occurred during client reset: 'Client reset cannot recover when "
-                                      "classes have been removed: {AddedClass}'");
-        });
+        auto status = async_open_realm(config_local);
+        REQUIRE_FALSE(status.is_ok());
+        REQUIRE_THAT(status.get_status().reason(),
+                     Catch::Matchers::ContainsSubstring(
+                         "'Client reset cannot recover when classes have been removed: {AddedClass}'"));
         error_future.get();
         CHECK(before_reset_count == 1);
         CHECK(after_reset_count == 0);
@@ -1434,16 +1439,14 @@ TEST_CASE("flx: client reset", "[sync][flx][client reset][baas]") {
         config_local.sync_config->client_resync_mode = ClientResyncMode::Recover;
         auto&& [error_future, err_handler] = make_error_handler();
         config_local.sync_config->error_handler = err_handler;
-        async_open_realm(config_local, [&](ThreadSafeReference&& ref, std::exception_ptr error) {
-            REQUIRE(!ref);
-            REQUIRE(error);
-            REQUIRE_THROWS_CONTAINING(
-                std::rethrow_exception(error),
-                "A fatal error occurred during client reset: 'The following changes cannot be "
-                "made in additive-only schema mode:\n"
+        auto status = async_open_realm(config_local);
+        REQUIRE_FALSE(status.is_ok());
+        REQUIRE_THAT(
+            status.get_status().reason(),
+            Catch::Matchers::ContainsSubstring(
+                "'The following changes cannot be made in additive-only schema mode:\n"
                 "- Property 'TopLevel._id' has been changed from 'object id' to 'uuid'.\nIf your app is running in "
-                "development mode, you can delete the realm and restart the app to update your schema.'");
-        });
+                "development mode, you can delete the realm and restart the app to update your schema.'"));
         error_future.get();
         CHECK(before_reset_count == 0); // we didn't even get this far because opening the frozen realm fails
         CHECK(after_reset_count == 0);
@@ -1466,21 +1469,16 @@ TEST_CASE("flx: client reset", "[sync][flx][client reset][baas]") {
         (void)setup_reset_handlers_for_schema_validation(config_local, changed_schema);
         auto&& [error_future, err_handler] = make_error_handler();
         config_local.sync_config->error_handler = err_handler;
-        async_open_realm(config_local, [&](ThreadSafeReference&& ref, std::exception_ptr error) {
-            REQUIRE(ref);
-            REQUIRE_FALSE(error);
-            auto realm = Realm::get_shared_realm(std::move(ref));
-            // make changes to the new property
-            realm->begin_transaction();
-            auto table = realm->read_group().get_table("class_TopLevel");
-            ColKey new_col = table->get_column_key("added_oid_field");
-            REQUIRE(new_col);
-            for (auto it = table->begin(); it != table->end(); ++it) {
-                it->set(new_col, ObjectId::gen());
-            }
-            realm->commit_transaction();
-        });
-        auto realm = Realm::get_shared_realm(config_local);
+        auto realm = successfully_async_open_realm(config_local);
+        // make changes to the new property
+        realm->begin_transaction();
+        auto table = realm->read_group().get_table("class_TopLevel");
+        ColKey new_col = table->get_column_key("added_oid_field");
+        REQUIRE(new_col);
+        for (auto it = table->begin(); it != table->end(); ++it) {
+            it->set(new_col, ObjectId::gen());
+        }
+        realm->commit_transaction();
         auto err = error_future.get();
         std::string property_err = "Invalid schema change (UPLOAD): non-breaking schema change: adding "
                                    "\"ObjectID\" column at field \"added_oid_field\" in schema \"TopLevel\", "
@@ -1492,6 +1490,72 @@ TEST_CASE("flx: client reset", "[sync][flx][client reset][baas]") {
                                               Catch::Matchers::ContainsSubstring(class_err));
         CHECK(before_reset_count == 1);
         CHECK(after_reset_count == 1);
+    }
+
+    SECTION("Recover: inserts in collections in mixed - collections cleared remotely") {
+        config_local.sync_config->client_resync_mode = ClientResyncMode::Recover;
+        auto&& [reset_future, reset_handler] = make_client_reset_handler();
+        config_local.sync_config->notify_after_client_reset = reset_handler;
+        auto test_reset = reset_utils::make_baas_flx_client_reset(config_local, config_remote, harness.session());
+        test_reset
+            ->populate_initial_object([&](SharedRealm realm) {
+                subscribe_to_all_and_bootstrap(*realm);
+                auto pk_of_added_object = ObjectId::gen();
+                auto table = realm->read_group().get_table("class_TopLevel");
+
+                realm->begin_transaction();
+                CppContext c(realm);
+                auto obj = Object::create(c, realm, "TopLevel",
+                                          std::any(AnyDict{{"_id"s, pk_of_added_object},
+                                                           {"queryable_str_field"s, "initial value"s},
+                                                           {"sum_of_list_field"s, int64_t(42)}}));
+                auto col_any = table->get_column_key("any_mixed");
+                obj.get_obj().set_collection(col_any, CollectionType::List);
+                auto list = obj.get_obj().get_list_ptr<Mixed>(col_any);
+                list->add(1);
+                auto dict = obj.get_obj().get_dictionary("dictionary_mixed");
+                dict.insert("key", 42);
+                realm->commit_transaction();
+                wait_for_upload(*realm);
+                return pk_of_added_object;
+            })
+            ->make_local_changes([&](SharedRealm local_realm) {
+                local_realm->begin_transaction();
+                auto table = local_realm->read_group().get_table("class_TopLevel");
+                auto col_any = table->get_column_key("any_mixed");
+                auto obj = table->get_object(0);
+                auto list = obj.get_list_ptr<Mixed>(col_any);
+                list->add(2);
+                auto dict = obj.get_dictionary("dictionary_mixed");
+                dict.insert("key2", "value");
+                local_realm->commit_transaction();
+            })
+            ->make_remote_changes([&](SharedRealm remote_realm) {
+                remote_realm->begin_transaction();
+                auto table = remote_realm->read_group().get_table("class_TopLevel");
+                auto col_any = table->get_column_key("any_mixed");
+                auto obj = table->get_object(0);
+                auto list = obj.get_list_ptr<Mixed>(col_any);
+                list->clear();
+                auto dict = obj.get_dictionary("dictionary_mixed");
+                dict.clear();
+                remote_realm->commit_transaction();
+            })
+            ->on_post_reset([&, client_reset_future = std::move(reset_future)](SharedRealm local_realm) {
+                wait_for_advance(*local_realm);
+                ClientResyncMode mode = client_reset_future.get();
+                REQUIRE(mode == ClientResyncMode::Recover);
+                auto table = local_realm->read_group().get_table("class_TopLevel");
+                auto obj = table->get_object(0);
+                auto col_any = table->get_column_key("any_mixed");
+                auto list = obj.get_list_ptr<Mixed>(col_any);
+                CHECK(list->size() == 1);
+                CHECK(list->get_any(0).get_int() == 2);
+                auto dict = obj.get_dictionary("dictionary_mixed");
+                CHECK(dict.size() == 1);
+                CHECK(dict.get("key2").get_string() == "value");
+            })
+            ->run();
     }
 }
 
@@ -2265,7 +2329,8 @@ TEST_CASE("flx: interrupted bootstrap restarts/recovers on reconnect", "[sync][f
         realm->sync_session()->shutdown_and_wait();
     }
 
-    _impl::RealmCoordinator::assert_no_open_realms();
+    // Verify that the file was fully closed
+    REQUIRE(DB::call_with_lock(interrupted_realm_config.path, [](auto&) {}));
 
     {
         DBOptions options;
@@ -2581,7 +2646,7 @@ TEST_CASE("flx: writes work without waiting for sync", "[sync][flx][baas]") {
 TEST_CASE("flx: verify websocket protocol number and prefixes", "[sync][protocol]") {
     // Update the expected value whenever the protocol version is updated - this ensures
     // that the current protocol version does not change unexpectedly.
-    REQUIRE(11 == sync::get_current_protocol_version());
+    REQUIRE(13 == sync::get_current_protocol_version());
     // This was updated in Protocol V8 to use '#' instead of '/' to support the Web SDK
     REQUIRE("com.mongodb.realm-sync#" == sync::get_pbs_websocket_protocol_prefix());
     REQUIRE("com.mongodb.realm-query-sync#" == sync::get_flx_websocket_protocol_prefix());
@@ -2613,7 +2678,7 @@ TEST_CASE("flx: subscriptions persist after closing/reopening", "[sync][flx][baa
 TEST_CASE("flx: no subscription store created for PBS app", "[sync][flx][baas]") {
     auto server_app_config = minimal_app_config("flx_connect_as_pbs", g_minimal_schema);
     TestAppSession session(create_app(server_app_config));
-    SyncTestFile config(session.app(), bson::Bson{}, g_minimal_schema);
+    SyncTestFile config(session.app()->current_user(), bson::Bson{}, g_minimal_schema);
 
     auto realm = Realm::get_shared_realm(config);
     CHECK(!wait_for_download(*realm));
@@ -2627,7 +2692,7 @@ TEST_CASE("flx: no subscription store created for PBS app", "[sync][flx][baas]")
 
 TEST_CASE("flx: connect to FLX as PBS returns an error", "[sync][flx][baas]") {
     FLXSyncTestHarness harness("connect_to_flx_as_pbs");
-    SyncTestFile config(harness.app(), bson::Bson{}, harness.schema());
+    SyncTestFile config(harness.app()->current_user(), bson::Bson{}, harness.schema());
     std::mutex sync_error_mutex;
     util::Optional<SyncError> sync_error;
     config.sync_config->error_handler = [&](std::shared_ptr<SyncSession>, SyncError error) mutable {
@@ -2678,30 +2743,19 @@ TEST_CASE("flx: connect to PBS as FLX returns an error", "[sync][flx][protocol][
 }
 
 TEST_CASE("flx: commit subscription while refreshing the access token", "[sync][flx][token][baas]") {
-    class HookedTransport : public SynchronousTestTransport {
-    public:
-        void send_request_to_server(const Request& request,
-                                    util::UniqueFunction<void(const Response&)>&& completion) override
-        {
-            if (request_hook) {
-                request_hook(request);
-            }
-            SynchronousTestTransport::send_request_to_server(request, std::move(completion));
-        }
-        util::UniqueFunction<void(const Request&)> request_hook;
-    };
-
-    auto transport = std::make_shared<HookedTransport>();
+    auto transport = std::make_shared<HookedTransport<>>();
     FLXSyncTestHarness harness("flx_wait_access_token2", FLXSyncTestHarness::default_server_schema(), transport);
     auto app = harness.app();
-    std::shared_ptr<SyncUser> user = app->current_user();
+    std::shared_ptr<User> user = app->current_user();
     REQUIRE(user);
     REQUIRE(!user->access_token_refresh_required());
     // Set a bad access token, with an expired time. This will trigger a refresh initiated by the client.
     std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
     using namespace std::chrono_literals;
     auto expires = std::chrono::system_clock::to_time_t(now - 30s);
-    user->update_access_token(encode_fake_jwt("fake_access_token", expires));
+    user->update_data_for_testing([&](UserData& data) {
+        data.access_token = RealmJWT(encode_fake_jwt("fake_access_token", expires));
+    });
     REQUIRE(user->access_token_refresh_required());
 
     bool seen_waiting_for_access_token = false;
@@ -2710,7 +2764,7 @@ TEST_CASE("flx: commit subscription while refreshing the access token", "[sync][
     transport->request_hook = [&](const Request&) {
         auto user = app->current_user();
         REQUIRE(user);
-        for (auto& session : user->all_sessions()) {
+        for (auto& session : app->sync_manager()->get_all_sessions_for(*user)) {
             if (session->state() == SyncSession::State::WaitingForAccessToken) {
                 REQUIRE(!seen_waiting_for_access_token);
                 seen_waiting_for_access_token = true;
@@ -2721,6 +2775,7 @@ TEST_CASE("flx: commit subscription while refreshing the access token", "[sync][
                 mut_subs.commit();
             }
         }
+        return std::nullopt;
     };
     SyncTestFile config(harness.app()->current_user(), harness.schema(), SyncConfig::FLXSyncEnabled{});
     // This triggers the token refresh.
@@ -2804,7 +2859,7 @@ TEST_CASE("flx: bootstrap batching prevents orphan documents", "[sync][flx][boot
             realm->close();
         }
 
-        _impl::RealmCoordinator::assert_no_open_realms();
+        REQUIRE_FALSE(_impl::RealmCoordinator::get_existing_coordinator(interrupted_realm_config.path));
 
         // Open up the realm without the sync client attached and verify that the realm got interrupted in the state
         // we expected it to be in.
@@ -2897,7 +2952,7 @@ TEST_CASE("flx: bootstrap batching prevents orphan documents", "[sync][flx][boot
             realm->close();
         }
 
-        _impl::RealmCoordinator::assert_no_open_realms();
+        REQUIRE_FALSE(_impl::RealmCoordinator::get_existing_coordinator(interrupted_realm_config.path));
 
         // Open up the realm without the sync client attached and verify that the realm got interrupted in the state
         // we expected it to be in.
@@ -2966,7 +3021,7 @@ TEST_CASE("flx: bootstrap batching prevents orphan documents", "[sync][flx][boot
             realm->close();
         }
 
-        _impl::RealmCoordinator::assert_no_open_realms();
+        REQUIRE_FALSE(_impl::RealmCoordinator::get_existing_coordinator(interrupted_realm_config.path));
 
         // Open up the realm without the sync client attached and verify that the realm got interrupted in the state
         // we expected it to be in.
@@ -3043,7 +3098,7 @@ TEST_CASE("flx: bootstrap batching prevents orphan documents", "[sync][flx][boot
             realm->close();
         }
 
-        _impl::RealmCoordinator::assert_no_open_realms();
+        REQUIRE_FALSE(_impl::RealmCoordinator::get_existing_coordinator(interrupted_realm_config.path));
 
         // Open up the realm without the sync client attached and verify that the realm got interrupted in the state
         // we expected it to be in.
@@ -3438,7 +3493,7 @@ TEST_CASE("flx: data ingest", "[sync][flx][data ingest][baas]") {
              }},
         };
 
-        SyncTestFile config(harness->app(), Bson{}, schema);
+        SyncTestFile config(harness->app()->current_user(), Bson{}, schema);
         REQUIRE_EXCEPTION(
             Realm::get_shared_realm(config), SchemaValidationFailed,
             Catch::Matchers::ContainsSubstring("Asymmetric table 'Asymmetric2' not allowed in partition based sync"));
@@ -3529,8 +3584,9 @@ TEST_CASE("flx: data ingest - dev mode", "[sync][flx][data ingest][baas]") {
             Object::create(c, realm, "Asymmetric", std::any(AnyDict{{"_id", foo_obj_id}, {"location", "foo"s}}));
             Object::create(c, realm, "Asymmetric", std::any(AnyDict{{"_id", bar_obj_id}, {"location", "bar"s}}));
             realm->commit_transaction();
-
-            auto docs = harness.session().get_documents(*realm->config().sync_config->user, "Asymmetric", 2);
+            User* user = dynamic_cast<User*>(realm->config().sync_config->user.get());
+            REALM_ASSERT(user);
+            auto docs = harness.session().get_documents(*user, "Asymmetric", 2);
             check_document(docs, foo_obj_id, {{"location", "foo"}});
             check_document(docs, bar_obj_id, {{"location", "bar"}});
         },
@@ -4271,12 +4327,13 @@ TEST_CASE("flx: open realm + register subscription callback while bootstrapping"
           "[sync][flx][bootstrap][async open][baas]") {
     FLXSyncTestHarness harness("flx_bootstrap_and_subscribe");
     auto foo_obj_id = ObjectId::gen();
+    int64_t foo_obj_queryable_int = 5;
     harness.load_initial_data([&](SharedRealm realm) {
         CppContext c(realm);
         Object::create(c, realm, "TopLevel",
                        std::any(AnyDict{{"_id", foo_obj_id},
                                         {"queryable_str_field", "foo"s},
-                                        {"queryable_int_field", static_cast<int64_t>(5)},
+                                        {"queryable_int_field", foo_obj_queryable_int},
                                         {"non_queryable_field", "created as initial data seed"s}}));
     });
     SyncTestFile config(harness.app()->current_user(), harness.schema(), SyncConfig::FLXSyncEnabled{});
@@ -4358,15 +4415,14 @@ TEST_CASE("flx: open realm + register subscription callback while bootstrapping"
                     promise.emplace_value(true);
                 };
             auto open_realm_pf = util::make_promise_future<bool>();
-            auto open_realm_completed_callback =
-                [&, promise_holder = util::CopyablePromiseHolder(std::move(open_realm_pf.promise))](
-                    ThreadSafeReference ref, std::exception_ptr err) mutable {
-                    auto promise = promise_holder.get_promise();
-                    if (err)
-                        promise.emplace_value(false);
-                    else
-                        promise.emplace_value(verify_subscription(Realm::get_shared_realm(std::move(ref))));
-                };
+            auto open_realm_completed_callback = [&](ThreadSafeReference ref, std::exception_ptr err) mutable {
+                bool result = false;
+                if (!err) {
+                    result =
+                        verify_subscription(Realm::get_shared_realm(std::move(ref), util::Scheduler::make_dummy()));
+                }
+                open_realm_pf.promise.emplace_value(result);
+            };
 
             config.sync_config->subscription_initializer = init_subscription_asyc_callback;
             config.sync_config->rerun_init_subscription_on_open = true;
@@ -4385,15 +4441,14 @@ TEST_CASE("flx: open realm + register subscription callback while bootstrapping"
         SECTION("Initial async open with no rerun on open set") {
             // subscription will be run since this is the first time we are opening the realm file.
             auto open_realm_pf = util::make_promise_future<bool>();
-            auto open_realm_completed_callback =
-                [&, promise_holder = util::CopyablePromiseHolder(std::move(open_realm_pf.promise))](
-                    ThreadSafeReference ref, std::exception_ptr err) mutable {
-                    auto promise = promise_holder.get_promise();
-                    if (err)
-                        promise.emplace_value(false);
-                    else
-                        promise.emplace_value(verify_subscription(Realm::get_shared_realm(std::move(ref))));
-                };
+            auto open_realm_completed_callback = [&](ThreadSafeReference ref, std::exception_ptr err) mutable {
+                bool result = false;
+                if (!err) {
+                    result =
+                        verify_subscription(Realm::get_shared_realm(std::move(ref), util::Scheduler::make_dummy()));
+                }
+                open_realm_pf.promise.emplace_value(result);
+            };
 
             config.sync_config->subscription_initializer = init_subscription_callback_with_promise;
             auto async_open = Realm::get_synchronized_realm(config);
@@ -4405,13 +4460,11 @@ TEST_CASE("flx: open realm + register subscription callback while bootstrapping"
                 subscription_invoked = false;
                 auto async_open = Realm::get_synchronized_realm(config);
                 auto open_realm_pf = util::make_promise_future<bool>();
-                auto open_realm_completed_callback =
-                    [promise_holder = util::CopyablePromiseHolder(std::move(open_realm_pf.promise))](
-                        ThreadSafeReference, std::exception_ptr) mutable {
-                        // no need to verify if the subscription has changed the db, since it has not run as we test
-                        // below
-                        promise_holder.get_promise().emplace_value(true);
-                    };
+                auto open_realm_completed_callback = [&](ThreadSafeReference, std::exception_ptr e) mutable {
+                    // no need to verify if the subscription has changed the db, since it has not run as we test
+                    // below
+                    open_realm_pf.promise.emplace_value(!e);
+                };
                 async_open->start(open_realm_completed_callback);
                 REQUIRE(open_realm_pf.future.get());
                 REQUIRE_FALSE(subscription_invoked.load());
@@ -4434,13 +4487,11 @@ TEST_CASE("flx: open realm + register subscription callback while bootstrapping"
                 config.sync_config->subscription_initializer = init_subscription;
                 auto async_open = Realm::get_synchronized_realm(config);
                 auto open_realm_pf = util::make_promise_future<bool>();
-                auto open_realm_completed_callback =
-                    [promise_holder = util::CopyablePromiseHolder(std::move(open_realm_pf.promise))](
-                        ThreadSafeReference, std::exception_ptr) mutable {
-                        // no need to verify if the subscription has changed the db, since it has not run as we test
-                        // below
-                        promise_holder.get_promise().emplace_value(true);
-                    };
+                auto open_realm_completed_callback = [&](ThreadSafeReference, std::exception_ptr e) mutable {
+                    // no need to verify if the subscription has changed the db, since it has not run as we test
+                    // below
+                    open_realm_pf.promise.emplace_value(!e);
+                };
                 async_open->start(open_realm_completed_callback);
                 REQUIRE(open_realm_pf.future.get());
                 REQUIRE_FALSE(subscription_invoked.load());
@@ -4462,19 +4513,15 @@ TEST_CASE("flx: open realm + register subscription callback while bootstrapping"
 
             auto open_task1_pf = util::make_promise_future<SharedRealm>();
             auto open_task2_pf = util::make_promise_future<SharedRealm>();
-            auto open_callback1 = [promise_holder = util::CopyablePromiseHolder(std::move(open_task1_pf.promise))](
-                                      ThreadSafeReference ref, std::exception_ptr err) mutable {
+            auto open_callback1 = [&](ThreadSafeReference ref, std::exception_ptr err) mutable {
                 REQUIRE_FALSE(err);
-                auto realm = Realm::get_shared_realm(std::move(ref));
-                REQUIRE(realm);
-                promise_holder.get_promise().emplace_value(realm);
+                open_task1_pf.promise.emplace_value(
+                    Realm::get_shared_realm(std::move(ref), util::Scheduler::make_dummy()));
             };
-            auto open_callback2 = [promise_holder = util::CopyablePromiseHolder(std::move(open_task2_pf.promise))](
-                                      ThreadSafeReference ref, std::exception_ptr err) mutable {
+            auto open_callback2 = [&](ThreadSafeReference ref, std::exception_ptr err) mutable {
                 REQUIRE_FALSE(err);
-                auto realm = Realm::get_shared_realm(std::move(ref));
-                REQUIRE(realm);
-                promise_holder.get_promise().emplace_value(realm);
+                open_task2_pf.promise.emplace_value(
+                    Realm::get_shared_realm(std::move(ref), util::Scheduler::make_dummy()));
             };
 
             config.sync_config->rerun_init_subscription_on_open = true;
@@ -4532,6 +4579,48 @@ TEST_CASE("flx: open realm + register subscription callback while bootstrapping"
                 REQUIRE(r1_active >= 1);
                 REQUIRE(r1_active <= 2);
             }
+        }
+
+        SECTION("Wait to bootstrap all pending subscriptions even when subscription_initializer is not used") {
+            // Client 1
+            {
+                auto realm = Realm::get_shared_realm(config);
+                // Create subscription (version = 1) and bootstrap data.
+                subscribe_to_all_and_bootstrap(*realm);
+                realm->sync_session()->shutdown_and_wait();
+
+                // Create a new subscription (version = 2) while the session is closed.
+                // The new subscription does not match the object bootstrapped at version 1.
+                auto mutable_subscription = realm->get_latest_subscription_set().make_mutable_copy();
+                mutable_subscription.clear();
+                auto table = realm->read_group().get_table("class_TopLevel");
+                auto queryable_int_field = table->get_column_key("queryable_int_field");
+                mutable_subscription.insert_or_assign(
+                    Query(table).not_equal(queryable_int_field, foo_obj_queryable_int));
+                mutable_subscription.commit();
+
+                realm->close();
+            }
+
+            REQUIRE_FALSE(_impl::RealmCoordinator::get_existing_coordinator(config.path));
+
+            // Client 2 uploads data matching Client 1's subscription at version 1
+            harness.load_initial_data([&](SharedRealm realm) {
+                CppContext c(realm);
+                Object::create(c, realm, "TopLevel",
+                               std::any(AnyDict{{"_id", ObjectId::gen()},
+                                                {"queryable_str_field", "bar"s},
+                                                {"queryable_int_field", 2 * foo_obj_queryable_int},
+                                                {"non_queryable_field", "some data"s}}));
+            });
+
+            // Client 1 opens the realm asynchronously and expects the task to complete
+            // when the subscription at version 2 finishes bootstrapping.
+            auto realm = successfully_async_open_realm(config);
+
+            // Check subscription at version 2 is marked Complete.
+            CHECK(realm->get_latest_subscription_set().version() == 2);
+            CHECK(realm->get_active_subscription_set().version() == 2);
         }
     }
 }
@@ -4608,7 +4697,7 @@ TEST_CASE("flx sync: Client reset during async open", "[sync][flx][client reset]
             if (ex) {
                 std::rethrow_exception(ex);
             }
-            promise.emplace_value(Realm::get_shared_realm(std::move(ref)));
+            promise.emplace_value(Realm::get_shared_realm(std::move(ref), util::Scheduler::make_dummy()));
         }
         catch (...) {
             promise.set_error(exception_to_status());
@@ -4672,7 +4761,7 @@ TEST_CASE("flx sync: resend pending subscriptions when reconnecting", "[sync][fl
         realm->close();
     }
 
-    _impl::RealmCoordinator::assert_no_open_realms();
+    REQUIRE_FALSE(_impl::RealmCoordinator::get_existing_coordinator(interrupted_realm_config.path));
 
     // Check at least one subscription set needs to be resent.
     {
@@ -4798,6 +4887,140 @@ TEST_CASE("flx: pause and resume bootstrapping at query version 0", "[sync][flx]
     auto active_sub_set = realm->sync_session()->get_flx_subscription_store()->get_active();
     REQUIRE(active_sub_set.version() == 0);
     REQUIRE(active_sub_set.state() == sync::SubscriptionSet::State::Complete);
+}
+
+TEST_CASE("flx: collections in mixed - merge lists", "[sync][flx][baas]") {
+    Schema schema{{"TopLevel",
+                   {{"_id", PropertyType::ObjectId, Property::IsPrimary{true}},
+                    {"queryable_str_field", PropertyType::String | PropertyType::Nullable},
+                    {"any", PropertyType::Mixed | PropertyType::Nullable}}}};
+
+    FLXSyncTestHarness::ServerSchema server_schema{schema, {"queryable_str_field"}};
+    FLXSyncTestHarness harness("flx_collections_in_mixed", server_schema);
+    SyncTestFile config(harness.app()->current_user(), harness.schema(), SyncConfig::FLXSyncEnabled{});
+
+    auto set_list_and_insert_element = [](Obj& obj, ColKey col_any, Mixed value) {
+        obj.set_collection(col_any, CollectionType::List);
+        auto list = obj.get_list_ptr<Mixed>(col_any);
+        list->add(value);
+    };
+
+    // Client 1 creates an object and sets property 'any' to an integer value.
+    auto foo_obj_id = ObjectId::gen();
+    harness.load_initial_data([&](SharedRealm realm) {
+        CppContext c(realm);
+        Object::create(c, realm, "TopLevel",
+                       std::any(AnyDict{{"_id", foo_obj_id}, {"queryable_str_field", "foo"s}, {"any", 42}}));
+    });
+
+    // Client 2 opens the realm and downloads schema and object created by Client 1.
+    auto realm = Realm::get_shared_realm(config);
+    subscribe_to_all_and_bootstrap(*realm);
+    realm->sync_session()->pause();
+
+    // Client 3 sets property 'any' to List and inserts two integers in the list.
+    harness.load_initial_data([&](SharedRealm realm) {
+        auto table = realm->read_group().get_table("class_TopLevel");
+        auto obj = table->get_object_with_primary_key(Mixed{foo_obj_id});
+        auto col_any = table->get_column_key("any");
+        set_list_and_insert_element(obj, col_any, 1);
+        set_list_and_insert_element(obj, col_any, 2);
+    });
+
+    // While its session is paused, Client 2 sets property 'any' to List and inserts two integers in the list.
+    CppContext c(realm);
+    realm->begin_transaction();
+    auto table = realm->read_group().get_table("class_TopLevel");
+    auto obj = table->get_object_with_primary_key(Mixed{foo_obj_id});
+    auto col_any = table->get_column_key("any");
+    set_list_and_insert_element(obj, col_any, 3);
+    set_list_and_insert_element(obj, col_any, 4);
+    realm->commit_transaction();
+
+    realm->sync_session()->resume();
+    wait_for_upload(*realm);
+    wait_for_download(*realm);
+    wait_for_advance(*realm);
+
+    // Client 2 ends up with four integers in the list (in the correct order).
+    auto list = obj.get_list_ptr<Mixed>(col_any);
+    CHECK(list->size() == 4);
+    CHECK(list->get(0) == 1);
+    CHECK(list->get(1) == 2);
+    CHECK(list->get(2) == 3);
+    CHECK(list->get(3) == 4);
+}
+
+TEST_CASE("flx: nested collections in mixed", "[sync][flx][baas]") {
+    Schema schema{{"TopLevel",
+                   {{"_id", PropertyType::Int, Property::IsPrimary{true}},
+                    {"queryable_str_field", PropertyType::String | PropertyType::Nullable},
+                    {"any", PropertyType::Mixed | PropertyType::Nullable}}}};
+
+    FLXSyncTestHarness::ServerSchema server_schema{schema, {"queryable_str_field"}};
+    FLXSyncTestHarness harness("flx_collections_in_mixed", server_schema);
+    SyncTestFile config(harness.app()->current_user(), harness.schema(), SyncConfig::FLXSyncEnabled{});
+
+    // Client 1: {_id: 1, any: ["abc", [42]]}
+    harness.load_initial_data([&](SharedRealm realm) {
+        CppContext c(realm);
+        auto obj = Object::create(c, realm, "TopLevel",
+                                  std::any(AnyDict{{"_id", INT64_C(1)}, {"queryable_str_field", "foo"s}}));
+        auto table = realm->read_group().get_table("class_TopLevel");
+        auto col_any = table->get_column_key("any");
+        obj.get_obj().set_collection(col_any, CollectionType::List);
+        List list(obj, obj.get_object_schema().property_for_name("any"));
+        list.insert_any(0, "abc");
+        list.insert_collection(1, CollectionType::List);
+        auto list2 = list.get_list(1);
+        list2.insert_any(0, 42);
+    });
+
+    // Client 2 opens the realm and downloads schema and object created by Client 1.
+    // {_id: 1, any: ["abc", [42]]}
+    auto realm = Realm::get_shared_realm(config);
+    subscribe_to_all_and_bootstrap(*realm);
+    realm->sync_session()->pause();
+
+    // Client 3 adds a dictionary with an element to list 'any'
+    // {_id: 1, any: [{{"key": 6}}, "abc", [42]]}
+    harness.load_initial_data([&](SharedRealm realm) {
+        CppContext c(realm);
+        auto obj = Object::get_for_primary_key(c, realm, "TopLevel", std::any(INT64_C(1)));
+        List list(obj, obj.get_object_schema().property_for_name("any"));
+        list.insert_collection(PathElement(0), CollectionType::Dictionary);
+        auto dict = list.get_dictionary(PathElement(0));
+        dict.insert_any("key", INT64_C(6));
+    });
+
+    // While its session is paused, Client 2 makes a change to a nested list
+    // {_id: 1, any: ["abc", [42, "foo"]]}
+    CppContext c(realm);
+    realm->begin_transaction();
+    auto obj = Object::get_for_primary_key(c, realm, "TopLevel", std::any(INT64_C(1)));
+    List list(obj, obj.get_object_schema().property_for_name("any"));
+    List list2 = list.get_list(PathElement(1));
+    list2.insert_any(list2.size(), "foo");
+    realm->commit_transaction();
+
+    realm->sync_session()->resume();
+    wait_for_upload(*realm);
+    wait_for_download(*realm);
+    wait_for_advance(*realm);
+
+    // Client 2 after the session is resumed
+    // {_id: 1, any: [{{"key": 6}}, "abc", [42, "foo"]]}
+    CHECK(list.size() == 3);
+    auto nested_dict = list.get_dictionary(0);
+    CHECK(nested_dict.size() == 1);
+    CHECK(nested_dict.get<Int>("key") == 6);
+
+    CHECK(list.get_any(1) == "abc");
+
+    auto nested_list = list.get_list(2);
+    CHECK(nested_list.size() == 2);
+    CHECK(nested_list.get_any(0) == 42);
+    CHECK(nested_list.get_any(1) == "foo");
 }
 
 } // namespace realm::app

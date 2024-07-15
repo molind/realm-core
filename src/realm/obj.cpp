@@ -240,12 +240,12 @@ bool Obj::compare_list_in_mixed(Lst<Mixed>& val1, Lst<Mixed>& val2, ColKey ck, O
         auto m2 = val2.get_any(i);
 
         if (m1.is_type(type_List) && m2.is_type(type_List)) {
-            DummyParent parent(get_table(), m2.get_ref());
+            DummyParent parent(other.get_table(), m2.get_ref());
             Lst<Mixed> list(parent, 0);
             return compare_list_in_mixed(*val1.get_list(i), list, ck, other, col_name);
         }
         else if (m1.is_type(type_Dictionary) && m2.is_type(type_Dictionary)) {
-            DummyParent parent(get_table(), m2.get_ref());
+            DummyParent parent(other.get_table(), m2.get_ref());
             Dictionary dict(parent, 0);
             return compare_dict_in_mixed(*val1.get_dictionary(i), dict, ck, other, col_name);
         }
@@ -269,12 +269,12 @@ bool Obj::compare_dict_in_mixed(Dictionary& val1, Dictionary& val2, ColKey ck, O
             return false;
 
         if (m1.is_type(type_List) && m2.is_type(type_List)) {
-            DummyParent parent(get_table(), m2.get_ref());
+            DummyParent parent(other.get_table(), m2.get_ref());
             Lst<Mixed> list(parent, 0);
             return compare_list_in_mixed(*val1.get_list(k1.get_string()), list, ck, other, col_name);
         }
         else if (m1.is_type(type_Dictionary) && m2.is_type(type_Dictionary)) {
-            DummyParent parent(get_table(), m2.get_ref());
+            DummyParent parent(other.get_table(), m2.get_ref());
             Dictionary dict(parent, 0);
             return compare_dict_in_mixed(*val1.get_dictionary(k1.get_string()), dict, ck, other, col_name);
         }
@@ -385,7 +385,7 @@ bool Obj::update() const
     if (changes) {
         m_mem = new_obj.m_mem;
         m_row_ndx = new_obj.m_row_ndx;
-        CollectionParent::m_parent_version++;
+        ++m_version_counter;
     }
     // Always update versions
     m_storage_version = new_obj.m_storage_version;
@@ -402,14 +402,14 @@ inline bool Obj::_update_if_needed() const
     return false;
 }
 
-UpdateStatus Obj::update_if_needed_with_status() const
+UpdateStatus Obj::update_if_needed() const
 {
     if (!m_table) {
         // Table deleted
         return UpdateStatus::Detached;
     }
 
-    auto current_version = get_alloc().get_storage_version();
+    auto current_version = _get_alloc().get_storage_version();
     if (current_version != m_storage_version) {
         ClusterNode::State state = get_tree_top()->try_get(m_key);
 
@@ -423,11 +423,19 @@ UpdateStatus Obj::update_if_needed_with_status() const
         if ((m_mem.get_addr() != state.mem.get_addr()) || (m_row_ndx != state.index)) {
             m_mem = state.mem;
             m_row_ndx = state.index;
-            CollectionParent::m_parent_version++;
+            ++m_version_counter;
             return UpdateStatus::Updated;
         }
     }
     return UpdateStatus::NoChange;
+}
+
+void Obj::checked_update_if_needed() const
+{
+    if (update_if_needed() == UpdateStatus::Detached) {
+        m_table.check();
+        get_tree_top()->get(m_key); // should always throw
+    }
 }
 
 template <class T>
@@ -704,7 +712,7 @@ Obj Obj::_get_linked_object(ColKey link_col_key, Mixed link) const
 Obj Obj::get_parent_object() const
 {
     Obj obj;
-    update_if_needed();
+    checked_update_if_needed();
 
     if (!m_table->is_embedded()) {
         throw LogicError(ErrorCodes::TopLevelObject, "Object is not embedded");
@@ -747,7 +755,7 @@ size_t Obj::get_link_count(ColKey col_key) const
 
 bool Obj::is_null(ColKey col_key) const
 {
-    update_if_needed();
+    checked_update_if_needed();
     ColumnAttrMask attr = col_key.get_attrs();
     ColKey::Idx col_ndx = col_key.get_index();
     if (attr.test(col_attr_Nullable) && !attr.test(col_attr_Collection)) {
@@ -784,7 +792,7 @@ bool Obj::is_null(ColKey col_key) const
 }
 
 
-// Figure out if this object has any remaining backlinkss
+// Figure out if this object has any remaining backlinks
 bool Obj::has_backlinks(bool only_strong_links) const
 {
     const Table& target_table = *m_table;
@@ -802,7 +810,7 @@ bool Obj::has_backlinks(bool only_strong_links) const
 
 size_t Obj::get_backlink_count() const
 {
-    update_if_needed();
+    checked_update_if_needed();
 
     size_t cnt = 0;
     m_table->for_each_backlink_column([&](ColKey backlink_col_key) {
@@ -814,7 +822,7 @@ size_t Obj::get_backlink_count() const
 
 size_t Obj::get_backlink_count(const Table& origin, ColKey origin_col_key) const
 {
-    update_if_needed();
+    checked_update_if_needed();
 
     size_t cnt = 0;
     if (TableKey origin_table_key = origin.get_key()) {
@@ -867,7 +875,7 @@ ObjKey Obj::get_backlink(ColKey backlink_col, size_t backlink_ndx) const
 
 std::vector<ObjKey> Obj::get_all_backlinks(ColKey backlink_col) const
 {
-    update_if_needed();
+    checked_update_if_needed();
 
     get_table()->check_column(backlink_col);
     Allocator& alloc = get_alloc();
@@ -1099,7 +1107,7 @@ StablePath Obj::get_stable_path() const noexcept
     return {};
 }
 
-void Obj::add_index(Path& path, const Index& index) const
+void Obj::add_index(Path& path, const CollectionParent::Index& index) const
 {
     if (path.empty()) {
         path.emplace_back(get_table()->get_column_key(index));
@@ -1151,7 +1159,7 @@ REALM_FORCEINLINE void Obj::sync(Node& arr)
 template <>
 Obj& Obj::set<Mixed>(ColKey col_key, Mixed value, bool is_default)
 {
-    update_if_needed();
+    checked_update_if_needed();
     get_table()->check_column(col_key);
     auto type = col_key.get_type();
     auto col_ndx = col_key.get_index();
@@ -1168,49 +1176,51 @@ Obj& Obj::set<Mixed>(ColKey col_key, Mixed value, bool is_default)
     }
 
     Mixed old_value = get_unfiltered_mixed(col_ndx);
-    if (old_value.is_type(type_TypedLink)) {
-        if (old_value == value) {
-            return *this;
+    if (!value.is_same_type(old_value) || value != old_value) {
+        if (old_value.is_type(type_TypedLink)) {
+            auto old_link = old_value.get<ObjLink>();
+            recurse = remove_backlink(col_key, old_link, state);
         }
-        auto old_link = old_value.get<ObjLink>();
-        recurse = remove_backlink(col_key, old_link, state);
-    }
-    else if (old_value.is_type(type_Dictionary)) {
-        Dictionary dict(*this, col_key);
-        recurse = dict.remove_backlinks(state);
-    }
-    else if (old_value.is_type(type_List)) {
-        Lst<Mixed> list(*this, col_key);
-        recurse = list.remove_backlinks(state);
-    }
-
-    if (value.is_type(type_TypedLink)) {
-        if (m_table->is_asymmetric()) {
-            throw IllegalOperation("Links not allowed in asymmetric tables");
+        else if (old_value.is_type(type_Dictionary)) {
+            Dictionary dict(*this, col_key);
+            recurse = dict.remove_backlinks(state);
         }
-        auto new_link = value.get<ObjLink>();
-        m_table->get_parent_group()->validate(new_link);
-        set_backlink(col_key, new_link);
+        else if (old_value.is_type(type_List)) {
+            Lst<Mixed> list(*this, col_key);
+            recurse = list.remove_backlinks(state);
+        }
+
+        if (value.is_type(type_TypedLink)) {
+            if (m_table->is_asymmetric()) {
+                throw IllegalOperation("Links not allowed in asymmetric tables");
+            }
+            auto new_link = value.get<ObjLink>();
+            m_table->get_parent_group()->validate(new_link);
+            set_backlink(col_key, new_link);
+        }
+
+        SearchIndex* index = m_table->get_search_index(col_key);
+        // The following check on unresolved is just a precaution as it should not
+        // be possible to hit that while Mixed is not a supported primary key type.
+        if (index && !m_key.is_unresolved()) {
+            index->set(m_key, value.is_unresolved_link() ? Mixed() : value);
+        }
+
+        Allocator& alloc = get_alloc();
+        alloc.bump_content_version();
+        Array fallback(alloc);
+        Array& fields = get_tree_top()->get_fields_accessor(fallback, m_mem);
+        REALM_ASSERT(col_ndx.val + 1 < fields.size());
+        ArrayMixed values(alloc);
+        values.set_parent(&fields, col_ndx.val + 1);
+        values.init_from_parent();
+        values.set(m_row_ndx, value);
+        if (value.is_type(type_Dictionary, type_List)) {
+            values.set_key(m_row_ndx, CollectionParent::generate_key(0x10));
+        }
+
+        sync(fields);
     }
-
-    SearchIndex* index = m_table->get_search_index(col_key);
-    // The following check on unresolved is just a precaution as it should not
-    // be possible to hit that while Mixed is not a supported primary key type.
-    if (index && !m_key.is_unresolved()) {
-        index->set(m_key, value.is_unresolved_link() ? Mixed() : value);
-    }
-
-    Allocator& alloc = get_alloc();
-    alloc.bump_content_version();
-    Array fallback(alloc);
-    Array& fields = get_tree_top()->get_fields_accessor(fallback, m_mem);
-    REALM_ASSERT(col_ndx.val + 1 < fields.size());
-    ArrayMixed values(alloc);
-    values.set_parent(&fields, col_ndx.val + 1);
-    values.init_from_parent();
-    values.set(m_row_ndx, value);
-
-    sync(fields);
 
     if (Replication* repl = get_replication())
         repl->set(m_table.unchecked_ptr(), col_key, m_key, value,
@@ -1226,7 +1236,7 @@ Obj& Obj::set_any(ColKey col_key, Mixed value, bool is_default)
 {
     if (value.is_null()) {
         REALM_ASSERT(col_key.get_attrs().test(col_attr_Nullable));
-        set_null(col_key);
+        set_null(col_key, is_default);
     }
     else {
         switch (col_key.get_type()) {
@@ -1284,7 +1294,7 @@ Obj& Obj::set_any(ColKey col_key, Mixed value, bool is_default)
 template <>
 Obj& Obj::set<int64_t>(ColKey col_key, int64_t value, bool is_default)
 {
-    update_if_needed();
+    checked_update_if_needed();
     get_table()->check_column(col_key);
     auto col_ndx = col_key.get_index();
 
@@ -1328,7 +1338,7 @@ Obj& Obj::set<int64_t>(ColKey col_key, int64_t value, bool is_default)
 
 Obj& Obj::add_int(ColKey col_key, int64_t value)
 {
-    update_if_needed();
+    checked_update_if_needed();
     get_table()->check_column(col_key);
     auto col_ndx = col_key.get_index();
 
@@ -1406,7 +1416,7 @@ Obj& Obj::add_int(ColKey col_key, int64_t value)
 template <>
 Obj& Obj::set<ObjKey>(ColKey col_key, ObjKey target_key, bool is_default)
 {
-    update_if_needed();
+    checked_update_if_needed();
     get_table()->check_column(col_key);
     ColKey::Idx col_ndx = col_key.get_index();
     ColumnType type = col_key.get_type();
@@ -1425,11 +1435,11 @@ Obj& Obj::set<ObjKey>(ColKey col_key, ObjKey target_key, bool is_default)
         }
     }
     ObjKey old_key = get_unfiltered_link(col_key); // Will update if needed
+    CascadeState state(CascadeState::Mode::Strong);
+    bool recurse = false;
 
     if (target_key != old_key) {
-        CascadeState state(CascadeState::Mode::Strong);
-
-        bool recurse = replace_backlink(col_key, {target_table_key, old_key}, {target_table_key, target_key}, state);
+        recurse = replace_backlink(col_key, {target_table_key, old_key}, {target_table_key, target_key}, state);
         _update_if_needed();
 
         Allocator& alloc = get_alloc();
@@ -1444,15 +1454,15 @@ Obj& Obj::set<ObjKey>(ColKey col_key, ObjKey target_key, bool is_default)
         values.set(m_row_ndx, target_key);
 
         sync(fields);
-
-        if (Replication* repl = get_replication()) {
-            repl->set(m_table.unchecked_ptr(), col_key, m_key, target_key,
-                      is_default ? _impl::instr_SetDefault : _impl::instr_Set); // Throws
-        }
-
-        if (recurse)
-            target_table->remove_recursive(state);
     }
+
+    if (Replication* repl = get_replication()) {
+        repl->set(m_table.unchecked_ptr(), col_key, m_key, target_key,
+                  is_default ? _impl::instr_SetDefault : _impl::instr_Set); // Throws
+    }
+
+    if (recurse)
+        target_table->remove_recursive(state);
 
     return *this;
 }
@@ -1460,7 +1470,7 @@ Obj& Obj::set<ObjKey>(ColKey col_key, ObjKey target_key, bool is_default)
 template <>
 Obj& Obj::set<ObjLink>(ColKey col_key, ObjLink target_link, bool is_default)
 {
-    update_if_needed();
+    checked_update_if_needed();
     get_table()->check_column(col_key);
     ColKey::Idx col_ndx = col_key.get_index();
     ColumnType type = col_key.get_type();
@@ -1469,12 +1479,11 @@ Obj& Obj::set<ObjLink>(ColKey col_key, ObjLink target_link, bool is_default)
     m_table->get_parent_group()->validate(target_link);
 
     ObjLink old_link = get<ObjLink>(col_key); // Will update if needed
+    CascadeState state(old_link.get_obj_key().is_unresolved() ? CascadeState::Mode::All : CascadeState::Mode::Strong);
+    bool recurse = false;
 
     if (target_link != old_link) {
-        CascadeState state(old_link.get_obj_key().is_unresolved() ? CascadeState::Mode::All
-                                                                  : CascadeState::Mode::Strong);
-
-        bool recurse = replace_backlink(col_key, old_link, target_link, state);
+        recurse = replace_backlink(col_key, old_link, target_link, state);
         _update_if_needed();
 
         Allocator& alloc = get_alloc();
@@ -1489,22 +1498,22 @@ Obj& Obj::set<ObjLink>(ColKey col_key, ObjLink target_link, bool is_default)
         values.set(m_row_ndx, target_link);
 
         sync(fields);
-
-        if (Replication* repl = get_replication()) {
-            repl->set(m_table.unchecked_ptr(), col_key, m_key, target_link,
-                      is_default ? _impl::instr_SetDefault : _impl::instr_Set); // Throws
-        }
-
-        if (recurse)
-            const_cast<Table*>(m_table.unchecked_ptr())->remove_recursive(state);
     }
+
+    if (Replication* repl = get_replication()) {
+        repl->set(m_table.unchecked_ptr(), col_key, m_key, target_link,
+                  is_default ? _impl::instr_SetDefault : _impl::instr_Set); // Throws
+    }
+
+    if (recurse)
+        const_cast<Table*>(m_table.unchecked_ptr())->remove_recursive(state);
 
     return *this;
 }
 
 Obj Obj::create_and_set_linked_object(ColKey col_key, bool is_default)
 {
-    update_if_needed();
+    checked_update_if_needed();
     get_table()->check_column(col_key);
     ColKey::Idx col_ndx = col_key.get_index();
     ColumnType type = col_key.get_type();
@@ -1533,33 +1542,32 @@ Obj Obj::create_and_set_linked_object(ColKey col_key, bool is_default)
         }
     }
 
-    if (target_key != old_key) {
-        CascadeState state;
+    REALM_ASSERT(target_key != old_key); // We will always create a new object
+    CascadeState state;
 
-        bool recurse = replace_backlink(col_key, {target_table_key, old_key}, {target_table_key, target_key}, state);
-        _update_if_needed();
+    bool recurse = replace_backlink(col_key, {target_table_key, old_key}, {target_table_key, target_key}, state);
+    _update_if_needed();
 
-        Allocator& alloc = get_alloc();
-        alloc.bump_content_version();
-        Array fallback(alloc);
-        Array& fields = get_tree_top()->get_fields_accessor(fallback, m_mem);
-        REALM_ASSERT(col_ndx.val + 1 < fields.size());
-        ArrayKey values(alloc);
-        values.set_parent(&fields, col_ndx.val + 1);
-        values.init_from_parent();
+    Allocator& alloc = get_alloc();
+    alloc.bump_content_version();
+    Array fallback(alloc);
+    Array& fields = get_tree_top()->get_fields_accessor(fallback, m_mem);
+    REALM_ASSERT(col_ndx.val + 1 < fields.size());
+    ArrayKey values(alloc);
+    values.set_parent(&fields, col_ndx.val + 1);
+    values.init_from_parent();
 
-        values.set(m_row_ndx, target_key);
+    values.set(m_row_ndx, target_key);
 
-        sync(fields);
+    sync(fields);
 
-        if (Replication* repl = get_replication()) {
-            repl->set(m_table.unchecked_ptr(), col_key, m_key, target_key,
-                      is_default ? _impl::instr_SetDefault : _impl::instr_Set); // Throws
-        }
-
-        if (recurse)
-            target_table->remove_recursive(state);
+    if (Replication* repl = get_replication()) {
+        repl->set(m_table.unchecked_ptr(), col_key, m_key, target_key,
+                  is_default ? _impl::instr_SetDefault : _impl::instr_Set); // Throws
     }
+
+    if (recurse)
+        target_table->remove_recursive(state);
 
     return result;
 }
@@ -1599,9 +1607,9 @@ inline void Obj::set_spec<ArrayString>(ArrayString& values, ColKey col_key)
 #if REALM_ENABLE_GEOSPATIAL
 
 template <>
-Obj& Obj::set(ColKey col_key, Geospatial value, bool)
+Obj& Obj::set(ColKey col_key, Geospatial value, bool is_default)
 {
-    update_if_needed();
+    checked_update_if_needed();
     get_table()->check_column(col_key);
     auto type = col_key.get_type();
 
@@ -1612,16 +1620,16 @@ Obj& Obj::set(ColKey col_key, Geospatial value, bool)
 
     Obj geo = get_linked_object(col_key);
     if (!geo) {
-        geo = create_and_set_linked_object(col_key);
+        geo = create_and_set_linked_object(col_key, is_default);
     }
     value.assign_to(geo);
     return *this;
 }
 
 template <>
-Obj& Obj::set(ColKey col_key, std::optional<Geospatial> value, bool)
+Obj& Obj::set(ColKey col_key, std::optional<Geospatial> value, bool is_default)
 {
-    update_if_needed();
+    checked_update_if_needed();
     auto table = get_table();
     table->check_column(col_key);
     auto type = col_key.get_type();
@@ -1635,12 +1643,12 @@ Obj& Obj::set(ColKey col_key, std::optional<Geospatial> value, bool)
         throw NotNullable(Group::table_name_to_class_name(table->get_name()), table->get_column_name(col_key));
 
     if (!value) {
-        set_null(col_key);
+        set_null(col_key, is_default);
     }
     else {
         Obj geo = get_linked_object(col_key);
         if (!geo) {
-            geo = create_and_set_linked_object(col_key);
+            geo = create_and_set_linked_object(col_key, is_default);
         }
         value->assign_to(geo);
     }
@@ -1652,7 +1660,7 @@ Obj& Obj::set(ColKey col_key, std::optional<Geospatial> value, bool)
 template <class T>
 Obj& Obj::set(ColKey col_key, T value, bool is_default)
 {
-    update_if_needed();
+    checked_update_if_needed();
     get_table()->check_column(col_key);
     auto type = col_key.get_type();
     auto attrs = col_key.get_attrs();
@@ -1660,7 +1668,7 @@ Obj& Obj::set(ColKey col_key, T value, bool is_default)
 
     if (type != ColumnTypeTraits<T>::column_id)
         throw InvalidArgument(ErrorCodes::TypeMismatch,
-                              util::format("Property not a %1", ColumnTypeTraits<int64_t>::column_id));
+                              util::format("Property not a %1", ColumnTypeTraits<T>::column_id));
     if (value_is_null(value) && !attrs.test(col_attr_Nullable))
         throw NotNullable(Group::table_name_to_class_name(m_table->get_name()), m_table->get_column_name(col_key));
 
@@ -1705,7 +1713,7 @@ INSTANTIATE_OBJ_SET(UUID);
 
 void Obj::set_int(ColKey::Idx col_ndx, int64_t value)
 {
-    update_if_needed();
+    checked_update_if_needed();
 
     Allocator& alloc = get_alloc();
     alloc.bump_content_version();
@@ -1722,7 +1730,7 @@ void Obj::set_int(ColKey::Idx col_ndx, int64_t value)
 
 void Obj::set_ref(ColKey::Idx col_ndx, ref_type value, CollectionType type)
 {
-    update_if_needed();
+    checked_update_if_needed();
 
     Allocator& alloc = get_alloc();
     alloc.bump_content_version();
@@ -1957,14 +1965,14 @@ void Obj::handle_multiple_backlinks_during_schema_migration()
 
 LstBasePtr Obj::get_listbase_ptr(ColKey col_key) const
 {
-    auto list = CollectionParent::get_listbase_ptr(col_key);
+    auto list = CollectionParent::get_listbase_ptr(col_key, 0);
     list->set_owner(*this, col_key);
     return list;
 }
 
 SetBasePtr Obj::get_setbase_ptr(ColKey col_key) const
 {
-    auto set = CollectionParent::get_setbase_ptr(col_key);
+    auto set = CollectionParent::get_setbase_ptr(col_key, 0);
     set->set_owner(*this, col_key);
     return set;
 }
@@ -1972,7 +1980,7 @@ SetBasePtr Obj::get_setbase_ptr(ColKey col_key) const
 Dictionary Obj::get_dictionary(ColKey col_key) const
 {
     REALM_ASSERT(col_key.is_dictionary() || col_key.get_type() == col_type_Mixed);
-    update_if_needed();
+    checked_update_if_needed();
     return Dictionary(Obj(*this), col_key);
 }
 
@@ -1983,53 +1991,10 @@ Obj& Obj::set_collection(ColKey col_key, CollectionType type)
         (col_key.is_list() && type == CollectionType::List)) {
         return *this;
     }
-    update_if_needed();
-    Mixed new_val(0, type);
-
     if (type == CollectionType::Set) {
         throw IllegalOperation("Set nested in Mixed is not supported");
     }
-
-    ArrayMixed arr(_get_alloc());
-    ref_type ref = to_ref(Array::get(m_mem.get_addr(), col_key.get_index().val + 1));
-    arr.init_from_ref(ref);
-    auto old_val = arr.get(m_row_ndx);
-
-    if (old_val != new_val) {
-        CascadeState state;
-        if (old_val.is_type(type_TypedLink)) {
-            remove_backlink(col_key, old_val.get<ObjLink>(), state);
-        }
-        else if (old_val.is_type(type_Dictionary)) {
-            Dictionary dict(*this, col_key);
-            dict.remove_backlinks(state);
-        }
-        else if (old_val.is_type(type_List)) {
-            Lst<Mixed> list(*this, col_key);
-            list.remove_backlinks(state);
-        }
-
-        if (SearchIndex* index = m_table->get_search_index(col_key)) {
-            index->set(m_key, new_val);
-        }
-
-        Allocator& alloc = _get_alloc();
-        alloc.bump_content_version();
-
-        Array fallback(alloc);
-        Array& fields = get_tree_top()->get_fields_accessor(fallback, m_mem);
-        ArrayMixed values(alloc);
-        values.set_parent(&fields, col_key.get_index().val + 1);
-        values.init_from_parent();
-
-        values.set(m_row_ndx, new_val);
-        values.set_key(m_row_ndx, generate_key(0x10));
-
-        sync(fields);
-
-        if (Replication* repl = get_replication())
-            repl->set(m_table.unchecked_ptr(), col_key, m_key, new_val); // Throws
-    }
+    set(col_key, Mixed(0, type));
 
     return *this;
 }
@@ -2131,7 +2096,7 @@ CollectionPtr Obj::get_collection_by_stable_path(const StablePath& path) const
 CollectionBasePtr Obj::get_collection_ptr(ColKey col_key) const
 {
     if (col_key.is_collection()) {
-        auto collection = CollectionParent::get_collection_ptr(col_key);
+        auto collection = CollectionParent::get_collection_ptr(col_key, 0);
         collection->set_owner(*this, col_key);
         return collection;
     }
@@ -2345,62 +2310,60 @@ Obj& Obj::set_null(ColKey col_key, bool is_default)
     ColumnType col_type = col_key.get_type();
     // Links need special handling
     if (col_type == col_type_Link) {
-        set(col_key, null_key);
+        return set(col_key, null_key, is_default);
     }
-    else if (col_type == col_type_Mixed) {
-        set(col_key, Mixed{});
+    if (col_type == col_type_Mixed) {
+        return set(col_key, Mixed{}, is_default);
     }
-    else {
-        auto attrs = col_key.get_attrs();
-        if (REALM_UNLIKELY(!attrs.test(col_attr_Nullable))) {
-            throw NotNullable(Group::table_name_to_class_name(m_table->get_name()),
-                              m_table->get_column_name(col_key));
-        }
 
-        update_if_needed();
+    auto attrs = col_key.get_attrs();
+    if (REALM_UNLIKELY(!attrs.test(col_attr_Nullable))) {
+        throw NotNullable(Group::table_name_to_class_name(m_table->get_name()), m_table->get_column_name(col_key));
+    }
 
-        SearchIndex* index = m_table->get_search_index(col_key);
-        if (index && !m_key.is_unresolved()) {
-            index->set(m_key, null{});
-        }
+    checked_update_if_needed();
 
-        switch (col_type) {
-            case col_type_Int:
-                do_set_null<ArrayIntNull>(col_key);
-                break;
-            case col_type_Bool:
-                do_set_null<ArrayBoolNull>(col_key);
-                break;
-            case col_type_Float:
-                do_set_null<ArrayFloatNull>(col_key);
-                break;
-            case col_type_Double:
-                do_set_null<ArrayDoubleNull>(col_key);
-                break;
-            case col_type_ObjectId:
-                do_set_null<ArrayObjectIdNull>(col_key);
-                break;
-            case col_type_String:
-                do_set_null<ArrayString>(col_key);
-                break;
-            case col_type_Binary:
-                do_set_null<ArrayBinary>(col_key);
-                break;
-            case col_type_Timestamp:
-                do_set_null<ArrayTimestamp>(col_key);
-                break;
-            case col_type_Decimal:
-                do_set_null<ArrayDecimal128>(col_key);
-                break;
-            case col_type_UUID:
-                do_set_null<ArrayUUIDNull>(col_key);
-                break;
-            case col_type_Mixed:
-            case col_type_Link:
-            case col_type_BackLink:
-            case col_type_TypedLink:
-                REALM_UNREACHABLE();
-        }
+    SearchIndex* index = m_table->get_search_index(col_key);
+    if (index && !m_key.is_unresolved()) {
+        index->set(m_key, null{});
+    }
+
+    switch (col_type) {
+        case col_type_Int:
+            do_set_null<ArrayIntNull>(col_key);
+            break;
+        case col_type_Bool:
+            do_set_null<ArrayBoolNull>(col_key);
+            break;
+        case col_type_Float:
+            do_set_null<ArrayFloatNull>(col_key);
+            break;
+        case col_type_Double:
+            do_set_null<ArrayDoubleNull>(col_key);
+            break;
+        case col_type_ObjectId:
+            do_set_null<ArrayObjectIdNull>(col_key);
+            break;
+        case col_type_String:
+            do_set_null<ArrayString>(col_key);
+            break;
+        case col_type_Binary:
+            do_set_null<ArrayBinary>(col_key);
+            break;
+        case col_type_Timestamp:
+            do_set_null<ArrayTimestamp>(col_key);
+            break;
+        case col_type_Decimal:
+            do_set_null<ArrayDecimal128>(col_key);
+            break;
+        case col_type_UUID:
+            do_set_null<ArrayUUIDNull>(col_key);
+            break;
+        case col_type_Mixed:
+        case col_type_Link:
+        case col_type_BackLink:
+        case col_type_TypedLink:
+            REALM_UNREACHABLE();
     }
 
     if (Replication* repl = get_replication())
@@ -2431,7 +2394,7 @@ ref_type Obj::Internal::get_ref(const Obj& obj, ColKey col_key)
     return to_ref(obj._get<int64_t>(col_key.get_index()));
 }
 
-ref_type Obj::get_collection_ref(Index index, CollectionType type) const
+ref_type Obj::get_collection_ref(StableIndex index, CollectionType type) const
 {
     if (index.is_collection()) {
         return to_ref(_get<int64_t>(index.get_index()));
@@ -2446,7 +2409,7 @@ ref_type Obj::get_collection_ref(Index index, CollectionType type) const
     throw StaleAccessor("This collection is no more");
 }
 
-bool Obj::check_collection_ref(Index index, CollectionType type) const noexcept
+bool Obj::check_collection_ref(StableIndex index, CollectionType type) const noexcept
 {
     if (index.is_collection()) {
         return true;
@@ -2457,13 +2420,87 @@ bool Obj::check_collection_ref(Index index, CollectionType type) const noexcept
     return false;
 }
 
-void Obj::set_collection_ref(Index index, ref_type ref, CollectionType type)
+void Obj::set_collection_ref(StableIndex index, ref_type ref, CollectionType type)
 {
     if (index.is_collection()) {
         set_int(index.get_index(), from_ref(ref));
         return;
     }
     set_ref(index.get_index(), ref, type);
+}
+
+void Obj::set_backlink(ColKey col_key, ObjLink new_link) const
+{
+    if (!new_link) {
+        return;
+    }
+
+    auto target_table = m_table->get_parent_group()->get_table(new_link.get_table_key());
+    ColKey backlink_col_key;
+    auto type = col_key.get_type();
+    if (type == col_type_TypedLink || type == col_type_Mixed || col_key.is_dictionary()) {
+        // This may modify the target table
+        backlink_col_key = target_table->find_or_add_backlink_column(col_key, m_table->get_key());
+        // it is possible that this was a link to the same table and that adding a backlink column has
+        // caused the need to update this object as well.
+        update_if_needed();
+    }
+    else {
+        backlink_col_key = m_table->get_opposite_column(col_key);
+    }
+    auto obj_key = new_link.get_obj_key();
+    auto target_obj =
+        obj_key.is_unresolved() ? target_table->try_get_tombstone(obj_key) : target_table->try_get_object(obj_key);
+    if (!target_obj) {
+        throw InvalidArgument(ErrorCodes::KeyNotFound, "Target object not found");
+    }
+    target_obj.add_backlink(backlink_col_key, m_key);
+}
+
+bool Obj::replace_backlink(ColKey col_key, ObjLink old_link, ObjLink new_link, CascadeState& state) const
+{
+    bool recurse = remove_backlink(col_key, old_link, state);
+    set_backlink(col_key, new_link);
+    return recurse;
+}
+
+bool Obj::remove_backlink(ColKey col_key, ObjLink old_link, CascadeState& state) const
+{
+    if (!old_link) {
+        return false;
+    }
+
+    REALM_ASSERT(m_table->valid_column(col_key));
+    ObjKey old_key = old_link.get_obj_key();
+    auto target_obj = m_table->get_parent_group()->get_object(old_link);
+    TableRef target_table = target_obj.get_table();
+    ColKey backlink_col_key;
+    auto type = col_key.get_type();
+    if (type == col_type_TypedLink || type == col_type_Mixed || col_key.is_dictionary()) {
+        backlink_col_key = target_table->find_or_add_backlink_column(col_key, m_table->get_key());
+    }
+    else {
+        backlink_col_key = m_table->get_opposite_column(col_key);
+    }
+
+    bool strong_links = target_table->is_embedded();
+    bool is_unres = old_key.is_unresolved();
+
+    bool last_removed = target_obj.remove_one_backlink(backlink_col_key, m_key); // Throws
+    if (is_unres) {
+        if (last_removed) {
+            // Check is there are more backlinks
+            if (!target_obj.has_backlinks(false)) {
+                // Tombstones can be erased right away - there is no cascading effect
+                target_table->m_tombstones->erase(old_key, state);
+            }
+        }
+    }
+    else {
+        return state.enqueue_for_cascade(target_obj, strong_links, last_removed);
+    }
+
+    return false;
 }
 
 } // namespace realm

@@ -136,7 +136,7 @@ void CollectionBaseImpl<LstBase>::to_json(std::ostream& out, JSONOutputMode outp
         if (i > 0)
             out << ",";
         Mixed val = get_any(i);
-        if (val.is_type(type_TypedLink)) {
+        if (val.is_type(type_Link, type_TypedLink)) {
             fn(val);
         }
         else {
@@ -347,45 +347,61 @@ void Lst<ObjLink>::do_remove(size_t ndx)
 
 /******************************** Lst<Mixed> *********************************/
 
-bool Lst<Mixed>::init_from_parent(bool allow_create) const
+Lst<Mixed>& Lst<Mixed>::operator=(const Lst<Mixed>& other)
 {
+    if (this != &other) {
+        Base::operator=(other);
+        CollectionParent::operator=(other);
+
+        // Just reset the pointer and rely on init_from_parent() being called
+        // when the accessor is actually used.
+        m_tree.reset();
+        Base::reset_content_version();
+    }
+
+    return *this;
+}
+
+Lst<Mixed>& Lst<Mixed>::operator=(Lst<Mixed>&& other) noexcept
+{
+    if (this != &other) {
+        Base::operator=(std::move(other));
+        CollectionParent::operator=(std::move(other));
+
+        m_tree = std::exchange(other.m_tree, nullptr);
+        if (m_tree) {
+            m_tree->set_parent(this, 0);
+        }
+    }
+
+    return *this;
+}
+
+
+UpdateStatus Lst<Mixed>::init_from_parent(bool allow_create) const
+{
+    Base::update_content_version();
+
     if (!m_tree) {
         m_tree.reset(new BPlusTreeMixed(get_alloc()));
         const ArrayParent* parent = this;
         m_tree->set_parent(const_cast<ArrayParent*>(parent), 0);
     }
     try {
-        auto ref = Base::get_collection_ref();
-        if (ref) {
-            m_tree->init_from_ref(ref);
-        }
-        else {
-            if (!allow_create) {
-                m_tree->detach();
-                return false;
-            }
-
-            // The ref in the column was NULL, create the tree in place.
-            m_tree->create();
-            REALM_ASSERT(m_tree->is_attached());
-        }
+        return do_init_from_parent(m_tree.get(), Base::get_collection_ref(), allow_create);
     }
     catch (...) {
         m_tree->detach();
         throw;
     }
-
-    return true;
 }
 
-UpdateStatus Lst<Mixed>::update_if_needed_with_status() const
+UpdateStatus Lst<Mixed>::update_if_needed() const
 {
-    auto status = Base::get_update_status();
-    switch (status) {
-        case UpdateStatus::Detached: {
+    switch (get_update_status()) {
+        case UpdateStatus::Detached:
             m_tree.reset();
             return UpdateStatus::Detached;
-        }
         case UpdateStatus::NoChange:
             if (m_tree && m_tree->is_attached()) {
                 return UpdateStatus::NoChange;
@@ -393,12 +409,8 @@ UpdateStatus Lst<Mixed>::update_if_needed_with_status() const
             // The tree has not been initialized yet for this accessor, so
             // perform lazy initialization by treating it as an update.
             [[fallthrough]];
-        case UpdateStatus::Updated: {
-            bool attached = init_from_parent(false);
-            Base::update_content_version();
-            CollectionParent::m_parent_version++;
-            return attached ? UpdateStatus::Updated : UpdateStatus::Detached;
-        }
+        case UpdateStatus::Updated:
+            return init_from_parent(false);
     }
     REALM_UNREACHABLE();
 }
@@ -427,8 +439,12 @@ Mixed Lst<Mixed>::set(size_t ndx, Mixed value)
     if (Replication* repl = Base::get_replication()) {
         repl->list_set(*this, ndx, value);
     }
-    if (!(old.is_same_type(value) && old == value)) {
+    if (!value.is_same_type(old) || value != old) {
         do_set(ndx, value);
+        if (value.is_type(type_Dictionary, type_List)) {
+            m_tree->ensure_keys();
+            set_key(*m_tree, ndx);
+        }
         bump_content_version();
     }
     return old;
@@ -446,6 +462,10 @@ void Lst<Mixed>::insert(size_t ndx, Mixed value)
         repl->list_insert(*this, ndx, value, sz);
     }
     do_insert(ndx, value);
+    if (value.is_type(type_Dictionary, type_List)) {
+        m_tree->ensure_keys();
+        set_key(*m_tree, ndx);
+    }
     bump_content_version();
 }
 
@@ -483,10 +503,12 @@ void Lst<Mixed>::remove(size_t from, size_t to)
 
 void Lst<Mixed>::clear()
 {
-    if (size() > 0) {
-        if (Replication* repl = Base::get_replication()) {
-            repl->list_clear(*this);
-        }
+    auto sz = size();
+    Replication* repl = Base::get_replication();
+    if (repl && (sz > 0 || !m_col_key.is_collection() || m_level > 1)) {
+        repl->list_clear(*this);
+    }
+    if (sz > 0) {
         CascadeState state;
         bool recurse = remove_backlinks(state);
 
@@ -548,17 +570,8 @@ void Lst<Mixed>::insert_collection(const PathElement& path_elem, CollectionType 
     if (dict_or_list == CollectionType::Set) {
         throw IllegalOperation("Set nested in List<Mixed> is not supported");
     }
-
-    ensure_created();
     check_level();
-    m_tree->ensure_keys();
     insert(path_elem.get_ndx(), Mixed(0, dict_or_list));
-    int64_t key = generate_key(size());
-    while (m_tree->find_key(key) != realm::not_found) {
-        key++;
-    }
-    m_tree->set_key(path_elem.get_ndx(), key);
-    bump_content_version();
 }
 
 void Lst<Mixed>::set_collection(const PathElement& path_elem, CollectionType dict_or_list)
@@ -566,47 +579,39 @@ void Lst<Mixed>::set_collection(const PathElement& path_elem, CollectionType dic
     if (dict_or_list == CollectionType::Set) {
         throw IllegalOperation("Set nested in List<Mixed> is not supported");
     }
-
-    auto ndx = path_elem.get_ndx();
-    // get will check for ndx out of bounds
-    Mixed old_val = do_get(ndx, "set_collection()");
-    Mixed new_val(0, dict_or_list);
-
     check_level();
+    set(path_elem.get_ndx(), Mixed(0, dict_or_list));
+}
 
-    if (old_val != new_val) {
-        m_tree->ensure_keys();
-        set(ndx, new_val);
-        int64_t key = m_tree->get_key(ndx);
-        if (key == 0) {
-            key = generate_key(size());
-            while (m_tree->find_key(key) != realm::not_found) {
-                key++;
-            }
-            m_tree->set_key(ndx, key);
+template <class T>
+inline std::shared_ptr<T> Lst<Mixed>::do_get_collection(const PathElement& path_elem)
+{
+    update();
+    auto get_shared = [&]() -> std::shared_ptr<CollectionParent> {
+        auto weak = weak_from_this();
+
+        if (weak.expired()) {
+            REALM_ASSERT_DEBUG(m_level == 1);
+            return std::make_shared<Lst<Mixed>>(*this);
         }
-        bump_content_version();
-    }
+
+        return weak.lock();
+    };
+
+    auto shared = get_shared();
+    auto ret = std::make_shared<T>(m_col_key, get_level() + 1);
+    ret->set_owner(shared, m_tree->get_key(path_elem.get_ndx()));
+    return ret;
 }
 
 DictionaryPtr Lst<Mixed>::get_dictionary(const PathElement& path_elem) const
 {
-    update();
-    auto weak = const_cast<Lst<Mixed>*>(this)->weak_from_this();
-    auto shared = weak.expired() ? std::make_shared<Lst<Mixed>>(*this) : weak.lock();
-    DictionaryPtr ret = std::make_shared<Dictionary>(m_col_key, get_level() + 1);
-    ret->set_owner(shared, m_tree->get_key(path_elem.get_ndx()));
-    return ret;
+    return const_cast<Lst<Mixed>*>(this)->do_get_collection<Dictionary>(path_elem);
 }
 
 std::shared_ptr<Lst<Mixed>> Lst<Mixed>::get_list(const PathElement& path_elem) const
 {
-    update();
-    auto weak = const_cast<Lst<Mixed>*>(this)->weak_from_this();
-    auto shared = weak.expired() ? std::make_shared<Lst<Mixed>>(*this) : weak.lock();
-    std::shared_ptr<Lst<Mixed>> ret = std::make_shared<Lst<Mixed>>(m_col_key, get_level() + 1);
-    ret->set_owner(shared, m_tree->get_key(path_elem.get_ndx()));
-    return ret;
+    return const_cast<Lst<Mixed>*>(this)->do_get_collection<Lst<Mixed>>(path_elem);
 }
 
 void Lst<Mixed>::do_set(size_t ndx, Mixed value)
@@ -871,16 +876,15 @@ bool Lst<Mixed>::clear_backlink(size_t ndx, CascadeState& state) const
     if (value.is_type(type_TypedLink, type_Dictionary, type_List)) {
         if (value.is_type(type_TypedLink)) {
             auto link = value.get<ObjLink>();
-            if (link.get_obj_key().is_unresolved()) {
-                state.m_mode = CascadeState::Mode::All;
-            }
             return Base::remove_backlink(m_col_key, link, state);
         }
         else if (value.is_type(type_List)) {
-            return get_list(ndx)->remove_backlinks(state);
+            Lst<Mixed> list{*const_cast<Lst<Mixed>*>(this), m_tree->get_key(ndx)};
+            return list.remove_backlinks(state);
         }
         else if (value.is_type(type_Dictionary)) {
-            return get_dictionary(ndx)->remove_backlinks(state);
+            Dictionary dict{*const_cast<Lst<Mixed>*>(this), m_tree->get_key(ndx)};
+            return dict.remove_backlinks(state);
         }
     }
     return false;
@@ -896,15 +900,6 @@ bool Lst<Mixed>::remove_backlinks(CascadeState& state) const
         }
     }
     return recurse;
-}
-
-bool Lst<Mixed>::update_if_needed() const
-{
-    auto status = update_if_needed_with_status();
-    if (status == UpdateStatus::Detached) {
-        throw StaleAccessor("CollectionList no longer exists");
-    }
-    return status == UpdateStatus::Updated;
 }
 
 /********************************** LnkLst ***********************************/
@@ -955,19 +950,9 @@ void LnkLst::remove_all_target_rows()
     }
 }
 
-void LnkLst::to_json(std::ostream& out, JSONOutputMode, util::FunctionRef<void(const Mixed&)> fn) const
+void LnkLst::to_json(std::ostream& out, JSONOutputMode mode, util::FunctionRef<void(const Mixed&)> fn) const
 {
-    out << "[";
-
-    auto sz = m_list.size();
-    for (size_t i = 0; i < sz; i++) {
-        if (i > 0)
-            out << ",";
-        Mixed val(m_list.get(i));
-        fn(val);
-    }
-
-    out << "]";
+    m_list.to_json(out, mode, fn);
 }
 
 void LnkLst::replace_link(ObjKey old_val, ObjKey new_val)

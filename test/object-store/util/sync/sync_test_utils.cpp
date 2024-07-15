@@ -18,6 +18,7 @@
 
 #include <util/sync/sync_test_utils.hpp>
 
+#include <util/test_file.hpp>
 #include <util/sync/baas_admin_api.hpp>
 
 #include <realm/object-store/binding_context.hpp>
@@ -28,6 +29,8 @@
 #include <realm/object-store/sync/mongo_collection.hpp>
 #include <realm/object-store/sync/mongo_database.hpp>
 
+#include <realm/sync/client_base.hpp>
+#include <realm/sync/protocol.hpp>
 #include <realm/sync/noinst/client_history_impl.hpp>
 #include <realm/sync/noinst/client_reset.hpp>
 
@@ -50,27 +53,6 @@ std::ostream& operator<<(std::ostream& os, util::Optional<app::AppError> error)
            << "\", link_to_server_logs=\"" << error->link_to_server_logs << "\")";
     }
     return os;
-}
-
-bool results_contains_user(SyncUserMetadataResults& results, const std::string& identity)
-{
-    for (size_t i = 0; i < results.size(); i++) {
-        auto this_result = results.get(i);
-        if (this_result.identity() == identity) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool results_contains_original_name(SyncFileActionMetadataResults& results, const std::string& original_name)
-{
-    for (size_t i = 0; i < results.size(); i++) {
-        if (results.get(i).original_name() == original_name) {
-            return true;
-        }
-    }
-    return false;
 }
 
 bool ReturnsTrueWithinTimeLimit::match(util::FunctionRef<bool()> condition) const
@@ -175,6 +157,23 @@ ExpectedRealmPaths::ExpectedRealmPaths(const std::string& base_path, const std::
     legacy_sync_path = (dir_builder / cleaned_partition).string();
 }
 
+std::string unquote_string(std::string_view possibly_quoted_string)
+{
+    if (possibly_quoted_string.size() > 0) {
+        auto check_char = possibly_quoted_string.front();
+        if (check_char == '"' || check_char == '\'') {
+            possibly_quoted_string.remove_prefix(1);
+        }
+    }
+    if (possibly_quoted_string.size() > 0) {
+        auto check_char = possibly_quoted_string.back();
+        if (check_char == '"' || check_char == '\'') {
+            possibly_quoted_string.remove_suffix(1);
+        }
+    }
+    return std::string{possibly_quoted_string};
+}
+
 #if REALM_ENABLE_SYNC
 
 void subscribe_to_all_and_bootstrap(Realm& realm)
@@ -205,42 +204,28 @@ void wait_for_sessions_to_close(const TestAppSession& test_app_session)
         std::chrono::minutes(5), std::chrono::milliseconds(100));
 }
 
-static std::string unquote_string(std::string_view possibly_quoted_string)
+std::string get_compile_time_base_url()
 {
-    if (possibly_quoted_string.size() > 0) {
-        auto check_char = possibly_quoted_string.front();
-        if (check_char == '"' || check_char == '\'') {
-            possibly_quoted_string.remove_prefix(1);
-        }
-    }
-    if (possibly_quoted_string.size() > 0) {
-        auto check_char = possibly_quoted_string.back();
-        if (check_char == '"' || check_char == '\'') {
-            possibly_quoted_string.remove_suffix(1);
-        }
-    }
-    return std::string{possibly_quoted_string};
-}
-
 #ifdef REALM_MONGODB_ENDPOINT
-std::string get_base_url()
-{
     // allows configuration with or without quotes
     return unquote_string(REALM_QUOTE(REALM_MONGODB_ENDPOINT));
+#else
+    return {};
+#endif // REALM_MONGODB_ENDPOINT
 }
 
-std::string get_admin_url()
+std::string get_compile_time_admin_url()
 {
 #ifdef REALM_ADMIN_ENDPOINT
     // allows configuration with or without quotes
     return unquote_string(REALM_QUOTE(REALM_ADMIN_ENDPOINT));
 #else
-    return get_base_url();
-#endif
+    return {};
+#endif // REALM_ADMIN_ENDPOINT
 }
-#endif // REALM_MONGODB_ENDPOINT
 #endif // REALM_ENABLE_AUTH_TESTS
 
+#if REALM_APP_SERVICES
 AutoVerifiedEmailCredentials::AutoVerifiedEmailCredentials()
 {
     // emails with this prefix will pass through the baas app due to the register function
@@ -257,13 +242,21 @@ AutoVerifiedEmailCredentials create_user_and_log_in(app::SharedApp app)
         creds.email, creds.password, [&](util::Optional<app::AppError> error) {
             REQUIRE(!error);
         });
-    app->log_in_with_credentials(realm::app::AppCredentials::username_password(creds.email, creds.password),
+    log_in_user(app, creds);
+    return creds;
+}
+
+void log_in_user(app::SharedApp app, app::AppCredentials creds)
+{
+    REQUIRE(app);
+    app->log_in_with_credentials(creds,
                                  [&](std::shared_ptr<realm::SyncUser> user, util::Optional<app::AppError> error) {
                                      REQUIRE(user);
                                      REQUIRE(!error);
                                  });
-    return creds;
 }
+
+#endif // REALM_APP_SERVICES
 
 void wait_for_advance(Realm& realm)
 {
@@ -294,26 +287,34 @@ void wait_for_advance(Realm& realm)
     realm.m_binding_context = nullptr;
 }
 
-void async_open_realm(const Realm::Config& config,
-                      util::UniqueFunction<void(ThreadSafeReference&& ref, std::exception_ptr e)> finish)
+StatusWith<std::shared_ptr<Realm>> async_open_realm(const Realm::Config& config)
 {
-    std::mutex mutex;
-    bool did_finish = false;
     auto task = Realm::get_synchronized_realm(config);
-    ThreadSafeReference tsr;
-    std::exception_ptr err = nullptr;
+    auto pf = util::make_promise_future<ThreadSafeReference>();
     task->start([&](ThreadSafeReference&& ref, std::exception_ptr e) {
-        std::lock_guard lock(mutex);
-        did_finish = true;
-        tsr = std::move(ref);
-        err = e;
+        if (e) {
+            try {
+                std::rethrow_exception(e);
+            }
+            catch (...) {
+                pf.promise.set_error(exception_to_status());
+            }
+        }
+        else {
+            pf.promise.emplace_value(std::move(ref));
+        }
     });
-    util::EventLoop::main().run_until([&] {
-        std::lock_guard lock(mutex);
-        return did_finish;
-    });
-    task->cancel(); // don't run the above notifier again on this session
-    finish(std::move(tsr), err);
+    auto sw = std::move(pf.future).get_no_throw();
+    if (sw.is_ok())
+        return Realm::get_shared_realm(std::move(sw.get_value()));
+    return sw.get_status();
+}
+
+std::shared_ptr<Realm> successfully_async_open_realm(const Realm::Config& config)
+{
+    auto status = async_open_realm(config);
+    REQUIRE(status.is_ok());
+    return status.get_value();
 }
 
 #endif // REALM_ENABLE_SYNC
@@ -390,7 +391,7 @@ struct FakeLocalClientReset : public TestClientReset {
             progress.upload.client_version = current_version;
             progress.upload.last_integrated_server_version = current_version;
             sync::VersionInfo info_out;
-            history_local->set_sync_progress(progress, nullptr, info_out);
+            history_local->set_sync_progress(progress, 0, info_out);
         }
         {
             local_realm->begin_transaction();
@@ -433,15 +434,14 @@ struct FakeLocalClientReset : public TestClientReset {
             }
             remote_realm->commit_transaction();
 
-            sync::SaltedFileIdent fake_ident{1, 123456789};
             auto local_db = TestHelper::get_db(local_realm);
-            auto remote_db = TestHelper::get_db(remote_realm);
             auto logger = util::Logger::get_default_logger();
+            sync::ClientReset reset_config{m_mode,
+                                           TestHelper::get_db(remote_realm),
+                                           {ErrorCodes::SyncClientResetRequired, "Bad client file ident"}};
 
             using _impl::client_reset::perform_client_reset_diff;
-            constexpr bool recovery_is_allowed = true;
-            perform_client_reset_diff(*local_db, *remote_db, fake_ident, *logger, m_mode, recovery_is_allowed,
-                                      nullptr, [](int64_t) {});
+            perform_client_reset_diff(*local_db, reset_config, *logger, nullptr, [](int64_t) {});
 
             remote_realm->close();
             if (m_on_post_reset) {
@@ -459,7 +459,7 @@ private:
 
 #if REALM_ENABLE_AUTH_TESTS
 
-void wait_for_object_to_persist_to_atlas(std::shared_ptr<SyncUser> user, const AppSession& app_session,
+void wait_for_object_to_persist_to_atlas(std::shared_ptr<app::User> user, const AppSession& app_session,
                                          const std::string& schema_name, const bson::BsonDocument& filter_bson)
 {
     // While at this point the object has been sync'd successfully, we must also
@@ -490,7 +490,7 @@ void wait_for_object_to_persist_to_atlas(std::shared_ptr<SyncUser> user, const A
         std::chrono::minutes(15), std::chrono::milliseconds(500));
 }
 
-void wait_for_num_objects_in_atlas(std::shared_ptr<SyncUser> user, const AppSession& app_session,
+void wait_for_num_objects_in_atlas(std::shared_ptr<app::User> user, const AppSession& app_session,
                                    const std::string& schema_name, size_t expected_size)
 {
     app::MongoClient remote_client = user->mongo_client("BackingDB");
@@ -561,9 +561,11 @@ struct BaasClientReset : public TestClientReset {
         //
         // So just don't try to do anything until initial sync is done and we're sure the server is in a stable
         // state.
-        timed_sleeping_wait_for([&] {
-            return app_session.admin_api.is_initial_sync_complete(app_session.server_app_id);
-        });
+        timed_sleeping_wait_for(
+            [&] {
+                return app_session.admin_api.is_initial_sync_complete(app_session.server_app_id);
+            },
+            std::chrono::seconds(30), std::chrono::seconds(1));
 
         auto realm = Realm::get_shared_realm(m_local_config);
         auto session = sync_manager->get_existing_session(realm->config().path);
@@ -742,7 +744,7 @@ struct BaasFLXClientReset : public TestClientReset {
         if (m_on_post_local) {
             m_on_post_local(realm);
         }
-        wait_for_upload(*realm);
+        wait_for_download(*realm);
         if (m_on_post_reset) {
             m_on_post_reset(realm);
         }

@@ -22,11 +22,11 @@
 #include <util/test_utils.hpp>
 #include <util/sync/sync_test_utils.hpp>
 
+#include <realm/list.hpp>
 #include <realm/object-store/object_schema.hpp>
 #include <realm/object-store/object_store.hpp>
 #include <realm/object-store/property.hpp>
 #include <realm/object-store/schema.hpp>
-
 #include <realm/sync/noinst/client_history_impl.hpp>
 #include <realm/sync/noinst/client_reset.hpp>
 #include <realm/sync/noinst/client_reset_recovery.hpp>
@@ -80,7 +80,7 @@ struct BenchmarkLocalClientReset : public reset_utils::TestClientReset {
         progress.upload.client_version = current_version;
         progress.upload.last_integrated_server_version = current_version;
         sync::VersionInfo info_out;
-        history_local->set_sync_progress(progress, nullptr, info_out);
+        history_local->set_sync_progress(progress, 0, info_out);
 
         constexpr int64_t shared_pk = -42;
         {
@@ -139,10 +139,7 @@ struct BenchmarkLocalClientReset : public reset_utils::TestClientReset {
         Transaction& wt_local = (Transaction&)m_local->read_group();
         VersionID current_local_version = wt_local.get_version_of_current_transaction();
 
-        class NullLogger : public util::Logger {
-            // Since we don't want to log anything, do_log() does nothing
-            void do_log(const util::LogCategory&, Level, const std::string&) override {}
-        } logger;
+        util::NullLogger logger;
 
         if (m_mode == ClientResyncMode::Recover) {
             auto history_local = dynamic_cast<sync::ClientHistory*>(wt_local.get_replication()->_get_history_write());

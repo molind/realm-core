@@ -168,7 +168,7 @@ void Collection::get_any(QueryCtrlBlock& ctrl, Mixed val, size_t index)
                             ctrl.matches.back().push_back(k);
                         });
                     }
-                    else {
+                    else if (end_of_path) {
                         ctrl.matches.back().push_back(Mixed());
                     }
                     return;
@@ -235,6 +235,32 @@ void Collection::get_any(QueryCtrlBlock& ctrl, Mixed val, size_t index)
             }
         }
     }
+}
+
+UpdateStatus CollectionBase::do_init_from_parent(BPlusTreeBase* tree, ref_type ref, bool allow_create)
+{
+    if (ref) {
+        tree->init_from_ref(ref);
+    }
+    else {
+        if (!allow_create) {
+            tree->detach();
+            return UpdateStatus::Detached;
+        }
+        // The ref in the column was NULL, create the tree in place.
+        tree->create();
+        REALM_ASSERT(tree->is_attached());
+    }
+    return UpdateStatus::Updated;
+}
+
+void CollectionBase::out_of_bounds(const char* msg, size_t index, size_t size) const
+{
+    auto path = get_short_path();
+    path.erase(path.begin());
+    throw OutOfBounds(util::format("%1 on %2 '%3.%4%5'", msg, collection_type_name(get_collection_type()),
+                                   get_table()->get_class_name(), get_property_name(), path),
+                      index, size);
 }
 
 } // namespace realm

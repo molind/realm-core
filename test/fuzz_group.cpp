@@ -19,6 +19,7 @@
 #include "fuzz_group.hpp"
 
 #include <realm.hpp>
+#include <realm/disable_sync_to_disk.hpp>
 #include <realm/index_string.hpp>
 
 #include <ctime>
@@ -52,8 +53,7 @@ using namespace realm::util;
 
 namespace {
 
-struct EndOfFile {
-};
+struct EndOfFile {};
 
 enum INS {
     ADD_TABLE,

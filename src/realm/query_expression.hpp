@@ -2065,14 +2065,14 @@ public:
         }
         else {
             if (index.initialize()) {
-                Value<Mixed> destination;
-                destination.init(false, 1);
-                SimpleQuerySupport::evaluate(index, destination);
+                Value<Mixed> dest;
+                dest.init(false, 1);
+                SimpleQuerySupport::evaluate(index, dest);
 
                 m_ctrl.matches.clear();
-                if (auto sz = destination.size()) {
+                if (auto sz = dest.size()) {
                     for (size_t i = 0; i < sz; i++) {
-                        Collection::get_any(m_ctrl, destination.get(i), 0);
+                        Collection::get_any(m_ctrl, dest.get(i), 0);
                     }
                 }
                 if (!index.set_size(m_ctrl.matches.size())) {
@@ -4514,7 +4514,8 @@ public:
             return not_found;
 
         // key is known to be in this leaf, so find key whithin leaf keys
-        return m_cluster->lower_bound_key(ObjKey(actual_key.value - m_cluster->get_offset()));
+        REALM_ASSERT(uint64_t(actual_key.value) >= m_cluster->get_offset());
+        return m_cluster->lower_bound_key(ClusterNode::RowKey(actual_key.value - m_cluster->get_offset()));
     }
 
 protected:

@@ -52,7 +52,7 @@ public:
     PendingBootstrapStore& operator=(const PendingBootstrapStore&) = delete;
 
     // True if there are pending changesets to process.
-    bool has_pending();
+    bool has_pending() const noexcept;
 
     struct PendingBatch {
         int64_t query_version = 0;
@@ -82,6 +82,7 @@ public:
                    const std::vector<RemoteChangeset>& changesets, bool* created_new_batch);
 
     void clear();
+    void clear(Transaction& wt);
 
 
 private:

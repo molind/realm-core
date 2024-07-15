@@ -48,7 +48,7 @@ void validate_key_value(const Mixed& key)
 
 /******************************** Dictionary *********************************/
 
-Dictionary::Dictionary(ColKey col_key, size_t level)
+Dictionary::Dictionary(ColKey col_key, uint8_t level)
     : Base(col_key)
     , CollectionParent(level)
 {
@@ -77,9 +77,10 @@ Dictionary::~Dictionary() = default;
 
 Dictionary& Dictionary::operator=(const Dictionary& other)
 {
-    Base::operator=(static_cast<const Base&>(other));
-
     if (this != &other) {
+        Base::operator=(other);
+        CollectionParent::operator=(other);
+
         // Back to scratch
         m_dictionary_top.reset();
         reset_content_version();
@@ -433,40 +434,39 @@ void Dictionary::insert_collection(const PathElement& path_elem, CollectionType 
     if (dict_or_list == CollectionType::Set) {
         throw IllegalOperation("Set nested in Dictionary is not supported");
     }
-
     check_level();
-    ensure_created();
-    Mixed new_val(0, dict_or_list);
-    auto old_val = try_get(path_elem.get_key());
-    if (!old_val || *old_val != new_val) {
-        m_values->ensure_keys();
-        auto [it, inserted] = insert(path_elem.get_key(), new_val);
-        int64_t key = generate_key(size());
-        while (m_values->find_key(key) != realm::not_found) {
-            key++;
+    insert(path_elem.get_key(), Mixed(0, dict_or_list));
+}
+
+template <class T>
+inline std::shared_ptr<T> Dictionary::do_get_collection(const PathElement& path_elem)
+{
+    update();
+    auto get_shared = [&]() -> std::shared_ptr<CollectionParent> {
+        auto weak = weak_from_this();
+
+        if (weak.expired()) {
+            REALM_ASSERT_DEBUG(m_level == 1);
+            return std::make_shared<Dictionary>(*this);
         }
-        m_values->set_key(it.index(), key);
-    }
+
+        return weak.lock();
+    };
+
+    auto shared = get_shared();
+    auto ret = std::make_shared<T>(m_col_key, get_level() + 1);
+    ret->set_owner(shared, build_index(path_elem.get_key()));
+    return ret;
 }
 
 DictionaryPtr Dictionary::get_dictionary(const PathElement& path_elem) const
 {
-    update();
-    auto weak = const_cast<Dictionary*>(this)->weak_from_this();
-    auto shared = weak.expired() ? std::make_shared<Dictionary>(*this) : weak.lock();
-    DictionaryPtr ret = std::make_shared<Dictionary>(m_col_key, get_level() + 1);
-    ret->set_owner(shared, build_index(path_elem.get_key()));
-    return ret;
+    return const_cast<Dictionary*>(this)->do_get_collection<Dictionary>(path_elem);
 }
 
 std::shared_ptr<Lst<Mixed>> Dictionary::get_list(const PathElement& path_elem) const
 {
-    update();
-    auto weak = const_cast<Dictionary*>(this)->weak_from_this();
-    auto shared = weak.expired() ? std::make_shared<Dictionary>(*this) : weak.lock();
-    std::shared_ptr<Lst<Mixed>> ret = std::make_shared<Lst<Mixed>>(m_col_key, get_level() + 1);
-    ret->set_owner(shared, build_index(path_elem.get_key()));
-    return ret;
+    return const_cast<Dictionary*>(this)->do_get_collection<Lst<Mixed>>(path_elem);
 }
 
 Mixed Dictionary::get(Mixed key) const
@@ -553,6 +553,7 @@ std::pair<Dictionary::Iterator, bool> Dictionary::insert(Mixed key, Mixed value)
         throw StaleAccessor("Stale dictionary");
     }
 
+    bool set_nested_collection_key = value.is_type(type_Dictionary, type_List);
     bool old_entry = false;
     auto [ndx, actual_key] = find_impl(key);
     if (actual_key != key) {
@@ -581,7 +582,6 @@ std::pair<Dictionary::Iterator, bool> Dictionary::insert(Mixed key, Mixed value)
             repl->dictionary_insert(*this, ndx, key, value);
         }
     }
-
     bump_content_version();
 
     ObjLink old_link;
@@ -590,7 +590,17 @@ std::pair<Dictionary::Iterator, bool> Dictionary::insert(Mixed key, Mixed value)
         if (old_value.is_type(type_TypedLink)) {
             old_link = old_value.get<ObjLink>();
         }
-        m_values->set(ndx, value);
+        if (!value.is_same_type(old_value) || value != old_value) {
+            m_values->set(ndx, value);
+        }
+        else {
+            set_nested_collection_key = false;
+        }
+    }
+
+    if (set_nested_collection_key) {
+        m_values->ensure_keys();
+        set_key(*m_values, ndx);
     }
 
     if (new_link != old_link) {
@@ -651,10 +661,9 @@ size_t Dictionary::find_index(const Index& index) const
     return m_values->find_key(index.get_salt());
 }
 
-UpdateStatus Dictionary::update_if_needed_with_status() const
+UpdateStatus Dictionary::do_update_if_needed(bool allow_create) const
 {
-    auto status = Base::get_update_status();
-    switch (status) {
+    switch (get_update_status()) {
         case UpdateStatus::Detached: {
             m_dictionary_top.reset();
             return UpdateStatus::Detached;
@@ -667,27 +676,23 @@ UpdateStatus Dictionary::update_if_needed_with_status() const
             // perform lazy initialization by treating it as an update.
             [[fallthrough]];
         }
-        case UpdateStatus::Updated: {
-            // Try to initialize. If the dictionary is not initialized
-            // the function will return false;
-            bool attached = init_from_parent(false);
-            Base::update_content_version();
-            CollectionParent::m_parent_version++;
-            return attached ? UpdateStatus::Updated : UpdateStatus::Detached;
-        }
+        case UpdateStatus::Updated:
+            return init_from_parent(allow_create);
     }
     REALM_UNREACHABLE();
 }
 
+UpdateStatus Dictionary::update_if_needed() const
+{
+    constexpr bool allow_create = false;
+    return do_update_if_needed(allow_create);
+}
+
 void Dictionary::ensure_created()
 {
-    if (Base::should_update() || !(m_dictionary_top && m_dictionary_top->is_attached())) {
-        // When allow_create is true, init_from_parent will always succeed
-        // In case of errors, an exception is thrown.
-        constexpr bool allow_create = true;
-        init_from_parent(allow_create); // Throws
-        CollectionParent::m_parent_version++;
-        Base::update_content_version();
+    constexpr bool allow_create = true;
+    if (do_update_if_needed(allow_create) == UpdateStatus::Detached) {
+        throw StaleAccessor("Dictionary no longer exists");
     }
 }
 
@@ -706,7 +711,6 @@ bool Dictionary::try_erase(Mixed key)
 
     return true;
 }
-
 
 void Dictionary::erase(Mixed key)
 {
@@ -819,10 +823,12 @@ size_t Dictionary::find_first(Mixed value) const
 
 void Dictionary::clear()
 {
-    if (size() > 0) {
-        if (Replication* repl = get_replication()) {
-            repl->dictionary_clear(*this);
-        }
+    auto sz = size();
+    Replication* repl = Base::get_replication();
+    if (repl && (sz > 0 || !m_col_key.is_collection() || m_level > 1)) {
+        repl->dictionary_clear(*this);
+    }
+    if (sz > 0) {
         CascadeState cascade_state(CascadeState::Mode::Strong);
         bool recurse = remove_backlinks(cascade_state);
 
@@ -837,8 +843,9 @@ void Dictionary::clear()
     }
 }
 
-bool Dictionary::init_from_parent(bool allow_create) const
+UpdateStatus Dictionary::init_from_parent(bool allow_create) const
 {
+    Base::update_content_version();
     try {
         auto ref = Base::get_collection_ref();
         if ((ref || allow_create) && !m_dictionary_top) {
@@ -871,7 +878,7 @@ bool Dictionary::init_from_parent(bool allow_create) const
             // dictionary detached
             if (!allow_create) {
                 m_dictionary_top.reset();
-                return false;
+                return UpdateStatus::Detached;
             }
 
             // Create dictionary
@@ -881,7 +888,7 @@ bool Dictionary::init_from_parent(bool allow_create) const
             m_dictionary_top->update_parent();
         }
 
-        return true;
+        return UpdateStatus::Updated;
     }
     catch (...) {
         m_dictionary_top.reset();
@@ -990,12 +997,12 @@ bool Dictionary::clear_backlink(size_t ndx, CascadeState& state) const
         return Base::remove_backlink(m_col_key, value.get_link(), state);
     }
     if (value.is_type(type_Dictionary)) {
-        auto key = do_get_key(ndx);
-        return get_dictionary(key.get_string())->remove_backlinks(state);
+        Dictionary dict{*const_cast<Dictionary*>(this), m_values->get_key(ndx)};
+        return dict.remove_backlinks(state);
     }
     if (value.is_type(type_List)) {
-        auto key = do_get_key(ndx);
-        return get_list(key.get_string())->remove_backlinks(state);
+        Lst<Mixed> list{*const_cast<Dictionary*>(this), m_values->get_key(ndx)};
+        return list.remove_backlinks(state);
     }
     return false;
 }
@@ -1179,7 +1186,6 @@ ref_type Dictionary::get_collection_ref(Index index, CollectionType type) const
         throw realm::IllegalOperation(util::format("Not a %1", type));
     }
     throw StaleAccessor("This collection is no more");
-    return 0;
 }
 
 bool Dictionary::check_collection_ref(Index index, CollectionType type) const noexcept
@@ -1200,13 +1206,12 @@ void Dictionary::set_collection_ref(Index index, ref_type ref, CollectionType ty
     m_values->set(ndx, Mixed(ref, type));
 }
 
-bool Dictionary::update_if_needed() const
+LinkCollectionPtr Dictionary::clone_as_obj_list() const
 {
-    auto status = update_if_needed_with_status();
-    if (status == UpdateStatus::Detached) {
-        throw StaleAccessor("CollectionList no longer exists");
+    if (get_value_data_type() == type_Link) {
+        return std::make_unique<DictionaryLinkValues>(*this);
     }
-    return status == UpdateStatus::Updated;
+    return nullptr;
 }
 
 /************************* DictionaryLinkValues *************************/
