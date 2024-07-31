@@ -4172,6 +4172,17 @@ TEST_CASE("app: jwt login and metadata tests", "[sync][app][user][metadata][func
 
     SECTION("jwt happy path") {
         bool processed = false;
+        bool logged_in_once = false;
+
+        auto token = app->subscribe([&logged_in_once, &app](auto&) {
+            REQUIRE(!logged_in_once);
+            auto user = app->current_user();
+            auto metadata = user->user_profile();
+
+            // Ensure that the JWT metadata fields are available when the callback is fired on login.
+            CHECK(metadata["name"] == "Foo Bar");
+            logged_in_once = true;
+        });
 
         std::shared_ptr<User> user = log_in(app, AppCredentials::custom(jwt));
 
@@ -4192,6 +4203,10 @@ TEST_CASE("app: jwt login and metadata tests", "[sync][app][user][metadata][func
         auto custom_data = *user->custom_data();
         CHECK(custom_data["name"] == "Not Foo Bar");
         CHECK(metadata["name"] == "Foo Bar");
+
+        REQUIRE(logged_in_once);
+
+        app->unsubscribe(token);
     }
 }
 
@@ -4471,22 +4486,7 @@ TEST_CASE("app: full-text compatible with sync", "[sync][app][baas]") {
         INFO("realm opened with async open");
         auto async_open_task = Realm::get_synchronized_realm(config);
 
-        auto [realm_promise, realm_future] = util::make_promise_future<ThreadSafeReference>();
-        async_open_task->start(
-            [promise = std::move(realm_promise)](ThreadSafeReference ref, std::exception_ptr ouch) mutable {
-                if (ouch) {
-                    try {
-                        std::rethrow_exception(ouch);
-                    }
-                    catch (...) {
-                        promise.set_error(exception_to_status());
-                    }
-                }
-                else {
-                    promise.emplace_value(std::move(ref));
-                }
-            });
-
+        auto realm_future = async_open_task->start();
         realm = Realm::get_shared_realm(std::move(realm_future.get()));
     }
 
