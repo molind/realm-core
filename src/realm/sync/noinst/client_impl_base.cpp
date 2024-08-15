@@ -20,8 +20,6 @@
 #include <realm/util/uri.hpp>
 #include <realm/version.hpp>
 
-#include <realm/sync/network/websocket.hpp> // Only for websocket::Error TODO remove
-
 #include <system_error>
 #include <sstream>
 
@@ -137,8 +135,7 @@ bool ClientImpl::decompose_server_url(const std::string& url, ProtocolEnvelope& 
 }
 
 ClientImpl::ClientImpl(ClientConfig config)
-    : logger_ptr{std::make_shared<util::CategoryLogger>(util::LogCategory::session, std::move(config.logger))}
-    , logger{*logger_ptr}
+    : logger(std::make_shared<util::CategoryLogger>(util::LogCategory::session, std::move(config.logger)))
     , m_reconnect_mode{config.reconnect_mode}
     , m_connect_timeout{config.connect_timeout}
     , m_connection_linger_time{config.one_connection_per_session ? 0 : config.connection_linger_time}
@@ -1225,6 +1222,14 @@ void Connection::disconnect(const SessionErrorInfo& info)
     m_sessions_enlisted_to_send.clear();
     m_sending = false;
 
+    if (!m_appservices_coid.empty()) {
+        m_appservices_coid.clear();
+        logger.base_logger = make_logger(m_ident, std::nullopt, get_client().logger.base_logger);
+        for (auto& [ident, sess] : m_sessions) {
+            sess->logger.base_logger = Session::make_logger(ident, logger.base_logger);
+        }
+    }
+
     report_connection_state_change(ConnectionState::disconnected, info); // Throws
     initiate_reconnect_wait();                                           // Throws
 }
@@ -1357,13 +1362,8 @@ void Connection::receive_query_error_message(int raw_error_code, std::string_vie
                                             "Received a FLX query error message on a non-FLX sync connection"});
     }
 
-    Session* sess = find_and_validate_session(session_ident, "QUERY_ERROR");
-    if (REALM_UNLIKELY(!sess)) {
-        return;
-    }
-
-    if (auto status = sess->receive_query_error_message(raw_error_code, message, query_version); !status.is_ok()) {
-        close_due_to_protocol_error(std::move(status));
+    if (Session* sess = find_and_validate_session(session_ident, "QUERY_ERROR")) {
+        sess->receive_query_error_message(raw_error_code, message, query_version);
     }
 }
 
@@ -1438,36 +1438,35 @@ void Connection::receive_test_command_response(session_ident_type session_ident,
 void Connection::receive_server_log_message(session_ident_type session_ident, util::Logger::Level level,
                                             std::string_view message)
 {
-    std::string prefix;
-    if (REALM_LIKELY(!m_appservices_coid.empty())) {
-        prefix = util::format("Server[%1]", m_appservices_coid);
-    }
-    else {
-        prefix = "Server";
-    }
-
     if (session_ident != 0) {
         if (auto sess = get_session(session_ident)) {
-            sess->logger.log(LogCategory::session, level, "%1 log: %2", prefix, message);
+            sess->logger.log(LogCategory::session, level, "Server log: %1", message);
             return;
         }
 
-        logger.log(util::LogCategory::session, level, "%1 log for unknown session %2: %3", prefix, session_ident,
+        logger.log(util::LogCategory::session, level, "Server log for unknown session %1: %2", session_ident,
                    message);
         return;
     }
 
-    logger.log(level, "%1 log: %2", prefix, message);
+    logger.log(level, "Server log: %1", message);
 }
 
 
 void Connection::receive_appservices_request_id(std::string_view coid)
 {
-    // Only set once per connection
-    if (!coid.empty() && m_appservices_coid.empty()) {
-        m_appservices_coid = coid;
-        logger.log(util::LogCategory::session, util::LogCategory::Level::info,
-                   "Connected to app services with request id: \"%1\"", m_appservices_coid);
+    if (coid.empty() || !m_appservices_coid.empty()) {
+        return;
+    }
+    m_appservices_coid = coid;
+    logger.log(util::LogCategory::session, util::LogCategory::Level::info,
+               "Connected to app services with request id: \"%1\". Further log entries for this connection will be "
+               "prefixed with \"Connection[%2:%1]\" instead of \"Connection[%2]\"",
+               m_appservices_coid, m_ident);
+    logger.base_logger = make_logger(m_ident, m_appservices_coid, get_client().logger.base_logger);
+
+    for (auto& [ident, sess] : m_sessions) {
+        sess->logger.base_logger = Session::make_logger(ident, logger.base_logger);
     }
 }
 
@@ -1580,7 +1579,7 @@ void Session::integrate_changesets(const SyncProgress& progress, std::uint_fast6
     auto transact = get_db()->start_read();
     history.integrate_server_changesets(
         progress, downloadable_bytes, received_changesets, version_info, download_batch_state, logger, transact,
-        [&](const TransactionRef&, util::Span<Changeset> changesets) {
+        [&](const Transaction&, util::Span<Changeset> changesets) {
             gather_pending_compensating_writes(changesets, &pending_compensating_write_errors);
         }); // Throws
     if (received_changesets.size() == 1) {
@@ -1667,14 +1666,13 @@ Session::~Session()
 }
 
 
-std::string Session::make_logger_prefix(session_ident_type ident)
+std::shared_ptr<util::Logger> Session::make_logger(session_ident_type ident,
+                                                   std::shared_ptr<util::Logger> base_logger)
 {
-    std::ostringstream out;
-    out.imbue(std::locale::classic());
-    out << "Session[" << ident << "]: "; // Throws
-    return out.str();                    // Throws
+    auto prefix = util::format("Session[%1]: ", ident);
+    return std::make_shared<util::PrefixLogger>(util::LogCategory::session, std::move(prefix),
+                                                std::move(base_logger));
 }
-
 
 void Session::activate()
 {
@@ -2233,13 +2231,10 @@ bool Session::client_reset_if_needed()
     Status cr_status = client_reset_config->error;
     ProtocolErrorInfo::Action cr_action = client_reset_config->action;
 
-    auto on_flx_version_complete = [this](int64_t version) {
-        this->on_flx_sync_version_complete(version);
-    };
     try {
         // The file ident from the fresh realm will be copied over to the local realm
         bool did_reset = client_reset::perform_client_reset(logger, *get_db(), std::move(*client_reset_config),
-                                                            get_flx_subscription_store(), on_flx_version_complete);
+                                                            get_flx_subscription_store());
 
         call_debug_hook(SyncClientHookEvent::ClientResetMergeComplete);
         if (!did_reset) {
@@ -2285,8 +2280,6 @@ bool Session::client_reset_if_needed()
 
     // Checks if there is a pending client reset
     handle_pending_client_reset_acknowledgement();
-
-    update_subscription_version_info();
 
     // If a migration or rollback is in progress, mark it complete when client reset is completed.
     if (auto migration_store = get_migration_store()) {
@@ -2521,16 +2514,10 @@ Status Session::receive_unbound_message()
 }
 
 
-Status Session::receive_query_error_message(int error_code, std::string_view message, int64_t query_version)
+void Session::receive_query_error_message(int error_code, std::string_view message, int64_t query_version)
 {
     logger.info("Received QUERY_ERROR \"%1\" (error_code=%2, query_version=%3)", message, error_code, query_version);
-    // Ignore the message if the deactivation process has been initiated,
-    // because in that case, the associated Realm and SessionWrapper must
-    // not be accessed any longer.
-    if (m_state == Active) {
-        on_flx_sync_error(query_version, message); // throws
-    }
-    return Status::OK();
+    on_flx_sync_error(query_version, message); // throws
 }
 
 // The caller (Connection) must discard the session if the session has become
