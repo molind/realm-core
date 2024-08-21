@@ -668,6 +668,7 @@ private:
     void add_core_history_entry(BinaryData);
     void add_sync_history_entry(const HistoryEntry&);
     void trim_cont_transact_history();
+    sync::Changeset compact_history(TransactionRef tr) const;
     ChunkedBinaryData get_changeset(version_type server_version) const noexcept;
     version_type find_history_entry(file_ident_type remote_file_ident, version_type begin_version,
                                     version_type end_version, HistoryEntry&) const noexcept;

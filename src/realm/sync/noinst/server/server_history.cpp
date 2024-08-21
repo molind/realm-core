@@ -811,36 +811,54 @@ bool ServerHistory::fetch_download_info(file_ident_type client_file_ident, Downl
             return false;
     }
 
-    std::size_t accum_byte_size = 0;
     DownloadCursor download_progress_2 = download_progress;
 
-    std::vector<Changeset> changesets;
-    std::vector<std::size_t> original_changeset_sizes;
-
-    for (;;) {
-        version_type begin_version = download_progress_2.server_version;
+    if (download_progress.server_version == 0 && end_version != 0) {
+        auto changeset = compact_history(tr);
+        changeset.version = end_version;
+        changeset.origin_file_ident = m_local_file_ident;
+        
+        ChangesetEncoder::Buffer encode_buffer;
+        encode_changeset(changeset, encode_buffer); // Throws
         HistoryEntry entry;
-        version_type version = find_history_entry(client_file_ident, begin_version, end_version, entry,
-                                                  download_progress_2.last_integrated_client_version);
-        if (version == 0) {
-            // End of history reached
-            download_progress_2.server_version = end_version;
-            break;
+        entry.remote_version = changeset.last_integrated_remote_version;
+        entry.origin_file_ident = changeset.origin_file_ident;
+        entry.origin_timestamp = changeset.origin_timestamp;
+        entry.changeset = BinaryData{encode_buffer.data(), encode_buffer.size()};
+
+        download_progress_2.server_version = changeset.version;
+
+        handler.handle(changeset.version, entry, entry.changeset.size()); // Throws
+        encode_buffer.clear();
+
+        fprintf(stderr, "Compacted initial state %d, to %d bytes\n", changeset.version, entry.changeset.size()); // Throws
+    } else {
+        std::size_t accum_byte_size = 0;
+        for (;;) {
+            version_type begin_version = download_progress_2.server_version;
+            HistoryEntry entry;
+            version_type version = find_history_entry(client_file_ident, begin_version, end_version, entry,
+                                                    download_progress_2.last_integrated_client_version);
+            if (version == 0) {
+                // End of history reached
+                download_progress_2.server_version = end_version;
+                break;
+            }
+
+            download_progress_2.server_version = version;
+
+            entry.remote_version = download_progress_2.last_integrated_client_version;
+
+            if (entry.origin_file_ident == 0)
+                entry.origin_file_ident = m_local_file_ident;
+
+            handler.handle(download_progress_2.server_version, entry, entry.changeset.size()); // Throws
+
+            accum_byte_size += entry.changeset.size();
+
+            if (accum_byte_size > accum_byte_size_soft_limit)
+                break;
         }
-
-        download_progress_2.server_version = version;
-
-        entry.remote_version = download_progress_2.last_integrated_client_version;
-
-        if (entry.origin_file_ident == 0)
-            entry.origin_file_ident = m_local_file_ident;
-
-        handler.handle(download_progress_2.server_version, entry, entry.changeset.size()); // Throws
-
-        accum_byte_size += entry.changeset.size();
-
-        if (accum_byte_size > accum_byte_size_soft_limit)
-            break;
     }
 
     // Set cumulative byte sizes.
@@ -868,6 +886,192 @@ bool ServerHistory::fetch_download_info(file_ident_type client_file_ident, Downl
     return true;
 }
 
+static sync::Instruction::Payload::Type convert_type(DataType type) {
+    switch (type)
+    {
+    case DataType::Type::Int:
+        return sync::Instruction::Payload::Type::Int;
+    case DataType::Type::Bool:
+        return sync::Instruction::Payload::Type::Bool;
+    case DataType::Type::String:
+        return sync::Instruction::Payload::Type::String;
+    case DataType::Type::Binary:
+        return sync::Instruction::Payload::Type::Binary;
+    case DataType::Type::Timestamp:
+        return sync::Instruction::Payload::Type::Timestamp;
+    case DataType::Type::Float:
+        return sync::Instruction::Payload::Type::Float;
+    case DataType::Type::Double:
+        return sync::Instruction::Payload::Type::Double;
+    case DataType::Type::Decimal:
+        return sync::Instruction::Payload::Type::Decimal;
+    case DataType::Type::Link:
+        return sync::Instruction::Payload::Type::Link;
+    case DataType::Type::ObjectId:
+        return sync::Instruction::Payload::Type::ObjectId;
+    case DataType::Type::UUID:
+        return sync::Instruction::Payload::Type::UUID;
+    
+    case DataType::Type::TypedLink:
+    case DataType::Type::Mixed:    
+    default:
+        throw util::runtime_error("Changeset: Unsupported data type");
+        break;
+    }
+}
+
+static sync::Instruction::CollectionType convert_collection_type(const ColKey &column) {
+    if (!column.is_collection())
+        return sync::Instruction::CollectionType::Single;
+    if (column.is_list())
+        return sync::Instruction::CollectionType::List;
+    if (column.is_set())
+        return sync::Instruction::CollectionType::Set;
+    if (column.is_dictionary())
+        return sync::Instruction::CollectionType::Dictionary;
+    
+    throw util::runtime_error("Changeset: Unsupported collection type");
+}
+
+Changeset ServerHistory::compact_history(TransactionRef tr) const {
+    Changeset changeset;
+
+    auto tableKeys = tr->get_table_keys();
+    for (const auto& tableKey : tableKeys) {
+        auto table = tr->get_table(tableKey);
+        auto tableName = tr->get_class_name(tableKey);
+        auto pkCol = table->get_primary_key_column();
+        auto pkName = table->get_column_name(pkCol);
+        auto pkType = table->get_column_type(pkCol);
+        auto pkNullable = table->is_nullable(pkCol);
+        auto tableAssymetric = table->is_asymmetric();
+        auto pk = changeset.intern_string(tableName);
+
+        // Создаем таблицу в changeset
+        sync::Instruction::AddTable addTable;
+        addTable.table = pk;
+        addTable.type = sync::Instruction::AddTable::TopLevelTable{
+            changeset.intern_string(pkName),
+            convert_type(pkType),
+            pkNullable,
+            tableAssymetric,
+        }; 
+        changeset.push_back(addTable);
+
+        auto columns = table->get_column_keys();
+        for (const auto& column : columns) {
+            if (column == pkCol)
+                continue;
+
+            const auto& colName = table->get_column_name(column);
+            auto colType = table->get_column_type(column);
+
+            // Добавляем колонку в таблицу
+            sync::Instruction::AddColumn addColumn;
+            addColumn.table = pk;
+            addColumn.field = changeset.intern_string(colName);
+            addColumn.type = convert_type(colType);
+            addColumn.nullable = table->is_nullable(column);
+            addColumn.collection_type = convert_collection_type(column);
+            changeset.push_back(addColumn);
+
+            // Добавляем индекс, если это необходимо
+            // if (attr.test(col_attr_Indexed) || colName == "folderUuid") {
+                // changeset.add_instruction<Changeset::Instruction::AddIndex>(tableName, colName);
+            // }
+        }
+
+        // // Создаем объекты в changeset
+        for (const auto& obj : *table) {
+            auto keyVal = obj.get_primary_key();
+            sync::Instruction::PrimaryKey objKey;
+            switch (keyVal.get_type()) {
+            case DataType::Type::Int:
+                objKey = keyVal.get_int();
+                break;
+            case DataType::Type::String:
+                objKey = changeset.intern_string(keyVal.get_string());
+                break;
+            case DataType::Type::ObjectId:
+                objKey = keyVal.get_object_id();
+                break;
+            case DataType::Type::UUID:
+                objKey = keyVal.get_uuid();
+                break;
+            default:
+                throw util::runtime_error("Changeset: Unsupported primary key type");
+                break;
+            }
+
+            sync::Instruction::CreateObject createObject;
+            createObject.table = pk;
+            createObject.object = objKey;
+            changeset.push_back(createObject);
+
+            // changeset.print();
+
+            for (const auto& column : columns) {
+                if (column == pkCol)
+                    continue;
+
+                sync::Instruction::Update update;
+                update.table = pk;
+                update.object = objKey;
+                update.field = changeset.intern_string(table->get_column_name(column));
+                auto val = obj.get_any(column);
+                if (!val.is_null()) {
+                    switch (val.get_type())
+                    {
+                    case DataType::Type::Int:
+                        update.value = sync::Instruction::Payload(val.get_int());
+                        break;
+                    case DataType::Type::Bool:
+                        update.value = sync::Instruction::Payload(val.get_bool());
+                        break;
+                    case DataType::Type::String: {
+                        auto str = changeset.intern_string(val.get_string());
+                        update.value = sync::Instruction::Payload(changeset.get_intern_string(str), false);
+                        break;
+                    }
+                    case DataType::Type::Binary: {
+                        auto binData = val.get_binary();
+                        auto str = changeset.intern_string(StringData(binData.data(), binData.size()));
+                        update.value = sync::Instruction::Payload(changeset.get_intern_string(str), true);
+                        break;
+                    }
+                    case DataType::Type::Timestamp:
+                        update.value = sync::Instruction::Payload(val.get_timestamp());
+                        break;
+                    case DataType::Type::Float:
+                        update.value = sync::Instruction::Payload(val.get_float());
+                        break;
+                    case DataType::Type::Double:
+                        update.value = sync::Instruction::Payload(val.get_double());
+                        break;
+                    case DataType::Type::Decimal:
+                        update.value = sync::Instruction::Payload(val.get_decimal());
+                        break;
+                    case DataType::Type::ObjectId:
+                        update.value = sync::Instruction::Payload(val.get_object_id());
+                        break;
+                    case DataType::Type::UUID:
+                        update.value = sync::Instruction::Payload(val.get_uuid());
+                        break;
+                    case DataType::Type::Link:
+                    case DataType::Type::TypedLink:
+                    case DataType::Type::Mixed:
+                    default:
+                        throw util::runtime_error("Changeset: Unsupported data type");
+                        break;
+                    }
+                }
+                changeset.push_back(update);
+            }
+        }
+    }
+
+    return changeset;
+}
 
 void ServerHistory::add_upstream_sync_status()
 {
