@@ -1,3 +1,177 @@
+# 14.14.0 Release notes
+
+### Enhancements
+* Enable automatic client reset recovery for audit Realm files ([PR #8072](https://github.com/realm/realm-core/pull/8072)).
+
+### Fixed
+* None.
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v24. Reads and automatically upgrade from fileformat v10. If you want to upgrade from an earlier file format version you will have to use RealmCore v13.x.y or earlier.
+
+-----------
+
+### Internals
+* None.
+
+----------------------------------------------
+
+# 14.13.5 Release notes
+
+### Enhancements
+* None.
+
+### Fixed
+* Committing a subscription set prematurely released a read lock, which may have caused a BadVersion exception with an error like `Unable to lock version XX as it does not exist or has been cleaned up` while changing subscriptions. ([PR #8068](https://github.com/realm/realm-core/pull/8068), since v14.12.0)
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v24. Reads and automatically upgrade from fileformat v10. If you want to upgrade from an earlier file format version you will have to use RealmCore v13.x.y or earlier.
+
+-----------
+
+### Internals
+* None.
+
+----------------------------------------------
+
+# 14.13.4 Release notes
+
+### Enhancements
+* None.
+
+### Fixed
+* If you open a synchronized realm and it needs to refresh its access token, and that refresh operation doesn't complete before the realm is closed, the lifetime of the sync session will be extended until the refresh is complete. If you open the realm again before that refresh is complete, then you'll have two sync sessions both try to start synchronizing the realm when the refreshes do complete, and that will crash the process with a MultipleSyncAgents exception. ([PR #8064](https://github.com/realm/realm-core/pull/8064))
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v24. Reads and automatically upgrade from fileformat v10. If you want to upgrade from an earlier file format version you will have to use RealmCore v13.x.y or earlier.
+
+-----------
+
+### Internals
+* None.
+
+----------------------------------------------
+
+# 14.13.3 Release notes
+
+### Enhancements
+* None.
+
+### Fixed
+* Changing type of primary key column crashes if more than one object ([#8056](https://github.com/realm/realm-core/issues/8056), since v14.13.2)
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v24. Reads and automatically upgrade from fileformat v10. If you want to upgrade from an earlier file format version you will have to use RealmCore v13.x.y or earlier.
+
+-----------
+
+### Internals
+* None.
+
+----------------------------------------------
+
+# 14.13.2 Release notes
+
+### Enhancements
+* None.
+
+### Fixed
+* Migrating primary key to a new type without migration function would cause an assertion to fail. ([#8045](https://github.com/realm/realm-core/issues/8045), since v10.0.0)
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v24. Reads and automatically upgrade from fileformat v10. If you want to upgrade from an earlier file format version you will have to use RealmCore v13.x.y or earlier.
+
+-----------
+
+### Internals
+* None.
+
+----------------------------------------------
+
+# 14.13.1 Release notes
+
+### Enhancements
+* None.
+
+### Fixed
+* The events library would attempt to upload backup files created as part of file format upgrades, causing backup copies of those backups to be made, looping until the maximum file name size was reached ([#8040](https://github.com/realm/realm-core/issues/8040), since v11.17.0).
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v24. Reads and automatically upgrade from fileformat v10. If you want to upgrade from an earlier file format version you will have to use RealmCore v13.x.y or earlier.
+
+-----------
+
+### Internals
+* None.
+
+----------------------------------------------
+
+# 14.13.0 Release notes
+
+### Enhancements
+* None.
+
+### Fixed
+* Having a query with a number of predicates ORed together may result in a crash on some platforms (strict weak ordering check failing on iphone) ([#8028](https://github.com/realm/realm-core/issues/8028), since v14.6.0)
+* None.
+
+### Breaking changes
+* Removed http 301/308 redirection support from app services operations provided by App. It is assumed that the SDK's http implementation will handle http redirects instead. ([PR #7996](https://github.com/realm/realm-core/pull/7996))
+
+### Compatibility
+* Fileformat: Generates files with format v24. Reads and automatically upgrade from fileformat v10. If you want to upgrade from an earlier file format version you will have to use RealmCore v13.x.y or earlier.
+
+-----------
+
+### Internals
+* None.
+
+----------------------------------------------
+
+# 14.12.1 Release notes
+
+### Enhancements
+* None.
+
+### Fixed
+* Using an empty KeyPath in C API would result in no filtering being done ([#7805](https://github.com/realm/realm-core/issues/7805), since v13.24.0)
+* Filtering notifications with backlink columns as last element could sometimes give wrong results ([#7530](https://github.com/realm/realm-core/issues/7530), since v11.1.0)
+* Fix crash during client app shutdown when Logger log level is set higher than Info. ([#7969](https://github.com/realm/realm-core/issues/7969), since v13.23.3)
+* If File::rw_lock() fails to open a file the exception message does not contain the filename ([#7999](https://github.com/realm/realm-core/issues/7999), since v6.0.21)
+* Fallback to hashed filename will fail if length of basename is between 240 and 250 ([#8007](https://github.com/realm/realm-core/issues/8007), since v10.0.0)
+* Swift API misuse within a callback from core would result in an internal unreachable error rather than the exception being propagated properly ([#7836](https://github.com/realm/realm-core/issues/7836)).
+
+### Breaking changes
+* None.
+
+### Compatibility
+* Fileformat: Generates files with format v24. Reads and automatically upgrade from fileformat v10. If you want to upgrade from an earlier file format version you will have to use RealmCore v13.x.y or earlier.
+
+-----------
+
+### Internals
+* Update TestAppSession to allow scope-based usage for restarting the local app resources. ([PR #7672](https://github.com/realm/realm-core/pull/7672))
+
+----------------------------------------------
+
 # 14.12.0 Release notes
 
 ### Enhancements
