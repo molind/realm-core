@@ -2062,6 +2062,17 @@ public:
         m_only_unary_links = other.m_only_unary_links;
     }
 
+    LinkMap& operator=(const LinkMap& other)
+    {
+        if (this != &other) {
+            m_link_column_keys = other.m_link_column_keys;
+            m_tables = other.m_tables;
+            m_link_types = other.m_link_types;
+            m_only_unary_links = other.m_only_unary_links;
+        }
+        return *this;
+    }
+
     size_t get_nb_hops() const
     {
         return m_link_column_keys.size();
